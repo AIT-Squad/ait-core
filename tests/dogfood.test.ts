@@ -1,6 +1,6 @@
-// [TDD]-dogfood_tests — 真实 tarball 安装、升级与完整生成周期验收。
+// [TDD]-dogfood_tests — 真实 tarball 安装、升级与 CLI + Node 混合入口闭环验收。
 // 固定宿主生成器仅验证交付/制品/回执机制，不证明 LLM 的语义质量。
-// 受管写入只经安装后的 bin/公开接口；测试只直接写临时 fixture 与制品。
+// 受管写入只经安装后的入口：CLI 推进规格/版本，Node 公开接口登记回执；测试只直接写临时 fixture 与制品。
 
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
@@ -542,10 +542,10 @@ function prdWorkspaceFile(dir: string): string {
 	return path.join(dir, "project-docs", "versions", "v0.1", "prd", "[PRD]-demo.md");
 }
 
-describe("安装后的完整自举", () => {
+describe("安装后的混合入口闭环（CLI + Node）", () => {
 	it("缺 build 时明确失败并提示 npm run build", () => { assertBuild(); });
 
-	it("真实 tarball 安装 → 生成/回执/验收/合入 → 隔离副本升级 → 下一完整周期", async () => {
+	it("真实 tarball 安装 → CLI + Node 混合入口生成/回执/验收/合入 → 隔离副本升级 → 下一混合入口闭环", async () => {
 		const sourcePackage = fs.readFileSync(path.join(PROJECT_ROOT, "package.json"));
 		const sourceLock = fs.readFileSync(path.join(PROJECT_ROOT, "package-lock.json"));
 		const installed = await makeInstallation();
