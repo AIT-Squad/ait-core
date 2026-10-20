@@ -49,7 +49,6 @@ import {
 import {
   SpecGraphStore,
   combinedView,
-  extractTargetFile,
   makeUri,
   specType,
   CombinedView,
@@ -58,6 +57,7 @@ import {
   type EdgeRel,
 } from "../specgraph/graph-model.js";
 import { VersionManager } from "../versioning/version-manager.js";
+import { checkArtifactScopeWrite } from "./governance.js";
 import {
   checkEdgeWrite,
   scanContentRelations,
@@ -317,6 +317,18 @@ function extractYamlBlocksOutsideFences(content: string): YamlBlock[] {
     });
   }
   return blocks;
+}
+
+/** 读取 YAML 的实际字符串，保留完整路径供候选校验与范围门禁使用。 */
+function extractTargetFile(content: string): string | undefined {
+  for (const block of extractYamlBlocksOutsideFences(content)) {
+    const document = parseDocument(block.text);
+    if (!isMap(document.contents) || !document.has("target_file")) continue;
+    if (!block.closed || document.errors.length > 0) return undefined;
+    const target = (document.toJS() as Record<string, unknown>)["target_file"];
+    return typeof target === "string" && target.trim() !== "" ? target : undefined;
+  }
+  return undefined;
 }
 
 function edgeKey(edge: EdgeRef): string {
@@ -580,7 +592,7 @@ export class NewModelManager {
     }
     const candidate = this.candidateView(view, version, id, prepared, declarations, edges, opts.overrides);
     this.contentGates(layer, id, content, parsed.chunks, candidate, sourceFile);
-    const pending = this.writeGates(id, action, candidate, parsed.chunks, edges);
+    const pending = this.writeGates(layer, id, action, candidate, parsed.chunks, edges);
     const discussionUsage = this.discussionUsage(opts);
 
     this.withVersionTransaction(version, [prepared.target], () => {
@@ -1260,6 +1272,7 @@ export class NewModelManager {
    * 全部提交端点与边在同一候选视图中交给生产 validator 校验。
    */
   private writeGates(
+    layer: DocLayer,
     id: string,
     action: Action,
     candidate: CombinedView,
@@ -1270,6 +1283,14 @@ export class NewModelManager {
       this.assertNotLocked(submittedId);
       if (action === "add" && this.index.queryBaseline(submittedId) !== null) {
         throw new ModelManagerError("DUPLICATE_BASELINE_CHUNK", `action=add 命中 baseline 已有 chunk：${submittedId}`);
+      }
+    }
+    if (layer === "tdd") {
+      for (const chunk of chunks) {
+        if (chunk.id.includes(":")) continue;
+        const parents = candidate.edgesTo(chunk.id, "details");
+        checkArtifactScopeWrite(this.root, chunk.id, extractTargetFile(chunk.content) as string,
+          parents.length === 1 ? parents[0]?.src : undefined);
       }
     }
     const pending = [...new Map(edges.map((edge) => [edgeKey(edge), edge])).values()];

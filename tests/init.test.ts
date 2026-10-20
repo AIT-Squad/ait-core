@@ -12,7 +12,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
 import {
@@ -284,6 +284,8 @@ describe("宿主非 git 仓", () => {
     expect(
       result.skipped.some((s) => s.includes("宿主非 git 仓")),
     ).toBe(true);
+    // init 只建立文档仓，不初始化宿主源码仓。
+    expect(fs.existsSync(path.join(base, ".git"))).toBe(false);
     // 不创建宿主 .gitignore
     expect(fs.existsSync(path.join(base, ".gitignore"))).toBe(false);
   });
@@ -393,6 +395,66 @@ function otherWrapperPath(base: string): string {
   return IS_WINDOWS ? wrapperPathsOf(base).sh : wrapperPathsOf(base).cmd;
 }
 
+/** 实际执行生成入口；Windows 必须经 cmd，POSIX 直接运行可执行 wrapper。 */
+function runWrapper(base: string, args: string[]) {
+  const wrapper = currentWrapperPath(base);
+  const options = {
+    cwd: base,
+    encoding: "utf-8" as const,
+    stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  };
+  const result = IS_WINDOWS
+    ? spawnSync(
+        process.env["ComSpec"] ?? "cmd.exe",
+        [
+          "/d", "/s", "/c",
+          '"' + [wrapper, ...args].map((arg) => '"' + arg + '"').join(" ") + '"',
+        ],
+        { ...options, windowsVerbatimArguments: true },
+      )
+    : spawnSync(wrapper, args, options);
+  expect(result.error).toBeUndefined();
+  expect(result.signal).toBeNull();
+  expect(result.stderr).toBe("");
+  const lines = result.stdout.trim().split(/\r?\n/);
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).not.toBe("");
+  return {
+    status: result.status,
+    payload: JSON.parse(lines[0]!) as Record<string, unknown>,
+  };
+}
+
+/** 记录目录与文件元数据，捕获 check 重写同字节内容或改变执行位的行为。 */
+function snapshotTree(base: string) {
+  const snapshot = new Map<
+    string, { mode: number; mtime: number; hash: string | null }
+  >();
+  const walk = (current: string): void => {
+    const stat = fs.lstatSync(current);
+    snapshot.set(path.relative(base, current), {
+      mode: stat.mode,
+      mtime: stat.mtimeMs,
+      hash: stat.isFile()
+        ? createHash("sha256").update(fs.readFileSync(current)).digest("hex")
+        : null,
+    });
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(current)) walk(path.join(current, name));
+    }
+  };
+  walk(base);
+  return snapshot;
+}
+
+/** 仅用于模板断言，不调用被测实现的引用函数。 */
+function quoteWrapperTarget(target: string): string {
+  return IS_WINDOWS
+    ? '"' + target.replace(/%/g, "%%") + '"'
+    : "'" + target.replace(/'/g, "'\\''") + "'";
+}
+
 describe("wrapper", () => {
   it(`init 只写本平台 wrapper（${CURRENT_REL}）并转发到 ait-core bin（:TEST 第 6 条）`, () => {
     const base = mkTmp();
@@ -407,17 +469,23 @@ describe("wrapper", () => {
     expect(result.createdFiles).not.toContain(OTHER_REL);
 
     if (IS_WINDOWS) {
-      // Windows wrapper：@echo off + 转发到 bin + %* 透传参数
+      // Windows wrapper 显式调用 Node，禁用延迟展开并透传退出码。
       const cmd = readNorm(current);
       const cmdLines = cmd.split("\n").map((l) => l.trim());
       expect(cmdLines[0]).toBe("@echo off");
-      expect(cmd).toContain(bin);
-      expect(cmd).toContain("%*");
+      expect(cmd).toContain("setlocal DisableDelayedExpansion");
+      expect(cmd).toContain(
+        `${quoteWrapperTarget(process.execPath)} ${quoteWrapperTarget(bin)} %*`,
+      );
+      expect(cmd.toLowerCase()).toContain("exit /b %errorlevel%");
     } else {
-      // POSIX wrapper：shebang + exec "<bin>" "$@" 透传参数
+      // POSIX wrapper 显式用 Node 执行 bin，不依赖 bin 的执行位。
       const sh = readNorm(current);
       expect(sh.split("\n")[0]).toBe("#!/bin/sh");
-      expect(sh).toContain('exec "' + bin + '" "$@"');
+      expect(sh).toContain(
+        `exec ${quoteWrapperTarget(process.execPath)} ${quoteWrapperTarget(bin)} "$@"`,
+      );
+      expect(fs.statSync(current).mode & 0o111).not.toBe(0);
     }
 
     // wrapper 不入 docs 仓版本控制：docs 仓内 .gitignore 已含 .ait/
@@ -468,6 +536,7 @@ describe("wrapper", () => {
       .update(fs.readFileSync(indexFile))
       .digest("hex");
     const docsBefore = hashTree(path.join(base, "project-docs", "docs"));
+    const metaBefore = hashTree(path.join(base, "project-docs", ".meta"));
 
     // 删除本平台 wrapper：refresh 应恢复
     fs.rmSync(current);
@@ -504,6 +573,8 @@ describe("wrapper", () => {
     expect(viaInit.createdFiles).not.toContain(OTHER_REL);
     expect(fs.readFileSync(current).equals(original)).toBe(true);
     expect(fs.existsSync(other)).toBe(false);
+    expect(hashTree(path.join(base, "project-docs", "docs"))).toEqual(docsBefore);
+    expect(hashTree(path.join(base, "project-docs", ".meta"))).toEqual(metaBefore);
   });
 
   it("--check 只要求本平台 wrapper 且零写入（:TEST 第 6 条）", () => {
@@ -554,6 +625,152 @@ describe("wrapper", () => {
     expect(fs.existsSync(current)).toBe(true);
     expect(fs.existsSync(other)).toBe(false);
   });
+
+  it("实际 wrapper 在空格/Unicode 目录保留 cwd、完整参数、单 JSON 与退出码（:TEST 第 8 条）", () => {
+    const base = path.join(mkTmp(), "项目 空格 '入口");
+    fs.mkdirSync(base);
+    initProject(base, { name: "demo" });
+    new VersionManager(resolveProjectRoot(base)).versionCreate("v0.17");
+    const before = snapshotTree(base);
+
+    expect(runWrapper(base, ["--version"])).toMatchObject({
+      status: 0,
+      payload: { ok: true, data: { version: "v0.17" } },
+    });
+    const invalid = runWrapper(base, ["init", "--未知 参数"]);
+    expect(invalid.status).toBeGreaterThan(0);
+    expect(invalid.payload).toMatchObject({
+      ok: false,
+      code: "USAGE_ERROR",
+      error: "未知 flag：--未知 参数",
+    });
+    expect(snapshotTree(base)).toEqual(before);
+  });
+
+  it.each(["旧 Python", "旧包入口", "任意损坏脚本"])(
+    "--check 拒绝%s且不执行，refresh 恢复真实入口并保留其余字节（:TEST 第 9 条）",
+    (kind) => {
+      const base = mkTmp();
+      initProject(base, { name: "demo" });
+      const current = currentWrapperPath(base);
+      const original = fs.readFileSync(current);
+      const marker = path.join(base, "wrapper-executed.txt");
+      let broken: string;
+      if (kind === "旧 Python") {
+        broken = IS_WINDOWS
+          ? '@echo off\r\npython "old-ait.py" %*\r\n'
+          : '#!/bin/sh\nexec python "old-ait.py" "$@"\n';
+      } else if (kind === "旧包入口") {
+        const oldBin = path.join(base, "old-bin.js");
+        fs.copyFileSync(expectedBin(), oldBin);
+        broken = readNorm(current).replace(
+          quoteWrapperTarget(expectedBin()), quoteWrapperTarget(oldBin),
+        );
+      } else {
+        broken = IS_WINDOWS
+          ? '@echo off\r\n> "' + marker + '" echo executed\r\n'
+          : '#!/bin/sh\nprintf executed > ' + quoteWrapperTarget(marker) + '\n';
+      }
+      fs.writeFileSync(current, broken, "utf-8");
+      const before = snapshotTree(base);
+      expect(checkProject(base)).toEqual({ ok: false, missing: [CURRENT_REL] });
+      const checked = initProject(base, { name: "demo", check: true });
+      expect(checked.createdFiles).toEqual([]);
+      expect(checked.skipped).toContain('check: ' + CURRENT_REL);
+      expect(snapshotTree(base)).toEqual(before);
+      expect(fs.existsSync(marker)).toBe(false);
+
+      const unchanged = hashTree(base);
+      unchanged.delete(CURRENT_REL);
+      const refreshed = refreshWrapper(base);
+      expect(refreshed.createdFiles).toEqual([CURRENT_REL]);
+      expect(Object.keys(refreshed.files)).toEqual([CURRENT_REL]);
+      expect(fs.readFileSync(current)).toEqual(original);
+      expect(checkProject(base)).toEqual({ ok: true, missing: [] });
+      expect(runWrapper(base, ["--version"])).toMatchObject({
+        status: 0, payload: { ok: true },
+      });
+      const after = hashTree(base);
+      after.delete(CURRENT_REL);
+      expect(after).toEqual(unchanged);
+    },
+  );
+
+  it("--check 允许模板 LF/CRLF 差异且保持原字节", () => {
+    const base = mkTmp();
+    initProject(base, { name: "demo" });
+    const wrapper = currentWrapperPath(base);
+    const normalized = readNorm(wrapper);
+    fs.writeFileSync(wrapper, IS_WINDOWS ? normalized : normalized.replace(/\n/g, "\r\n"));
+    const before = snapshotTree(base);
+    expect(checkProject(base)).toEqual({ ok: true, missing: [] });
+    expect(snapshotTree(base)).toEqual(before);
+  });
+
+  it("--check 报告本例包副本的 Node/bin 目标缺失，不改动真实 Node", async () => {
+    const packageCopy = path.join(mkTmp(), "安装 包副本");
+    fs.mkdirSync(packageCopy);
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "package.json"), path.join(packageCopy, "package.json"),
+    );
+    fs.cpSync(path.join(REPO_ROOT, "src"), path.join(packageCopy, "src"), {
+      recursive: true,
+    });
+    fs.symlinkSync(
+      path.join(REPO_ROOT, "node_modules"),
+      path.join(packageCopy, "node_modules"),
+      "junction",
+    );
+    const binCopy = path.join(packageCopy, path.relative(REPO_ROOT, expectedBin()));
+    fs.mkdirSync(path.dirname(binCopy), { recursive: true });
+    fs.copyFileSync(expectedBin(), binCopy);
+    const nodeCopy = path.join(packageCopy, path.basename(process.execPath));
+    fs.copyFileSync(process.execPath, nodeCopy);
+    const fixture = await import(
+      path.join(packageCopy, "src/init/init-manager.ts").split(path.sep).join("/")
+    ) as typeof import("../src/init/init-manager.js");
+    const base = mkTmp();
+    const nodeDescriptor = Object.getOwnPropertyDescriptor(process, "execPath")!;
+    try {
+      Object.defineProperty(process, "execPath", { ...nodeDescriptor, value: nodeCopy });
+      fixture.initProject(base, { name: "demo" });
+      expect(fixture.checkProject(base)).toEqual({ ok: true, missing: [] });
+      for (const target of [nodeCopy, binCopy]) {
+        fs.renameSync(target, target + ".unavailable");
+        try {
+          const before = snapshotTree(base);
+          const checked = fixture.checkProject(base);
+          expect(checked.ok).toBe(false);
+          expect(checked.missing).toContain(CURRENT_REL);
+          expect(checked.missing).toContain(
+            path.relative(base, target).split(path.sep).join("/"),
+          );
+          expect(snapshotTree(base)).toEqual(before);
+        } finally {
+          fs.renameSync(target + ".unavailable", target);
+        }
+        expect(fixture.checkProject(base)).toEqual({ ok: true, missing: [] });
+      }
+    } finally {
+      Object.defineProperty(process, "execPath", nodeDescriptor);
+    }
+  });
+
+  it.skipIf(IS_WINDOWS)("POSIX --check 拒绝缺执行位的 wrapper，refresh 后可直接执行", () => {
+    const base = mkTmp();
+    initProject(base, { name: "demo" });
+    const wrapper = currentWrapperPath(base);
+    fs.chmodSync(wrapper, 0o644);
+    const before = snapshotTree(base);
+    expect(checkProject(base)).toEqual({ ok: false, missing: [CURRENT_REL] });
+    expect(snapshotTree(base)).toEqual(before);
+    refreshWrapper(base);
+    expect(fs.statSync(wrapper).mode & 0o111).not.toBe(0);
+    expect(checkProject(base)).toEqual({ ok: true, missing: [] });
+    expect(runWrapper(base, ["--version"])).toMatchObject({
+        status: 0, payload: { ok: true },
+      });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -587,12 +804,13 @@ function corpusProjectDocs(): { configured: string[]; existing: string[] } {
   };
 }
 
-/** 拷贝 project-docs 到 <base>/project-docs（跳过 .git，避免体积与文件锁）。 */
+/** 拷贝 project-docs 到 <base>/project-docs（跳过 .git/.ait，独立验证本地入口补齐）。 */
 function copyProjectDocs(src: string, base: string): string {
   const dst = path.join(base, "project-docs");
   fs.cpSync(src, dst, {
     recursive: true,
-    filter: (p) => !p.split(path.sep).includes(".git"),
+    filter: (p) =>
+      !p.split(path.sep).some((part) => part === ".git" || part === ".ait"),
   });
   return dst;
 }
@@ -604,6 +822,7 @@ describe("Python 仓库副本", () => {
       `Python 仓库副本用例 skip：AIT_CORPUS_DIRS 未指向任何含 docs/ 与 .meta/ 的 ` +
         `project-docs 目录；配置值 = ${JSON.stringify(corpus.configured)}`,
     );
+    it.skip("缺少 Python project-docs 语料，已打印配置原因", () => {});
   }
 
   for (const src of corpus.existing) {
@@ -661,13 +880,16 @@ describe("Python 仓库副本", () => {
         expect(result.createdFiles).toContain(CURRENT_REL);
         expect(result.createdFiles).not.toContain(OTHER_REL);
         const currentText = readNorm(current);
-        expect(currentText).toContain(expectedBin());
+        expect(currentText).toContain(quoteWrapperTarget(process.execPath));
+        expect(currentText).toContain(quoteWrapperTarget(expectedBin()));
         if (IS_WINDOWS) {
           expect(currentText.split("\n")[0]).toBe("@echo off");
           expect(currentText).toContain("%*");
         } else {
           expect(currentText.split("\n")[0]).toBe("#!/bin/sh");
-          expect(currentText).toContain('exec "' + expectedBin() + '" "$@"');
+          expect(currentText).toContain(
+            `exec ${quoteWrapperTarget(process.execPath)} ${quoteWrapperTarget(expectedBin())} "$@"`,
+          );
         }
       },
     );

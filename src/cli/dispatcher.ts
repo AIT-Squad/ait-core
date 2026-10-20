@@ -140,6 +140,7 @@ const CREATE_FLAGS: Record<string, FlagKind> = {
 
 const DECOMPOSE_FLAGS: Record<string, FlagKind> = {
   content: "value",
+  "content-file": "value",
   overrides: "value",
   action: "value",
   "context-token": "value",
@@ -478,11 +479,45 @@ const COMMANDS: Record<string, CommandSpec> = {
     run: async ({ root, flags }) => {
       const { combinedView } = await import("../specgraph/graph-model.js");
       const { validateInvariants } = await import("../new-model/validator.js");
-      const view = typeof flags.version === "string"
-        ? combinedView(root!, flags.version)
-        : combinedView(root!);
-      const violations = validateInvariants(view);
-      return { passed: violations.length === 0, violations };
+      const { evaluateGovernance } = await import("../new-model/governance.js");
+      const { IndexManager } = await import("../indexing/index-manager.js");
+      const { VersionMetaSchema } = await import("../doc-model/schemas.js");
+      const { loadModel } = await import("../foundation/yaml.js");
+      const { ensureWithin } = await import("../foundation/io.js");
+      const versions = typeof flags.version === "string"
+        ? [flags.version]
+        : new IndexManager(root!).listVersions();
+      const active = versions.filter((version) => {
+        const metaPath = ensureWithin(path.join(root!.meta, "versions"), `${version}.yaml`);
+        try {
+          const meta = loadModel(metaPath, VersionMetaSchema);
+          return meta.merged_at === null && meta.phase !== "merged";
+        } catch (err) {
+          if ((err as { code?: unknown } | null)?.code === "ENOENT") {
+            throw Object.assign(new Error(`版本元数据不存在：${version}（${metaPath}）`), {
+              code: "VERSION_NOT_FOUND",
+            });
+          }
+          throw err;
+        }
+      });
+      if (active.length > 1) {
+        throw Object.assign(new Error(`存在多个活动版本：${active.join(", ")}`), {
+          code: "ACTIVE_VERSION_CONFLICT",
+        });
+      }
+      const effectiveVersion = active[0];
+      const violations = validateInvariants(combinedView(root!, effectiveVersion));
+      const report = evaluateGovernance(root!, effectiveVersion);
+      return {
+        version: effectiveVersion ?? "baseline",
+        passed: violations.length === 0,
+        violations,
+        policy_violations: report.violations,
+        warnings: report.warnings,
+        target_file_missing: report.target_file_missing,
+        derives_residue: report.derives_residue,
+      };
     },
   },
 

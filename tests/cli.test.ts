@@ -1,4 +1,4 @@
-// [TDD]-cli_tests — cli 域制品的集成验收，覆盖 [FSD]-ait-core-cli:TEST 第 1~11 条：
+// [TDD]-cli_tests — cli 域制品的集成验收，覆盖 [FSD]-ait-core-cli:TEST 第 1~13 条：
 // 1. 双入口一致（dispatch() 返回值 vs bin 子进程 stdout JSON deep-equal，单段输出）
 // 2. USAGE_ERROR 矩阵（未知命令/缺参数/非法 flag 值/未知 flag/布尔 flag 带值，exit 1，不进业务逻辑）
 // 3. 校验类语义（违规 {ok:true,data:{passed:false,violations}} 且 exit 0）
@@ -17,6 +17,7 @@
 // bin 入口使用实际构建的 dist/src/bin.js；运行本文件前先 npm run build。
 // v0.10：成功信封显式 next_action，讨论保留写入意图，codegen 交付文件可校验，
 // dispatch/runCli 返回后调用者继续运行；安装与包根导入由 dogfood/system tests 覆盖。
+// v0.11：共享治理诊断、有效版本选择、confirm/merge 定位一致和 init 未就绪透传。
 
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
@@ -132,6 +133,18 @@ async function dispatchIn(cwd: string, argv: string[]): Promise<CoreResult> {
 	} finally {
 		process.chdir(prev);
 	}
+}
+
+
+/** 两入口只读对拍：连失败路径也核对整树字节与单 JSON 退出语义。 */
+async function readOnlyBoth(dir: string, argv: string[], status = 0): Promise<CoreResult> {
+	const before = digestTree(dir);
+	const viaDispatch = await dispatchIn(dir, argv);
+	const viaBin = await runBin(dir, argv);
+	expect(digestTree(dir)).toEqual(before);
+	expect(viaBin.status, viaBin.stderr || viaBin.stdout).toBe(status);
+	expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
+	return viaDispatch;
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +761,10 @@ describe("校验类语义", () => {
 				violations: Array<{ code: unknown; message: unknown }>;
 			};
 			expect(data.passed).toBe(false);
+			expect(data).toMatchObject({
+				version: "baseline", policy_violations: [], warnings: [],
+				target_file_missing: [], derives_residue: [],
+			});
 			expect(Array.isArray(data.violations)).toBe(true);
 			expect(data.violations.length).toBeGreaterThan(0);
 			for (const v of data.violations) {
@@ -767,12 +784,213 @@ describe("校验类语义", () => {
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch).toEqual({
 			ok: true,
-			data: { passed: true, violations: [], next_action: null },
+			data: {
+				version: "baseline", passed: true, violations: [], policy_violations: [],
+				warnings: [], target_file_missing: [], derives_residue: [], next_action: null,
+			},
 		});
 		const viaBin = await runBin(dir, argv);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// v0.11 — 只读策略诊断与有效版本选择
+// ---------------------------------------------------------------------------
+
+describe("共享治理诊断", () => {
+	const diagnosticArgv = ["specgraph", "validate-new-model"];
+	const missingTarget = {
+		code: "TDD_TARGET_FILE_MISSING", chunkId: "[TDD]-demo",
+		file: "tdd/[TDD]-demo", targetFile: "src/demo.ts", message: expect.any(String),
+	};
+	const residue = {
+		code: "DERIVES_RESIDUE", chunkId: "[FSD]-demo:feature",
+		file: "fsd/[FSD]-demo", message: expect.any(String),
+	};
+
+	/** 使用实际重建入口使索引/图与正文一致，治理和版本门禁均不 mock。 */
+	async function makeGovernanceSkeleton(policy: Record<string, unknown> = {}): Promise<string> {
+		const dir = makeBaselineSkeleton();
+		writeDoc(dir, "fsd/[FSD]-demo.md", FSD_BODY + "\n提及 [PRD]-demo:legacy。\n");
+		successData(await dispatchIn(dir, ["reindex"]));
+		successData(await dispatchIn(dir, ["specgraph", "sync"]));
+		writeVersionMeta(dir, VERSION, { phase: "tdd-confirm" });
+		writeVersionIndex(dir, VERSION, []);
+		fs.writeFileSync(path.join(dir, "project-docs/.meta/config.yaml"), JSON.stringify(policy));
+		return dir;
+	}
+
+	it("默认 warn 完整可见，图 passed 保持 true，与实际 confirm 的问题及定位相同", async () => {
+		const dir = await makeGovernanceSkeleton();
+		const diagnostic = successData(await readOnlyBoth(dir, diagnosticArgv));
+		const confirmed = successData(await dispatchIn(dir, ["version", "confirm", VERSION]));
+		expect(confirmed.passed).toBe(true);
+		expect(confirmed.warnings).toEqual(expect.arrayContaining([
+			{ ...missingTarget, enforcement: "warn" }, { ...residue, enforcement: "warn" },
+		]));
+		expect(confirmed.warnings).toHaveLength(2);
+		expect(diagnostic).toEqual({
+			version: VERSION, passed: true, violations: [], policy_violations: [],
+			warnings: confirmed.warnings,
+			target_file_missing: [{ ...missingTarget, enforcement: "warn" }],
+			derives_residue: [{ ...residue, enforcement: "warn" }], next_action: null,
+		});
+	});
+
+	for (const policy of ["target_file_existence", "derives_residue"] as const) {
+		it(policy + " block：诊断 exit 0，保留其余 warning，实际 confirm 同码同定位拒绝", async () => {
+			const dir = await makeGovernanceSkeleton({ [policy]: { enforcement: "block" } });
+			const diagnostic = successData(await readOnlyBoth(dir, diagnosticArgv));
+			const blocked = policy === "target_file_existence" ? missingTarget : residue;
+			const warned = policy === "target_file_existence" ? residue : missingTarget;
+			const confirmed = await readOnlyBoth(dir, ["version", "confirm", VERSION], 1);
+			expect(confirmed).toMatchObject({ ok: false, code: "INVARIANT_VIOLATION" });
+			if (confirmed.ok) throw new Error("block 策略必须拒绝 confirm");
+			for (const detail of [blocked.code, blocked.chunkId, blocked.file]) {
+				expect(confirmed.error).toContain(detail);
+			}
+			if ("targetFile" in blocked) expect(confirmed.error).toContain(blocked.targetFile);
+			expect(diagnostic).toEqual({
+				version: VERSION, passed: true, violations: [],
+				policy_violations: [{ ...blocked, enforcement: "block" }],
+				warnings: [{ ...warned, enforcement: "warn" }],
+				target_file_missing: [{ ...missingTarget, enforcement: policy === "target_file_existence" ? "block" : "warn" }],
+				derives_residue: [{ ...residue, enforcement: policy === "derives_residue" ? "block" : "warn" }],
+				next_action: null,
+			});
+		});
+	}
+
+	it("confirm 后基线制品消失：诊断与实际 merge 对同一路径报告并阻断", async () => {
+		const dir = await makeGovernanceSkeleton({ target_file_existence: { enforcement: "block" } });
+		const artifact = path.join(dir, "src/demo.ts");
+		fs.mkdirSync(path.dirname(artifact), { recursive: true });
+		fs.writeFileSync(artifact, "export const demo = true;\n");
+		expect(successData(await dispatchIn(dir, ["version", "confirm", VERSION])).passed).toBe(true);
+		fs.unlinkSync(artifact);
+		const diagnostic = successData(await readOnlyBoth(dir, diagnosticArgv));
+		const merged = await readOnlyBoth(dir, ["version", "merge", VERSION], 1);
+		expect(merged).toMatchObject({ ok: false, code: "INVARIANT_VIOLATION" });
+		if (merged.ok) throw new Error("缺失基线制品必须阻断 merge");
+		for (const detail of [missingTarget.code, missingTarget.chunkId, missingTarget.file, missingTarget.targetFile]) {
+			expect(merged.error).toContain(detail);
+		}
+		expect(diagnostic.passed).toBe(true);
+		expect(diagnostic.policy_violations).toEqual([{ ...missingTarget, enforcement: "block" }]);
+		expect(diagnostic.target_file_missing).toEqual(diagnostic.policy_violations);
+	});
+
+	for (const [name, config] of [
+		["损坏 YAML", "target_file_existence: [\n"],
+		["非法强度", JSON.stringify({ target_file_existence: { enforcement: "ignore" } })],
+	] as const) {
+		it(name + "：诊断与实际 confirm 透传 CONFIG_UNREADABLE，双入口零写入", async () => {
+			const dir = await makeGovernanceSkeleton();
+			fs.writeFileSync(path.join(dir, "project-docs/.meta/config.yaml"), config);
+			const confirmed = await readOnlyBoth(dir, ["version", "confirm", VERSION], 1);
+			expect(confirmed).toMatchObject({ ok: false, code: "CONFIG_UNREADABLE" });
+			const diagnostic = await readOnlyBoth(dir, diagnosticArgv, 1);
+			expect(diagnostic).toEqual(confirmed);
+		});
+	}
+});
+
+describe("诊断有效版本", () => {
+	const diagnosticArgv = ["specgraph", "validate-new-model"];
+
+	/** 版本独有 TDD：默认诊断必须读到，merged 归档则不能污染 baseline。 */
+	function addVersionTarget(
+		dir: string, version: string, target: string, overrides: Record<string, unknown> = {},
+	): void {
+		writeVersionMeta(dir, version, { phase: "tdd-confirm", ...overrides });
+		writeVersionIndex(dir, version, [{
+			...idxEntry("[TDD]-current", "working"), file: "tdd/[TDD]-current", heading: "demo TDD",
+		}]);
+		const document = path.join(dir, "project-docs", "versions", version, "tdd/[TDD]-current.md");
+		fs.mkdirSync(path.dirname(document), { recursive: true });
+		fs.writeFileSync(document, tddDoc().replaceAll("[TDD]-demo", "[TDD]-current").replace("src/demo.ts", target));
+		const uri = "spec:tdd:" + version + ":[TDD]-current";
+		fs.writeFileSync(path.join(dir, "project-docs/.meta/specgraph-" + version + ".yaml"), JSON.stringify({
+			version: 1, updated: "2026-01-01T00:00:00+00:00",
+			specs: [{ uri, title: "demo TDD", type: "tdd", version, chunk_id: "[TDD]-current",
+				file: "tdd/[TDD]-current", metadata: { source: "version" } }],
+			edges: [{ src: "spec:fsd:baseline:[FSD]-demo:feature", dst: uri, rel: "details",
+				weight: 1, metadata: { source: "new-model-cli" } }],
+		}));
+	}
+
+	it("无参数选择唯一活动版本，发现新 TDD 目标，不被数值更大的 merged 版本替代", async () => {
+		const dir = makeBaselineSkeleton();
+		fs.mkdirSync(path.join(dir, "src"));
+		fs.writeFileSync(path.join(dir, "src/demo.ts"), "export {};\n");
+		addVersionTarget(dir, "v9.9", "src/stale.ts", { phase: "merged", merged_at: "2026-01-02T00:00:00+00:00" });
+		addVersionTarget(dir, VERSION, "src/current.ts");
+		const implicit = successData(await readOnlyBoth(dir, diagnosticArgv));
+		const explicit = successData(await readOnlyBoth(dir, [...diagnosticArgv, "--version", VERSION]));
+		expect(implicit).toEqual(explicit);
+		const finding = {
+			code: "TDD_TARGET_FILE_MISSING", chunkId: "[TDD]-current", file: "tdd/[TDD]-current",
+			targetFile: "src/current.ts", enforcement: "warn", message: expect.any(String),
+		};
+		expect(implicit).toEqual({
+			version: VERSION, passed: true, violations: [], policy_violations: [],
+			warnings: [finding], target_file_missing: [finding], derives_residue: [], next_action: null,
+		});
+	});
+
+	for (const explicit of [false, true]) {
+		it((explicit ? "显式 merged 版本" : "没有活动版本") + "：只诊断 baseline 有效目标", async () => {
+			const dir = makeBaselineSkeleton();
+			addVersionTarget(dir, VERSION, "src/stale.ts", { phase: "merged", merged_at: "2026-01-02T00:00:00+00:00" });
+			const data = successData(await readOnlyBoth(dir, [
+				...diagnosticArgv, ...(explicit ? ["--version", VERSION] : []),
+			]));
+			const finding = {
+				code: "TDD_TARGET_FILE_MISSING", chunkId: "[TDD]-demo", file: "tdd/[TDD]-demo",
+				targetFile: "src/demo.ts", enforcement: "warn", message: expect.any(String),
+			};
+			expect(data).toEqual({
+				version: "baseline", passed: true, violations: [], policy_violations: [],
+				warnings: [finding], target_file_missing: [finding], derives_residue: [], next_action: null,
+			});
+		});
+	}
+
+	it("显式缺失版本：VERSION_NOT_FOUND，不回退 baseline", async () => {
+		const dir = makeBaselineSkeleton();
+		const result = await readOnlyBoth(dir, [...diagnosticArgv, "--version", "v9.9"], 1);
+		expect(result).toMatchObject({ ok: false, code: "VERSION_NOT_FOUND", error: expect.stringContaining("v9.9") });
+	});
+
+	it("两个真实活动元数据：ACTIVE_VERSION_CONFLICT，明确列出冲突版本", async () => {
+		const dir = makeBaselineSkeleton();
+		writeVersionMeta(dir, VERSION);
+		writeVersionMeta(dir, "v0.5");
+		const result = await readOnlyBoth(dir, diagnosticArgv, 1);
+		expect(result).toMatchObject({ ok: false, code: "ACTIVE_VERSION_CONFLICT" });
+		if (result.ok) throw new Error("多活动版本不能静默选择");
+		expect(result.error).toContain(VERSION);
+		expect(result.error).toContain("v0.5");
+	});
+
+	for (const [name, contents, code] of [
+		["坏 YAML", "phase: [\n", "YAML_PARSE_ERROR"],
+		["非法元数据", JSON.stringify({ version: VERSION, created_at: "2026-01-01T00:00:00+00:00", phase: "unknown" }), "SCHEMA_VALIDATION_ERROR"],
+	] as const) {
+		for (const explicit of [false, true]) {
+			it(name + (explicit ? " 显式版本" : " 自动选择") + "：原始稳定错误与路径透传", async () => {
+				const dir = makeBaselineSkeleton();
+				const meta = path.join(dir, "project-docs/.meta/versions", VERSION + ".yaml");
+				fs.writeFileSync(meta, contents);
+				const result = await readOnlyBoth(dir, [
+					...diagnosticArgv, ...(explicit ? ["--version", VERSION] : []),
+				], 1);
+				expect(result).toMatchObject({ ok: false, code, error: expect.stringContaining(meta) });
+			});
+		}
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1367,118 @@ describe("参数形态", () => {
 		}
 		expect(digestTree(dir)).toEqual(before);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// v0.11 — fsd decompose 的文件正文兼容
+// ---------------------------------------------------------------------------
+
+describe("fsd decompose --content-file", () => {
+	const PARENT = "[FSD]-demo:decomposition";
+	const CHILD = "[FSD]-child";
+	const argv = ["fsd", "decompose", PARENT, CHILD, "--action", "add"];
+	const body = [
+		"<!-- @id:[FSD]-child -->", "## 中文子功能", "", "### 功能描述",
+		"第一行：从父功能分解出的新子功能。", "第二行：文件与内联正文应保持一致。", "",
+		"<!-- @id:[FSD]-child:feature -->", "### 子功能实现", "", "保留多行中文与空行。", "",
+	].join("\n");
+
+	/** 容器父文件不含 details 子 TDD；图经真实入口与正文同步。 */
+	async function makeDecomposeSkeleton(): Promise<string> {
+		const dir = makeSkeleton();
+		writeDoc(dir, "prd/[PRD]-demo.md", prdDoc("[PRD]-demo"));
+		writeDoc(dir, "fsd/[FSD]-demo.md", [
+			"<!-- @id:[FSD]-demo -->", "## demo FSD", "", "### 功能描述", "演示功能。", "",
+			"<!-- @id:" + PARENT + " -->", "### 待分解功能", "", "由新子 FSD 负责实现。", "",
+		].join("\n"));
+		const rows = [
+			["[PRD]-demo", "prd", "prd/[PRD]-demo"],
+			["[FSD]-demo", "fsd", "fsd/[FSD]-demo"],
+			[PARENT, "fsd", "fsd/[FSD]-demo"],
+		] as const;
+		const specs = rows.map(([id, type, file]) => ({
+			uri: "spec:" + type + ":baseline:" + id, title: id, type, version: "baseline",
+			chunk_id: id, file, metadata: { source: "baseline" },
+		}));
+		writeBaselineGraph(dir, {
+			version: 1, updated: "2026-01-01T00:00:00+00:00", specs,
+			edges: [
+				{ src: specs[0]!.uri, dst: specs[1]!.uri, rel: "derives", weight: 1, metadata: { source: "new-model-cli" } },
+			],
+		});
+		successData(await dispatchIn(dir, ["reindex"]));
+		successData(await dispatchIn(dir, ["specgraph", "sync"]));
+		writeVersionMeta(dir, VERSION, { phase: "prd-confirm" });
+		return dir;
+	}
+
+	it("两入口使用同意图 token 写入新 child：文件与内联正文等价且 decomposes 边正确", async () => {
+		const documents: Buffer[] = [];
+		for (const entry of ["dispatch", "bin"] as const) {
+			for (const source of ["--content", "--content-file"] as const) {
+				const dir = await makeDecomposeSkeleton();
+				const contentFile = path.join(dir, "分解 正文.md");
+				fs.writeFileSync(contentFile, body);
+				const run = async (args: string[]): Promise<CoreResult> => {
+					if (entry === "dispatch") return dispatchIn(dir, args);
+					const result = await runBin(dir, args);
+					expect(result.status, result.stderr || result.stdout).toBe(0);
+					return parseSingleJson(result.stdout);
+				};
+				const before = digestTree(dir);
+				const context = successData(await run(argv));
+				expect(context.mode).toBe("discussion-context");
+				expect(context.context_token).toEqual(expect.any(String));
+				expect(digestTree(dir)).toEqual(before);
+				const result = await run([
+					...argv, source, source === "--content" ? body : contentFile,
+					"--context-token", context.context_token as string,
+				]);
+				expect(successData(result).next_action).toBe(null);
+				const childFile = path.join(dir, "project-docs", "versions", VERSION, "fsd", CHILD + ".md");
+				const bytes = fs.readFileSync(childFile);
+				expect(bytes.toString("utf8").replace(/\r\n/g, "\n")).toContain(body.trim());
+				documents.push(bytes);
+				const graph = successData(await readOnlyBoth(dir, ["specgraph", "export", "--version", VERSION]));
+				expect(graph.specs).toEqual(expect.arrayContaining([
+					expect.objectContaining({ chunk_id: CHILD }),
+				]));
+				expect(graph.edges).toEqual(expect.arrayContaining([
+					expect.objectContaining({
+						src: expect.stringContaining(PARENT), dst: expect.stringContaining(CHILD), rel: "decomposes",
+					}),
+				]));
+			}
+		}
+		for (const document of documents) expect(document).toEqual(documents[0]);
+	}, 20_000);
+
+	for (const [name, expectedError] of [
+		["同现互斥", "互斥"], ["不可读文件", "--content-file"], ["未知参数", "--nope"],
+	] as const) {
+		it(name + "：双入口 USAGE_ERROR、exit 1，目录字节不变", async () => {
+			const dir = await makeDecomposeSkeleton();
+			const contentFile = path.join(dir, "分解 正文.md");
+			fs.writeFileSync(contentFile, body);
+			const context = successData(await dispatchIn(dir, argv));
+			expect(context.mode).toBe("discussion-context");
+			expect(context.context_token).toEqual(expect.any(String));
+			const args = [
+				...argv, "--context-token", context.context_token as string,
+				"--content-file", name === "不可读文件" ? path.join(dir, "不存在.md") : contentFile,
+				...(name === "同现互斥" ? ["--content", body] : []),
+				...(name === "未知参数" ? ["--nope", "1"] : []),
+			];
+			const before = digestTree(dir);
+			const viaDispatch = await dispatchIn(dir, args);
+			expect(viaDispatch).toMatchObject({ ok: false, code: "USAGE_ERROR", error: expect.stringContaining(expectedError) });
+			expect(digestTree(dir)).toEqual(before);
+			const viaBin = await runBin(dir, args);
+			expect(viaBin.status, viaBin.stderr || viaBin.stdout).toBe(1);
+			expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
+			expect(digestTree(dir)).toEqual(before);
+		});
+	}
 });
 
 // ---------------------------------------------------------------------------
@@ -1604,6 +1934,25 @@ describe("init 参数", () => {
 		expect(digestTree(dir)).toEqual(before);
 		expect(metaDigest(dir)).toEqual(meta);
 	});
+
+
+	for (const refresh of [false, true]) {
+		it("--check" + (refresh ? " --refresh-wrapper" : "") + "：已存在但无效的 wrapper 保持未就绪，双入口只读", async () => {
+			const dir = mkTmp();
+			successData(await dispatchIn(dir, ["init", "--name", "demo"]));
+			const wrapper = path.join(dir, PLATFORM_WRAPPER_REL);
+			const invalid = IS_WINDOWS ? "@echo off\r\nexit /b 0\r\n" : "#!/bin/sh\nexit 0\n";
+			fs.writeFileSync(wrapper, invalid);
+			const result = await readOnlyBoth(dir, [
+				"init", "--check", ...(refresh ? ["--refresh-wrapper"] : []),
+			]);
+			expect(result).toEqual({
+				ok: true, data: { ok: false, missing: [PLATFORM_WRAPPER_REL], next_action: null },
+			});
+			expect(fs.existsSync(wrapper)).toBe(true);
+			expect(fs.readFileSync(wrapper, "utf8")).toBe(invalid);
+		});
+	}
 
 	it("--refresh-wrapper：只重写本平台 wrapper，其余文件与 .meta 不动", async () => {
 		const dir = mkTmp();

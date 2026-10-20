@@ -1,4 +1,4 @@
-// [TDD]-versioning_tests v0.10 — versioning 域三个制品（version-manager / merge-engine /
+// [TDD]-versioning_tests v0.11 — versioning 域三个制品（version-manager / merge-engine /
 // publish）的集成验收，覆盖 [FSD]-ait-core-versioning:TEST 第 1~8 条全部断言点。
 //
 // 持久化形态按 Python 当前形态断言（v0.5 对齐，doc-model schemas 为权威）：
@@ -109,7 +109,7 @@ import {
   type ProjectRoot,
 } from "../src/foundation/root.js";
 import { loadModel, saveModel } from "../src/foundation/yaml.js";
-import { writeLocalConfig } from "../src/foundation/config.js";
+import { loadConfig, writeLocalConfig } from "../src/foundation/config.js";
 import {
   ChangeRecordSchema,
   SpecGraphSchema,
@@ -2466,6 +2466,267 @@ describe("原始图端点门禁", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// v0.11 — 连续迭代基线隔离与既有治理策略
+// ---------------------------------------------------------------------------
+
+function expectBaselineLifecycleClean(root: ProjectRoot): void {
+  const baseline = new SpecGraphStore(root).load();
+  expect(baseline.specs.length).toBeGreaterThan(0);
+  for (const node of baseline.specs) {
+    for (const field of ["state", "action", "commit_id", "fsd_declaration_overrides"]) {
+      expect(node.metadata).not.toHaveProperty(field);
+    }
+  }
+}
+
+/** 只在第一轮 merge 后取一次预期；所有第二轮操作共用该字节基准。 */
+async function exerciseSecondRoundIsolation(
+  root: ProjectRoot,
+  version: string,
+  docs: { prdId: string; prd: string; fsdId: string; fsd: string; tddId: string; tdd: string },
+): Promise<void> {
+  expectBaselineLifecycleClean(root);
+  const baselineDocs = treeDigest(root.docs);
+  const baselineNames = ["chunks-index.yaml", "specgraph.yaml"];
+  const baselineMeta = fileDigests(root.meta, baselineNames);
+  const history = metaHistoryDigests(root.meta);
+  const unchanged = (): void => {
+    expectSameDigest(baselineDocs, treeDigest(root.docs));
+    expectSameDigest(baselineMeta, fileDigests(root.meta, baselineNames));
+    expectSameDigest(history, fileDigests(root.meta, [...history.keys()]));
+  };
+  const command = async (args: string[]): Promise<Record<string, unknown>> => {
+    const result = await dispatchOk(root.cwd, args);
+    unchanged();
+    return result;
+  };
+  await command(["version", "create", version]);
+  await createWithContext(root, "prd", docs.prdId, docs.prd + "\n\n第二轮概述。", ["--action", "modify"]);
+  unchanged();
+  await command(["prd", "confirm"]);
+  await command(["prd", "revert"]);
+  await createWithContext(root, "prd", docs.prdId, docs.prd + "\n\n第二轮返工后的概述。", ["--action", "modify"]);
+  unchanged();
+  await command(["prd", "confirm"]);
+  await createWithContext(root, "fsd", docs.fsdId, docs.fsd + "\n\n第二轮能力说明。", ["--action", "modify"]);
+  unchanged();
+  await command(["fsd", "confirm"]);
+  const tddOptions = ["--parent", docs.fsdId, "--action", "modify"];
+  await createWithContext(root, "tdd", docs.tddId, docs.tdd + "\n\n第二轮实现说明。", tddOptions);
+  unchanged();
+  const committed = await command(["version", "commit", version]);
+  expect(committed["committed"]).toContain(docs.tddId);
+  await command(["tdd", "confirm"]);
+  await command(["tdd", "revert"]);
+  await createWithContext(root, "tdd", docs.tddId, docs.tdd + "\n\n第二轮返工后的实现说明。", tddOptions);
+  unchanged();
+  await command(["tdd", "confirm"]);
+  const confirmed = await command(["version", "confirm", version]);
+  expect(confirmed["passed"]).toBe(true);
+  expect(confirmed["plan_fingerprint"]).toMatch(/^[0-9a-f]{64}$/);
+  await command(["version", "revert", version, "--confirm"]);
+  expect(fs.existsSync(path.join(root.root, "versions", version))).toBe(false);
+  expectSameDigest(history, metaHistoryDigests(root.meta));
+}
+
+/** 第一轮真实合入带 TDD 的基线，再开启只修改 PRD 的纯文档版本。 */
+async function documentVersionOverTddBaseline(root: ProjectRoot): Promise<VersionManager> {
+  const vm = await buildGenerationVersion(root);
+  writeDemoArtifact(root);
+  await vm.versionConfirm(V);
+  await versionMerge(root, V);
+  await dispatchOk(root.cwd, ["version", "create", "v0.5"]);
+  await createWithContext(root, "prd", "[PRD]-demo", PRD_DOC + "\n\n纯文档更新。", ["--action", "modify"]);
+  await dispatchOk(root.cwd, ["prd", "confirm"]);
+  expect(new IndexManager(root).loadVersionIndex("v0.5").chunks.map((chunk) => chunk.id)).toEqual(["[PRD]-demo"]);
+  return vm;
+}
+
+describe("连续两轮基线字节隔离", () => {
+  it("第一轮 merge 清理生命周期；第二轮逐层写入、confirm、返工、commit 与未合入 revert 均不改基线或历史", { timeout: T }, async () => {
+    const { root } = makeEnv();
+    const vm = await buildGenerationVersion(root);
+    writeDemoArtifact(root);
+    await vm.versionConfirm(V);
+    const graphName = "specgraph-" + V + ".yaml";
+    const versionGraph = fileDigests(root.meta, [graphName]);
+    await versionMerge(root, V);
+    expectSameDigest(versionGraph, fileDigests(root.meta, [graphName]));
+    await exerciseSecondRoundIsolation(root, "v0.5", {
+      prdId: "[PRD]-demo", prd: PRD_DOC,
+      fsdId: "[FSD]-demo:implementation", fsd: FSD_LEAF_DOC,
+      tddId: "[TDD]-demo", tdd: TDD_DOC,
+    });
+  });
+});
+
+describe("既有治理策略的版本门禁", () => {
+  it.each(["confirm", "merge"] as const)("纯文档版本 %s 仍阻断缺失的基线制品，零提交且受管目录零落盘", { timeout: T }, async (gate) => {
+    const { root } = makeEnv();
+    const vm = await documentVersionOverTddBaseline(root);
+    writeLocalConfig(root.meta, {
+      target_file_existence: { enforcement: "block" },
+      generation_receipts: { enforcement: "block" },
+    });
+    if (gate === "merge") {
+      const confirmed = await vm.versionConfirm("v0.5");
+      expect(confirmed.warnings).toEqual([]);
+      expect(confirmed.generation_receipts).toEqual({ enforcement: "block", passed: true, findings: [] });
+    }
+    fs.rmSync(path.join(root.cwd, "src/demo.ts"));
+    const before = managedSnapshot(root);
+    const heads = [root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]));
+    const error = await captureErr(gate === "confirm" ? vm.versionConfirm("v0.5") : versionMerge(root, "v0.5"));
+    expect(error).toMatchObject({ code: "INVARIANT_VIOLATION" });
+    expect((error as Error).message).toContain("TDD_TARGET_FILE_MISSING");
+    expect((error as Error).message).toContain("[TDD]-demo");
+    expect((error as Error).message).toContain("src/demo.ts");
+    expectManagedUnchanged(root, before);
+    expect([root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]))).toEqual(heads);
+  });
+
+  it("确认后删除本版制品仍报计划过期，并保留缺失制品的治理定位", { timeout: T }, async () => {
+    const { root } = makeEnv();
+    const { vm } = await generatedVersion(root);
+    writeLocalConfig(root.meta, { target_file_existence: { enforcement: "block" } });
+    const confirmed = await vm.versionConfirm(V);
+    fs.rmSync(path.join(root.cwd, "src/demo.ts"));
+    const before = managedSnapshot(root);
+    const heads = [root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]));
+    const error = await captureErr(versionMerge(root, V));
+    expect(error).toMatchObject({ code: "CONFIRMATION_STALE" });
+    expect((error as Error).message).toContain("TDD_TARGET_FILE_MISSING");
+    expect((error as Error).message).toContain("[TDD]-demo");
+    expect((error as Error).message).toContain("src/demo.ts");
+    expect((error as Error).message).toContain("recovery");
+    expectManagedUnchanged(root, before);
+    expect(readMeta(root, V).confirmed_plan?.input_fingerprint).toBe(confirmed.plan_fingerprint);
+    expect([root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]))).toEqual(heads);
+  });
+
+  it("warn 在 confirm/merge 返回相同定位，纯文档回执豁免且未配 scope 的非 Git 宿主可用", { timeout: T }, async () => {
+    const { root } = makeEnv({ hostGit: false });
+    const vm = await documentVersionOverTddBaseline(root);
+    writeLocalConfig(root.meta, {
+      target_file_existence: { enforcement: "warn" },
+      generation_receipts: { enforcement: "block" },
+    });
+    fs.rmSync(path.join(root.cwd, "src/demo.ts"));
+    const confirmed = await vm.versionConfirm("v0.5");
+    expect(confirmed.warnings).toEqual([expect.objectContaining({
+      code: "TDD_TARGET_FILE_MISSING", chunkId: "[TDD]-demo", file: "tdd/[TDD]-demo",
+      targetFile: "src/demo.ts", enforcement: "warn",
+    })]);
+    expect(confirmed.generation_receipts).toEqual({ enforcement: "block", passed: true, findings: [] });
+    expect(confirmed.code_result).toBeNull();
+    const merged = await versionMerge(root, "v0.5");
+    expect(merged.warnings).toEqual(confirmed.warnings);
+    expect(merged.generation_receipts).toEqual(confirmed.generation_receipts);
+    expect(readMeta(root, "v0.5").code_result).toBeNull();
+    expect(fs.existsSync(path.join(root.cwd, ".git"))).toBe(false);
+  });
+
+  it("验收成功但删除基线制品时按最终事实阻断，不能提交宿主或保存确认计划", { timeout: T }, async () => {
+    const { root } = makeEnv();
+    const vm = await documentVersionOverTddBaseline(root);
+    writeLocalConfig(root.meta, { target_file_existence: { enforcement: "block" } });
+    acceptanceSet(root, 'node -e "require(\'node:fs\').unlinkSync(\'src/demo.ts\')"');
+    const before = managedSnapshot(root);
+    const heads = [root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]));
+    const error = await captureErr(vm.versionConfirm("v0.5"));
+    expect(error).toMatchObject({ code: "INVARIANT_VIOLATION" });
+    expect((error as Error).message).toContain("TDD_TARGET_FILE_MISSING");
+    expect(fs.existsSync(path.join(root.cwd, "src/demo.ts"))).toBe(false);
+    expectManagedUnchanged(root, before);
+    expect(readMeta(root, "v0.5").confirmed_plan).toBeNull();
+    expect([root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]))).toEqual(heads);
+  });
+
+  it.each([
+    { target_file_existence: { enforcement: "report" } },
+    { artifact_scopes: { tests: { parent_suffix: "TEST", enforcement: "block" } } },
+    { derives_residue: { enforcement: "ignore" } },
+  ])("坏治理配置拒绝且零落盘：%j", { timeout: T }, async (policy) => {
+    const { root } = makeEnv({ hostGit: false });
+    const vm = await advanceToCommit(root);
+    writeLocalConfig(root.meta, policy);
+    const before = managedSnapshot(root);
+    await expectErrCode(vm.versionConfirm(V), "CONFIG_UNREADABLE");
+    expectManagedUnchanged(root, before);
+  });
+
+  for (const enforcement of ["warn", "block"] as const) {
+    it.each(["UNCOVERED_ARTIFACT", "TEST_SPLIT_UNCOVERED", "DERIVES_RESIDUE"] as const)(
+      enforcement + " 治理实际 %s，warn 在 merge 保留诊断，block 不落盘", { timeout: T }, async (code) => {
+        const { root } = makeEnv();
+        const vm = new VersionManager(root);
+        vm.versionCreate(V);
+        await createWithContext(root, "prd", "[PRD]-demo", PRD_DOC + "\n\n" + seedRequirement("[PRD]-demo:behavior", "demo 制品"));
+        await dispatchOk(root.cwd, ["prd", "confirm"]);
+        const leaf = code === "TEST_SPLIT_UNCOVERED"
+          ? FSD_LEAF_DOC.replaceAll(":implementation", ":TEST")
+          : FSD_LEAF_DOC + (code === "DERIVES_RESIDUE" ? "\n\n满足 [PRD]-demo:behavior。" : "");
+        await createWithContext(root, "fsd", "[FSD]-demo", FSD_DOC + "\n\n" + leaf, ["--parent", "[PRD]-demo"]);
+        await dispatchOk(root.cwd, ["fsd", "confirm"]);
+        if (code === "DERIVES_RESIDUE") {
+          writeLocalConfig(root.meta, { derives_residue: { enforcement } });
+        } else {
+          writeLocalConfig(root.meta, { artifact_scopes: { tests: { parent_suffix: ":TEST", enforcement } } });
+        }
+        if (code === "UNCOVERED_ARTIFACT") {
+          fs.mkdirSync(path.join(root.cwd, "tests"));
+          fs.writeFileSync(path.join(root.cwd, "tests/unmanaged.test.ts"), "export {};\n");
+          git(root.cwd, ["add", "--", "tests/unmanaged.test.ts"]);
+        }
+        const before = managedSnapshot(root);
+        const hostHead = git(root.cwd, ["rev-parse", "HEAD"]);
+        if (enforcement === "block") {
+          const error = await captureErr(vm.versionConfirm(V));
+          expect(error).toMatchObject({ code: "INVARIANT_VIOLATION" });
+          expect((error as Error).message).toContain(code);
+          expectManagedUnchanged(root, before);
+          expect(git(root.cwd, ["rev-parse", "HEAD"])).toBe(hostHead);
+        } else {
+          const confirmed = await vm.versionConfirm(V);
+          expect(confirmed.warnings).toEqual([expect.objectContaining({ code, enforcement })]);
+          expect((await versionMerge(root, V)).warnings).toEqual(confirmed.warnings);
+        }
+      },
+    );
+  }
+
+  it.each(["existence", "scope", "path-exemption", "node-exemption", "derives"] as const)(
+    "确认后 %s 策略变化使计划过期，重新确认后可合入", { timeout: T }, async (change) => {
+      const { root } = makeEnv();
+      const vm = await advanceToCommit(root);
+      const scopes = { tests: { parent_suffix: ":TEST", enforcement: "warn", exempt_paths: [] as string[], exempt_test_splits: [] as string[] } };
+      writeLocalConfig(root.meta, {
+        artifact_scopes: scopes, target_file_existence: { enforcement: "warn" }, derives_residue: { enforcement: "warn" },
+      });
+      const confirmed = await vm.versionConfirm(V);
+      expect(confirmed.warnings).toEqual([]);
+      expect((await vm.versionConfirm(V)).plan_fingerprint).toBe(confirmed.plan_fingerprint);
+      if (change === "existence") writeLocalConfig(root.meta, { target_file_existence: { enforcement: "block" } });
+      if (change === "derives") writeLocalConfig(root.meta, { derives_residue: { enforcement: "block" } });
+      if (change === "scope") scopes.tests.enforcement = "block";
+      if (change === "path-exemption") scopes.tests.exempt_paths.push("tests/future.test.ts");
+      if (change === "node-exemption") scopes.tests.exempt_test_splits.push("[FSD]-demo:TEST");
+      if (["scope", "path-exemption", "node-exemption"].includes(change)) writeLocalConfig(root.meta, { artifact_scopes: scopes });
+      const before = managedSnapshot(root);
+      const heads = [root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]));
+      await expectErrCode(versionMerge(root, V), "CONFIRMATION_STALE");
+      expectManagedUnchanged(root, before);
+      expect([root.cwd, root.root].map((dir) => git(dir, ["rev-parse", "HEAD"]))).toEqual(heads);
+      expect(readMeta(root, V).confirmed_plan?.input_fingerprint).toBe(confirmed.plan_fingerprint);
+      const refreshed = await vm.versionConfirm(V);
+      expect(refreshed.plan_fingerprint).not.toBe(confirmed.plan_fingerprint);
+      expect((await versionMerge(root, V)).warnings).toEqual([]);
+    },
+  );
+});
+
 // [TDD]-versioning_tests v0.5 — 接管 Python 版 ait 已管理仓库（:TEST 7/8）。
 
 /** AIT_CORPUS_DIRS（";" 分隔的 .meta 目录或 project-docs 目录列表）。 */
@@ -2512,6 +2773,26 @@ function copyProjectDocsWithGit(src: string, base: string): string {
     const target = path.join(base, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(source, target);
+  }
+  const scopes = loadConfig(root.meta)["artifact_scopes"] as Record<string, unknown> | undefined;
+  if (scopes !== undefined && Object.keys(scopes).length > 0) {
+    // 配置 scope 的副本使用真实 Git 跟踪清单，连同未建 TDD 的受治理文件一起核验。
+    const sourceRoot = path.dirname(src);
+    const tracked = git(sourceRoot, ["ls-files", "-z", "--", ...Object.keys(scopes)]).split("\0").filter(Boolean);
+    for (const relative of tracked) {
+      const source = path.resolve(sourceRoot, relative);
+      const within = path.relative(sourceRoot, source);
+      if (path.isAbsolute(within) || within === ".." || within.startsWith(".." + path.sep)) {
+        throw new Error("语料受治理路径越界：" + relative);
+      }
+      if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
+      const target = path.join(base, relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(source, target);
+    }
+    fs.writeFileSync(path.join(base, ".gitignore"), "project-docs/\n");
+    initRepo(base);
+    gitCommitAll(base, "corpus artifact baseline");
   }
   return dst;
 }
@@ -3002,6 +3283,18 @@ describe("接管 Python 仓库", () => {
         ]);
         expect(impactNew["found"]).toBe(true);
         expect(impactNew["impacted"]).toContain(docs.tddId);
+
+        // 同一份百版本语料副本继续第二轮，快照先于所有第二轮操作。
+        await exerciseSecondRoundIsolation(root, "v9.10", {
+          prdId: prdRootId as string, prd: docs.prdRoot,
+          fsdId: docs.fsdSplitId, fsd: docs.fsdSplit,
+          tddId: docs.tddId, tdd: docs.tdd,
+        });
+        expect(new VersionManager(root).versionStatus(TAKEOVER_VERSION).phase).toBe("merged");
+        const historyAfterSecondRound = metaHistoryDigests(root.meta);
+        for (const [rel, hash] of historyBefore) {
+          expect(historyAfterSecondRound.get(rel)).toBe(hash);
+        }
       },
     );
   }

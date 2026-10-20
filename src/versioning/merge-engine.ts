@@ -46,6 +46,7 @@ import {
 } from "../doc-model/schemas.js";
 import { IndexManager } from "../indexing/index-manager.js";
 import { SpecGraphStore } from "../specgraph/graph-model.js";
+import { evaluateGovernance, type GovernanceFinding } from "../new-model/governance.js";
 import { verifyGenerationReceipts } from "../orchestration/generation-receipts.js";
 import {
   assertSpecIntegrity,
@@ -66,6 +67,7 @@ export interface MergeResult {
   tag_created: boolean;
   plan_fingerprint: string;
   generation_receipts: GenerationVerification;
+  warnings: GovernanceFinding[];
 }
 
 export class MergeError extends Error {
@@ -73,6 +75,7 @@ export class MergeError extends Error {
     | "CONFIRMATION_REQUIRED"
     | "CONFIRMATION_STALE"
     | "GENERATION_RECEIPTS_FAILED"
+    | "INVARIANT_VIOLATION"
     | "MERGE_ROLLBACK";
 
   constructor(
@@ -540,12 +543,12 @@ function sameOperations(
   return a.length === b.length && a.every((op, i) => sameOperation(op, b[i] as ReconciliationOperation));
 }
 
-/** 只读核验确认计划与生成回执；report 诊断随最终合并结果返回。 */
+/** 只读核验确认计划、共享治理与生成回执；诊断随最终合并结果返回。 */
 function verifyMergeInputs(
   root: ProjectRoot,
   id: string,
   plan: ReconciliationPlan,
-): GenerationVerification {
+): Pick<MergeResult, "generation_receipts" | "warnings"> {
   const policy: ConflictPolicy = plan.conflict_policy;
 
   // 过期校验：按持久化的 conflict_policy 重算计划与判定输入指纹，逐项与持久化计划比对
@@ -568,6 +571,12 @@ function verifyMergeInputs(
     );
   }
 
+  const governance = evaluateGovernance(root, id);
+  const governanceFailures = governance.violations.map((finding) =>
+    finding.code + ": " + [finding.chunkId, finding.file, finding.targetFile]
+      .filter((value) => value !== undefined).join(" / ") + " — " + finding.message,
+  ).join("\n");
+
   if (
     plan.input_fingerprint !== fingerprint ||
     policy !== expected.conflict_policy ||
@@ -579,7 +588,15 @@ function verifyMergeInputs(
         : "计划操作与当前判定输入重算结果不全等";
     throw new MergeError(
       "CONFIRMATION_STALE",
-      `确认计划已过期：${reason}（conflict_policy=${policy}）；recovery：重新执行 version confirm，再重试 merge`,
+      `确认计划已过期：${reason}（conflict_policy=${policy}）；recovery：重新执行 version confirm，再重试 merge` +
+        (governanceFailures === "" ? "" : `\n治理门禁失败：\n${governanceFailures}`),
+    );
+  }
+
+  if (governance.violations.length > 0) {
+    throw new MergeError(
+      "INVARIANT_VIOLATION",
+      "治理门禁失败：\n" + governanceFailures,
     );
   }
 
@@ -591,7 +608,7 @@ function verifyMergeInputs(
         .map((finding) => `${finding.code}: ${finding.message}`).join("\n"),
     );
   }
-  return generationReceipts;
+  return { generation_receipts: generationReceipts, warnings: governance.warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -659,10 +676,10 @@ export async function versionMerge(
     );
   }
 
-  // 首次基线写入前再次核验最终指纹与回执；门禁失败保留原错误码，零业务落盘。
-  let generationReceipts: GenerationVerification;
+  // 首次基线写入前重新读取治理事实并核验最终指纹与回执；门禁失败零业务落盘。
+  let verification: ReturnType<typeof verifyMergeInputs>;
   try {
-    generationReceipts = verifyMergeInputs(root, id, plan);
+    verification = verifyMergeInputs(root, id, plan);
   } catch (err) {
     fs.rmSync(snapshot.tmpDir, { recursive: true, force: true });
     throw err;
@@ -731,6 +748,7 @@ export async function versionMerge(
     git: commit === null ? "unavailable" : "committed",
     tag_created: tagCreated,
     plan_fingerprint: plan.input_fingerprint,
-    generation_receipts: generationReceipts,
+    generation_receipts: verification.generation_receipts,
+    warnings: verification.warnings,
   };
 }

@@ -6,7 +6,7 @@
  * - confirm 纯校验：docs 零落盘，`.meta` 只写**本版本元数据**（confirmed_plan、
  *   code_result、recovery_journal=null）；已合入版本的元数据只读；
  * - 真实文档/索引/原始图一致性只读校验，六不变式与正文契约委托 new_model validator；
- * - 回执在验收前后核验，确认指纹包含策略、交付、回执与实际制品状态；
+ * - 治理与回执在验收前后核验，确认指纹包含策略、交付、回执与实际制品状态；
  * - 制品验收：exit≠0 → ACCEPTANCE_FAILED；未配置跳过=真空通过；配置损坏
  *   CONFIG_UNREADABLE 拒而不放（foundation ConfigUnreadableError 直接上抛）；
  * - merge 的执行归 merge_engine（本文件只产出计划与指纹）；
@@ -66,6 +66,7 @@ import {
   type ViewNode,
 } from "../specgraph/graph-model.js";
 import { scanContentRelations, scanPrdRequirementContract, validateInvariants } from "../new-model/validator.js";
+import { evaluateGovernance, governancePolicyFingerprint, type GovernanceFinding } from "../new-model/governance.js";
 import { generationFingerprint, verifyGenerationReceipts } from "../orchestration/generation-receipts.js";
 
 // ---------------------------------------------------------------------------
@@ -92,6 +93,7 @@ export interface ConfirmResult {
   conflict_policy: string;
   acceptance: AcceptanceOutcome;
   generation_receipts: GenerationVerification;
+  warnings: GovernanceFinding[];
   code_result: string | null;
 }
 
@@ -550,6 +552,19 @@ export function assertSpecIntegrity(root: ProjectRoot, version: string): void {
   }
 }
 
+/** 共享治理报告：block 在任何提交前拒绝，warn 只作为结果返回。 */
+function checkGovernance(root: ProjectRoot, version: string): GovernanceFinding[] {
+  const report = evaluateGovernance(root, version);
+  if (report.violations.length > 0) {
+    throw new VersionManagerError("INVARIANT_VIOLATION",
+      "治理门禁失败：\n" + report.violations.map((finding) =>
+        finding.code + ": " + [finding.chunkId, finding.file, finding.targetFile]
+          .filter((value) => value !== undefined).join(" / ") + " — " + finding.message,
+      ).join("\n"));
+  }
+  return report.warnings;
+}
+
 /** report 只返回诊断，block 的任一 finding 都拒绝确认。 */
 function checkGenerationReceipts(root: ProjectRoot, version: string): GenerationVerification {
   const result = verifyGenerationReceipts(root, version);
@@ -637,7 +652,7 @@ export function buildReconciliation(
 /**
  * 判定输入指纹：对
  * `{baseline:[涉及的基线文件按文件名排序，每个 {file, header, chunks:[{id,content}]}],
- *   operations:[归一前操作], conflict_policy, specgraph:{baseline, version}, generation}`
+ *   operations:[归一前操作], conflict_policy, specgraph:{baseline, version}, generation, governance_policy}`
  * 做键排序的紧凑 JSON，取 sha256 小写 hex。
  */
 export function inputFingerprint(
@@ -669,6 +684,7 @@ export function inputFingerprint(
       version: graphText(ensureWithin(root.root, path.join(root.meta, `specgraph-${id}.yaml`))),
     },
     generation: generationFingerprint(root, id),
+    governance_policy: governancePolicyFingerprint(root),
   };
   return sha256Hex(canonicalJson(payload));
 }
@@ -769,7 +785,7 @@ export class VersionManager {
   /**
    * 提交：版本索引中 state∈{working,staged} 的条目逐个生成变更记录并置
    * state=committed、commit_id=c<commits.length+1>；重新保存索引后调用
-   * specgraph sync。无可提交条目报 COMMIT_EMPTY。
+   * specgraph syncVersion(id)，只同步当前版本图。无可提交条目报 COMMIT_EMPTY。
    */
   versionCommit(id: string, message = "version commit"): {
     committed: string[];
@@ -816,7 +832,7 @@ export class VersionManager {
     });
     this.saveVersionIndex(index);
     this.saveMeta(id, meta);
-    new SpecGraphStore(this.root).sync();
+    new SpecGraphStore(this.root).syncVersion(id);
 
     return { committed, changes };
   }
@@ -853,7 +869,7 @@ export class VersionManager {
   }
 
   /**
-   * confirm 门禁：已合入→拒绝；真实规格/原始图/override 校验 → 回执核验
+   * confirm 门禁：已合入→拒绝；真实规格/原始图/override 校验 → 治理与回执核验
    * → 制品验收（未配置真空通过；exit≠0 ACCEPTANCE_FAILED；配置损坏拒绝）
    * → 验收后重新核验 → buildReconciliation + inputFingerprint → 版本元数据
    * `confirmed_plan`、`recovery_journal=null` → commitHostIfDirty 绑定 code_result
@@ -871,7 +887,8 @@ export class VersionManager {
     // ① 真实文档、索引、原始图与 override 门禁（只读，违例零落盘）。
     assertSpecIntegrity(this.root, id);
 
-    // ② 验收前先检查回执，block 时不执行验收命令。
+    // ② 验收前先检查治理与回执，block 时不执行验收命令。
+    checkGovernance(this.root, id);
     checkGenerationReceipts(this.root, id);
 
     // ③ 制品验收（配置损坏由 foundation 抛 CONFIG_UNREADABLE，拒而不放）
@@ -884,7 +901,8 @@ export class VersionManager {
     }
 
     // ④ 验收可能改写制品或规格；最终状态必须重新核验，不能保存验收前快照。
-    if (acceptance.ran) assertSpecIntegrity(this.root, id);
+    assertSpecIntegrity(this.root, id);
+    const warnings = checkGovernance(this.root, id);
     const generationReceipts = checkGenerationReceipts(this.root, id);
     meta = this.loadMeta(id);
 
@@ -913,6 +931,7 @@ export class VersionManager {
       conflict_policy: conflictPolicy,
       acceptance,
       generation_receipts: generationReceipts,
+      warnings,
       code_result: meta.code_result ?? null,
     };
   }

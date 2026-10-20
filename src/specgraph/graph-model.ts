@@ -262,6 +262,16 @@ function preserveDeclarationOverrides(prev: SpecGraph, cur: SpecGraph): void {
   }
 }
 
+/** 基线元数据不携带版本生命周期字段；其余自定义字段保留。 */
+function baselineMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const baseline: Record<string, unknown> = { ...metadata, source: BASELINE };
+  delete baseline["state"];
+  delete baseline["action"];
+  delete baseline["commit_id"];
+  delete baseline[DECLARATION_OVERRIDES];
+  return baseline;
+}
+
 /** 版本图中出现的 FSD 根（旧格式 owned-scope）。 */
 function ownedRootsOf(vgraph: SpecGraph): Set<string> {
   const roots = new Set<string>();
@@ -381,7 +391,7 @@ export class SpecGraphStore {
   }
 
   /**
-   * 从索引重建节点并保留显式边与声明键标记。
+   * 从索引重建节点并保留显式边与版本声明键标记。
    * baseline 图 + 每个未合入版本的版本图。
    * 不生成任何树边、不读文档内容推断关系；已合入版本不读不写。返回 baseline 图。
    */
@@ -401,14 +411,13 @@ export class SpecGraphStore {
         version: BASELINE,
         chunk_id: entry.id,
         file: entry.file,
-        metadata: { source: "baseline", ...entry.metadata },
+        metadata: baselineMetadata(entry.metadata),
       });
     }
 
     // 只保留显式来源的边（manual/new-model-cli/fsd-declaration）。
     // sync 绝不从文档内容推断/建立 fsd-declaration 边——它们由 new_model 域的
     // FSD create 流程建立与对账（Python 同构：sync 只保留，不创建）。
-    preserveDeclarationOverrides(prevBase, base);
     preserveExplicitEdges(prevBase, base);
 
     const written = writeGraph(basePath, base);
@@ -417,33 +426,45 @@ export class SpecGraphStore {
     for (const version of indexes.listVersions()) {
       const vindex = loadVersionIndexOrEmpty(indexes, version);
       if (vindex.status === "merged") continue; // 已合入：不读不写
-      const vPath = this.graphPath(version);
-      const prev = readGraph(vPath);
-      const vg = emptyGraph();
-      for (const entry of vindex.chunks) {
-        const file = entry.file ?? "";
-        vg.specs.push({
-          uri: makeUri(entry.id, version, file),
-          title: entry.heading ?? "",
-          type: specType(entry.id, file),
-          version,
-          chunk_id: entry.id,
-          file,
-          metadata: {
-            source: "version",
-            state: entry.state,
-            action: entry.action,
-            commit_id: entry.commit_id,
-            ...entry.metadata,
-          },
-        });
-      }
-      preserveDeclarationOverrides(prev, vg);
-      preserveExplicitEdges(prev, vg);
-      writeGraph(vPath, vg);
+      this.syncVersionGraph(version, vindex);
     }
 
     return written;
+  }
+
+  /** 仅从真实版本索引同步指定版本图；已合入版本返回原图，不写基线或其它版本。 */
+  syncVersion(version: string): SpecGraph {
+    const vindex = new IndexManager(this.root).loadVersionIndex(version);
+    if (vindex.status === "merged") return this.load(version);
+    return this.syncVersionGraph(version, vindex);
+  }
+
+  /** 全图同步与版本专用同步共用节点重建、声明标记和显式边保留逻辑。 */
+  private syncVersionGraph(version: string, vindex: VersionIndexLike): SpecGraph {
+    const vPath = this.graphPath(version);
+    const prev = readGraph(vPath);
+    const vg = emptyGraph();
+    for (const entry of vindex.chunks) {
+      const file = entry.file ?? "";
+      vg.specs.push({
+        uri: makeUri(entry.id, version, file),
+        title: entry.heading ?? "",
+        type: specType(entry.id, file),
+        version,
+        chunk_id: entry.id,
+        file,
+        metadata: {
+          source: "version",
+          state: entry.state,
+          action: entry.action,
+          commit_id: entry.commit_id,
+          ...entry.metadata,
+        },
+      });
+    }
+    preserveDeclarationOverrides(prev, vg);
+    preserveExplicitEdges(prev, vg);
+    return writeGraph(vPath, vg);
   }
 
   /**
@@ -513,18 +534,18 @@ export class SpecGraphStore {
 
     const promoted = new Map<string, Spec>(); // chunk_id → 提升后节点
     for (const spec of vgraph.specs) {
-      const metadata: Record<string, unknown> = { ...spec.metadata, source: "baseline" };
-      delete metadata[DECLARATION_OVERRIDES];
       promoted.set(spec.chunk_id, {
         ...spec,
         uri: makeUri(spec.chunk_id, BASELINE, spec.file),
         version: BASELINE,
-        metadata,
+        metadata: baselineMetadata(spec.metadata),
       });
     }
     const nodes = new Map<string, Spec>();
     for (const spec of baseline.specs) {
-      if (!promoted.has(spec.chunk_id)) nodes.set(spec.chunk_id, spec);
+      if (!promoted.has(spec.chunk_id)) {
+        nodes.set(spec.chunk_id, { ...spec, metadata: baselineMetadata(spec.metadata) });
+      }
     }
     for (const [chunkId, spec] of promoted) nodes.set(chunkId, spec);
 

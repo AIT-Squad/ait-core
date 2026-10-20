@@ -1,6 +1,6 @@
 // [TDD]-dogfood_tests — 真实 tarball 安装、升级与 CLI + Node 混合入口闭环验收。
 // 固定宿主生成器仅验证交付/制品/回执机制，不证明 LLM 的语义质量。
-// 受管写入只经安装后的入口：CLI 推进规格/版本，Node 公开接口登记回执；测试只直接写临时 fixture 与制品。
+// 受管写入只经安装后的入口：项目 wrapper 推进规格/版本，Node 公开接口登记回执；测试只直接写临时 fixture 与制品。
 
 import { afterEach, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
@@ -26,7 +26,7 @@ const PUBLIC_FUNCTIONS = [
 let tmpDirs: string[] = [];
 
 function mkTmp(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ait-dogfood-"));
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ait-dogfood-含空格 测试-"));
 	tmpDirs.push(dir);
 	return dir;
 }
@@ -55,9 +55,10 @@ function runNode(
 	args: string[],
 	cwd: string,
 	timeoutMs = 60_000,
+	options: { env?: NodeJS.ProcessEnv; windowsVerbatimArguments?: boolean } = {},
 ): Promise<BinRun> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(exe, args, { cwd, windowsHide: true });
+		const child = spawn(exe, args, { cwd, windowsHide: true, ...options });
 		let stdout = "";
 		let stderr = "";
 		child.stdout.setEncoding("utf8");
@@ -179,11 +180,41 @@ function runBin(installation: Installation, cwd: string, argv: string[]): Promis
 	return runNode(process.execPath, [installation.bin, ...argv], cwd);
 }
 
+function runWrapper(installation: Installation, cwd: string, argv: string[]): Promise<BinRun> {
+	const wrapper = path.join(cwd, "project-docs", ".ait",
+		process.platform === "win32" ? "ait-cli.cmd" : "ait-cli");
+	expect(fs.statSync(wrapper).isFile(), `项目 wrapper 不存在：${wrapper}`).toBe(true);
+	const content = fs.readFileSync(wrapper, "utf8");
+	expect(content).toContain(installation.bin);
+	expect(content).toContain(process.execPath);
+	if (process.platform !== "win32") return runNode(wrapper, argv, cwd);
+
+	// cmd 的命令文本只含固定环境变量名；正文/路径不插入 shell 字符串。
+	// 延迟展开避免调用 shell 提前解释参数，wrapper 自身仍负责原样转发。
+	const env = { ...process.env };
+	const parameters = [wrapper, ...argv].map((arg, index) => {
+		expect(arg, "Windows wrapper fixture 参数不得含双引号或 NUL；正文可用 --content-file")
+			.not.toMatch(/["\0]/);
+		const name = `AIT_DOGFOOD_ARG_${index}`;
+		env[name] = arg.replace(/(\\+)$/, "$1$1");
+		return `"!${name}!"`;
+	});
+	return runNode(process.env.ComSpec ?? "cmd.exe", [
+		"/d", "/s", "/v:on", "/c", `"${parameters.join(" ")}"`,
+	], cwd, 60_000, { env, windowsVerbatimArguments: true });
+}
+
 /** 单 JSON、成功显式 next_action、失败保留原有三个字段。 */
-function parseSingleJson(stdout: string): CoreResult {
-	const lines = stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
-	expect(lines).toHaveLength(1);
-	const result = JSON.parse(lines[0]!) as CoreResult;
+function parseSingleJson(run: BinRun): CoreResult {
+	const diagnostic = `exit=${run.status}\nstdout:\n${run.stdout}\nstderr:\n${run.stderr}`;
+	const lines = run.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+	expect(lines, diagnostic).toHaveLength(1);
+	let result: CoreResult;
+	try {
+		result = JSON.parse(lines[0]!) as CoreResult;
+	} catch {
+		throw new Error(`入口未输出合法 JSON：${diagnostic}`);
+	}
 	if (result.ok) {
 		expect(Object.hasOwn(result.data, "next_action")).toBe(true);
 		if (result.data.next_action !== null) {
@@ -197,18 +228,23 @@ function parseSingleJson(stdout: string): CoreResult {
 	return result;
 }
 
-async function runOk(installation: Installation, cwd: string, argv: string[]): Promise<Record<string, unknown>> {
-	const res = await runBin(installation, cwd, argv);
-	expect(res.status, `argv=${argv.join(" ")}\n${res.stdout}\n${res.stderr}`).toBe(0);
-	const result = parseSingleJson(res.stdout);
+async function runOk(
+	installation: Installation, cwd: string, argv: string[], entry: "wrapper" | "bin" = "wrapper",
+): Promise<Record<string, unknown>> {
+	const res = await (entry === "bin" ? runBin : runWrapper)(installation, cwd, argv);
+	expect(res.status, `entry=${entry} argv=${JSON.stringify(argv)}\n${res.stdout}\n${res.stderr}`).toBe(0);
+	const result = parseSingleJson(res);
 	if (!result.ok) throw new Error(`命令失败：${res.stdout}`);
 	return result.data;
 }
 
-async function runError(installation: Installation, cwd: string, argv: string[], code = "USAGE_ERROR") {
-	const res = await runBin(installation, cwd, argv);
-	expect(res.status, `argv=${argv.join(" ")}\n${res.stdout}\n${res.stderr}`).toBe(1);
-	const result = parseSingleJson(res.stdout);
+async function runError(
+	installation: Installation, cwd: string, argv: string[], code = "USAGE_ERROR",
+	entry: "wrapper" | "bin" = "wrapper",
+) {
+	const res = await (entry === "bin" ? runBin : runWrapper)(installation, cwd, argv);
+	expect(res.status, `entry=${entry} argv=${JSON.stringify(argv)}\n${res.stdout}\n${res.stderr}`).toBe(1);
+	const result = parseSingleJson(res);
 	if (result.ok) throw new Error(`应失败的命令成功：${res.stdout}`);
 	expect(result.code).toBe(code);
 	return result;
@@ -297,7 +333,7 @@ async function assertPublicEntry(installation: Installation): Promise<void> {
 	expect(report.first).toEqual(report.second);
 	const bin = await runBin(installation, installation.consumer, ["--version"]);
 	expect(bin.status).toBe(0);
-	expect(parseSingleJson(bin.stdout)).toEqual(report.first);
+	expect(parseSingleJson(bin)).toEqual(report.first);
 	expect(treeSnapshot(installation.consumer)).toEqual(before);
 
 	// 编译器仅充当开发工具；类型必须从 consumer 中安装的 .d.ts 解析。
@@ -527,7 +563,7 @@ async function runFullCycle(installation: Installation, project: string, version
 
 async function makeProjectWithVersion(installation: Installation): Promise<string> {
 	const dir = mkTmp();
-	await runOk(installation, dir, ["init", "--name", "demo"]);
+	await runOk(installation, dir, ["init", "--name", "demo"], "bin");
 	await runOk(installation, dir, ["version", "create", "v0.1"]);
 	return dir;
 }
@@ -545,13 +581,13 @@ function prdWorkspaceFile(dir: string): string {
 describe("安装后的混合入口闭环（CLI + Node）", () => {
 	it("缺 build 时明确失败并提示 npm run build", () => { assertBuild(); });
 
-	it("真实 tarball 安装 → CLI + Node 混合入口生成/回执/验收/合入 → 隔离副本升级 → 下一混合入口闭环", async () => {
+	it("真实 tarball 安装 → 项目 wrapper + Node 混合入口生成/回执/验收/合入 → 升级并刷新 wrapper → 下一混合入口闭环", async () => {
 		const sourcePackage = fs.readFileSync(path.join(PROJECT_ROOT, "package.json"));
 		const sourceLock = fs.readFileSync(path.join(PROJECT_ROOT, "package-lock.json"));
 		const installed = await makeInstallation();
 		await assertPublicEntry(installed);
 		const project = mkTmp();
-		await runOk(installed, project, ["init", "--name", "demo"]);
+		await runOk(installed, project, ["init", "--name", "demo"], "bin");
 		await runFullCycle(installed, project, "v0.1", 1);
 		const history = treeSnapshot(project);
 
@@ -574,6 +610,10 @@ describe("安装后的混合入口闭环（CLI + Node）", () => {
 		expect(upgraded.manifest.version).not.toBe(installed.manifest.version);
 		expect(upgraded.tarball).not.toBe(installed.tarball);
 		await assertPublicEntry(upgraded);
+		const refreshed = await runOk(upgraded, project, ["init", "--refresh-wrapper"], "bin");
+		expect(refreshed.createdFiles).toContain(
+			`project-docs/.ait/ait-cli${process.platform === "win32" ? ".cmd" : ""}`,
+		);
 		expect((await runOk(upgraded, project, ["--version"])).version).toBe("v0.1");
 		expect(treeSnapshot(project)).toEqual(history);
 		expect(fs.readFileSync(path.join(PROJECT_ROOT, "package.json"))).toEqual(sourcePackage);
@@ -582,11 +622,11 @@ describe("安装后的混合入口闭环（CLI + Node）", () => {
 		await runFullCycle(upgraded, project, "v0.2", 2);
 	}, 600_000);
 
-	it("安装 bin 的单 JSON/退出码与未知命令、未知参数零落盘回归", async () => {
+	it("安装 bin 与项目 wrapper 的单 JSON/退出码和未知命令、未知参数零落盘回归", async () => {
 		const installation = await makeInstallation();
 		const empty = mkTmp();
-		expect((await runOk(installation, empty, ["--version"])).version).toBe("unversioned");
-		const unknown = await runError(installation, empty, ["frobnicate"]);
+		expect((await runOk(installation, empty, ["--version"], "bin")).version).toBe("unversioned");
+		const unknown = await runError(installation, empty, ["frobnicate"], "USAGE_ERROR", "bin");
 		expect(unknown.error.length).toBeGreaterThan(0);
 		expect(fs.readdirSync(empty)).toEqual([]);
 		const dir = await makeProjectWithVersion(installation);
@@ -602,21 +642,23 @@ describe("安装后的混合入口闭环（CLI + Node）", () => {
 });
 
 describe("--content-file", () => {
-	it("与 --content 等价：独立项目各取令牌，落盘字节相同", async () => {
+	it("已安装原生 Node bin 的 --content-file/--content 参数契约：独立令牌、落盘字节相同", async () => {
 		const installation = await makeInstallation();
 		const dirA = await makeProjectWithVersion(installation);
 		const dirB = await makeProjectWithVersion(installation);
 		const tokenA = await prdTokenOf(installation, dirA);
 		const tokenB = await prdTokenOf(installation, dirB);
+		// Windows 的 Python/Node .cmd 都会截断多行 --content；本例仅验证安装 bin 的参数契约。
+		// 两侧正文显式走原生 Node bin；wrapper 完整闭环继续用 --content-file，不据此宣称多行内联成功。
 		const content = prdContent(1);
 		await runOk(installation, dirA, [
 			"prd", "create", "[PRD]-demo", "--content", content, "--context-token", tokenA,
-		]);
+		], "bin");
 		const bodyFile = path.join(mkTmp(), "body.md");
 		fs.writeFileSync(bodyFile, content, "utf8");
 		await runOk(installation, dirB, [
 			"prd", "create", "[PRD]-demo", "--content-file", bodyFile, "--context-token", tokenB,
-		]);
+		], "bin");
 		const a = fs.readFileSync(prdWorkspaceFile(dirA));
 		const b = fs.readFileSync(prdWorkspaceFile(dirB));
 		expect(a.length).toBeGreaterThan(0);

@@ -256,6 +256,44 @@ function nodeById(
   return graph.specs.find((s) => s.chunk_id === chunkId);
 }
 
+/** 为图测试写入真实版本索引及可枚举的版本记录。 */
+function writeGraphVersionIndex(
+  root: ProjectRoot,
+  version: string,
+  specs: GraphFixtureSpec[],
+  status: "developing" | "committed" | "merged" = "developing",
+): void {
+  writeYaml(path.join(root.meta, `chunks-index-${version}.yaml`), JSON.stringify({
+    version: 1, scope: "version", version_name: version, status,
+    chunks: specs.map((spec) => ({
+      id: spec.chunk_id, file: spec.file, heading: spec.title, level: 2,
+      action: "modify", state: status === "developing" ? "working" : "committed",
+      commit_id: status === "developing" ? null : "c11",
+    })),
+  }));
+  const versions = path.join(root.meta, "versions");
+  fs.mkdirSync(versions, { recursive: true });
+  writeYaml(path.join(versions, `${version}.yaml`), [
+    `version: ${version}`, "created_at: '2026-01-01T00:00:00.000Z'",
+  ].join("\n"));
+}
+
+/** 固定旧 mtime，确保同一毫秒内的意外重写也能被检测。 */
+function snapshotFiles(files: string[]): Map<string, { bytes: Buffer; mtime: number }> {
+  const oldTime = new Date("2000-01-01T00:00:00.000Z");
+  return new Map(files.map((file) => {
+    fs.utimesSync(file, oldTime, oldTime);
+    return [file, { bytes: fs.readFileSync(file), mtime: fs.statSync(file).mtimeMs }];
+  }));
+}
+
+function expectFilesUnchanged(before: Map<string, { bytes: Buffer; mtime: number }>): void {
+  for (const [file, snapshot] of before) {
+    expect(fs.readFileSync(file).equals(snapshot.bytes), file).toBe(true);
+    expect(fs.statSync(file).mtimeMs, file).toBe(snapshot.mtime);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // :TEST 第 1 条 — sync
 // ---------------------------------------------------------------------------
@@ -419,6 +457,148 @@ describe("sync", () => {
     const second = store.sync();
     expect(second.updated).toBe(updated);
     expect(fs.statSync(file).mtimeMs).toBe(mtime);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.11 — 版本专用同步只更新当前未合入版本
+// ---------------------------------------------------------------------------
+
+describe("syncVersion", () => {
+  it("仅更新指定版本，保留显式边和 marker；带生命周期残留的基线及其它版本逐字不变", () => {
+    const root = makeRoot();
+    writeDocs(root, ALPHA_TREE);
+    reindexBaseline(root);
+    const store = new SpecGraphStore(root);
+    store.sync();
+    store.addEdge("v11", "[PRD]-alpha", "[FSD]-alpha", "derives", "new-model-cli");
+    store.addEdge("v11", "[FSD]-alpha:beta", "[TDD]-gamma", "depends_on", "fsd-declaration");
+    store.addEdge("v11", "[FSD]-alpha", "[TDD]-gamma", "details", "manual");
+    const current = store.load("v11");
+    nodeById(current, "[FSD]-alpha")!.metadata["fsd_declaration_overrides"] = {};
+    nodeById(current, "[FSD]-alpha:beta")!.metadata["fsd_declaration_overrides"] = { depends_on: true };
+    store.save("v11", current);
+    writeGraphVersionIndex(root, "v11", current.specs.map((spec) => ({
+      ...spec, title: `${spec.title} 已提交`,
+    })), "committed");
+
+    const baseline = store.load();
+    for (const spec of baseline.specs) {
+      Object.assign(spec.metadata, {
+        state: "committed", action: "modify", commit_id: "old-commit",
+        fsd_declaration_overrides: {}, custom: { keep: spec.chunk_id },
+      });
+    }
+    store.save("baseline", baseline);
+    for (const version of ["v10", "v12"] as const) {
+      const spec = node("[TDD]-gamma", version, "tdd/[TDD]-gamma", "原图标题", "tdd");
+      writeYaml(graphPathOf(root, version), graphText([spec], []));
+      writeGraphVersionIndex(root, version, [{ ...spec, title: "索引新标题" }],
+        version === "v10" ? "merged" : "developing");
+    }
+    const files = fs.readdirSync(root.meta).sort();
+    const protectedFiles = snapshotFiles([
+      ...files.filter((file) => file !== "versions" && file !== "specgraph-v11.yaml")
+        .map((file) => path.join(root.meta, file)),
+      ...["v10", "v11", "v12"].map((version) => path.join(root.meta, "versions", `${version}.yaml`)),
+      ...Object.keys(ALPHA_TREE).map((file) => path.join(root.docs, file)),
+    ]);
+    const currentBytes = readBytes(root, "v11");
+
+    const synced = store.syncVersion("v11");
+
+    expect(readBytes(root, "v11").equals(currentBytes)).toBe(false);
+    expect(synced.specs.map((spec) => spec.chunk_id).sort())
+      .toEqual(current.specs.map((spec) => spec.chunk_id).sort());
+    expect(synced.edges).toEqual(current.edges);
+    for (const spec of synced.specs) {
+      expect(spec.title).toBe(`${nodeById(current, spec.chunk_id)!.title} 已提交`);
+      expect(spec.metadata).toMatchObject({
+        source: "version", state: "committed", action: "modify", commit_id: "c11",
+      });
+    }
+    expect(nodeById(synced, "[FSD]-alpha")?.metadata)
+      .toHaveProperty("fsd_declaration_overrides", {});
+    expect(nodeById(synced, "[FSD]-alpha:beta")?.metadata)
+      .toHaveProperty("fsd_declaration_overrides", { depends_on: true });
+    expectFilesUnchanged(protectedFiles);
+    expect(fs.readdirSync(root.meta).sort()).toEqual(files);
+    const noChange = snapshotFiles([graphPathOf(root, "v11")]);
+    store.syncVersion("v11");
+    expectFilesUnchanged(noChange);
+    expectFilesUnchanged(protectedFiles);
+  });
+
+  it("从真实索引首次建图，不读取损坏的基线或其它版本", () => {
+    const root = makeRoot();
+    const spec = node("[FSD]-alpha", "v11", "fsd/[FSD]-alpha", "alpha FSD 根", "fsd");
+    writeGraphVersionIndex(root, "v11", [spec]);
+    const unrelated = [graphPathOf(root), graphPathOf(root, "v10"),
+      path.join(root.meta, "chunks-index.yaml"), path.join(root.meta, "chunks-index-v10.yaml")];
+    for (const file of unrelated) writeYaml(file, "broken: [");
+    const before = snapshotFiles([...unrelated, path.join(root.meta, "chunks-index-v11.yaml")]);
+    const store = new SpecGraphStore(root);
+
+    const graph = store.syncVersion("v11");
+
+    expect(graph.specs).toHaveLength(1);
+    expect(graph.specs[0]).toMatchObject({ ...spec, metadata: { source: "version", state: "working" } });
+    expect(graph.edges).toEqual([]);
+    expect(store.load("v11")).toEqual(graph);
+    expectFilesUnchanged(before);
+  });
+
+  it("已 merged 版本返回原图，索引内容不同也不改图、updated 或 mtime", () => {
+    const root = makeRoot();
+    const spec = node("[TDD]-gamma", "v10", "tdd/[TDD]-gamma", "历史标题", "tdd");
+    spec.metadata = { source: "version", state: "committed", action: "modify", commit_id: "c10" };
+    writeYaml(graphPathOf(root, "v10"), graphText([spec], []));
+    writeGraphVersionIndex(root, "v10", [{ ...spec, title: "不可覆盖历史图的索引标题" }], "merged");
+    const store = new SpecGraphStore(root);
+    const graph = store.load("v10");
+    const before = snapshotFiles([graphPathOf(root, "v10"), path.join(root.meta, "chunks-index-v10.yaml")]);
+
+    expect(store.syncVersion("v10")).toEqual(graph);
+    expectFilesUnchanged(before);
+    expect(fs.existsSync(graphPathOf(root))).toBe(false);
+  });
+
+  it.each([
+    { label: "索引缺失", text: null, code: "VERSION_NOT_FOUND" },
+    { label: "索引 YAML 损坏", text: "chunks: [", code: "INDEX_UNREADABLE" },
+    { label: "索引 schema 非法", text: "version_name: v11\nchunks: invalid", code: "INDEX_UNREADABLE" },
+  ])("$label 时真实报错，已有图不被空索引覆盖", ({ text, code }) => {
+    const root = makeRoot();
+    const spec = node("[FSD]-alpha", "v11", "fsd/[FSD]-alpha", "alpha", "fsd");
+    writeYaml(graphPathOf(root, "v11"), graphText([spec], []));
+    const indexPath = path.join(root.meta, "chunks-index-v11.yaml");
+    if (text !== null) writeYaml(indexPath, text);
+    const files = fs.readdirSync(root.meta).sort();
+    const before = snapshotFiles(files.map((file) => path.join(root.meta, file)));
+
+    expect(() => new SpecGraphStore(root).syncVersion("v11")).toThrowError(expect.objectContaining({
+      code, message: expect.stringContaining(text === null ? "v11" : indexPath),
+    }));
+    expectFilesUnchanged(before);
+    expect(fs.readdirSync(root.meta).sort()).toEqual(files);
+  });
+
+  it.each([
+    { status: "developing", text: "specs: [" },
+    { status: "developing", text: "specs: []\nedges: []\nbogus: true" },
+    { status: "merged", text: "specs: [" },
+  ] as const)("$status 的损坏版本图报 GRAPH_UNREADABLE 且零写入：$text", ({ status, text }) => {
+    const root = makeRoot();
+    writeGraphVersionIndex(root, "v11", [], status);
+    const file = graphPathOf(root, "v11");
+    writeYaml(file, text);
+    const before = snapshotFiles([file, path.join(root.meta, "chunks-index-v11.yaml")]);
+
+    expect(() => new SpecGraphStore(root).syncVersion("v11")).toThrowError(expect.objectContaining({
+      code: "GRAPH_UNREADABLE", message: expect.stringContaining(file),
+    }));
+    expectFilesUnchanged(before);
+    expect(fs.existsSync(graphPathOf(root))).toBe(false);
   });
 });
 
@@ -796,6 +976,79 @@ describe("FSD 声明键所有权", () => {
 // ---------------------------------------------------------------------------
 
 describe("mergeIntoBaseline", () => {
+  it("合并当次清除所有基线节点的四个版本字段，保留自定义 metadata；后续全图 sync 不再改写", () => {
+    const root = makeRoot();
+    writeDocs(root, ALPHA_TREE);
+    reindexBaseline(root);
+    const store = new SpecGraphStore(root);
+    store.sync();
+    store.addEdge("baseline", "[PRD]-alpha", "[FSD]-alpha", "derives", "new-model-cli");
+    store.addEdge("v11", "[FSD]-alpha", "[FSD]-alpha:beta", "decomposes", "new-model-cli");
+    const baseline = store.load();
+    const version = store.load("v11");
+    for (const [graph, origin] of [[baseline, "retained"], [version, "promoted"]] as const) {
+      for (const spec of graph.specs) {
+        Object.assign(spec.metadata, {
+          state: "committed", action: "modify", commit_id: `${origin}-commit`,
+          fsd_declaration_overrides: {}, custom: { origin, owner: spec.chunk_id }, note: "保留",
+        });
+      }
+    }
+    store.save("baseline", baseline);
+    store.save("v11", version);
+    writeGraphVersionIndex(root, "v11", version.specs, "committed");
+    const historical = node("[TDD]-gamma", "v10", "tdd/[TDD]-gamma", "历史图", "tdd");
+    historical.metadata = { source: "version", state: "committed", action: "modify", commit_id: "c10" };
+    writeYaml(graphPathOf(root, "v10"), graphText([historical], []));
+    writeGraphVersionIndex(root, "v10", [historical], "merged");
+
+    // 模拟调用方已提升的基线索引，故意留下生命周期字段；图模块不得改写索引。
+    const indexes = new IndexManager(root);
+    const baselineIndex = indexes.loadBaseline();
+    for (const entry of baselineIndex.chunks) {
+      entry.metadata = { ...(nodeById(version, entry.id) ?? nodeById(baseline, entry.id))!.metadata };
+    }
+    const indexFile = path.join(root.meta, "chunks-index.yaml");
+    writeYaml(indexFile, JSON.stringify(baselineIndex));
+    const before = snapshotFiles([
+      indexFile, graphPathOf(root, "v11"), graphPathOf(root, "v10"),
+      path.join(root.meta, "chunks-index-v11.yaml"), path.join(root.meta, "chunks-index-v10.yaml"),
+    ]);
+
+    store.mergeIntoBaseline("v11");
+
+    // 必须在任何 sync 之前检查落盘结果，不能让下一次重建替 merge 清理。
+    const merged = store.load();
+    expect(merged.specs.map((spec) => spec.chunk_id).sort()).toEqual([...ALPHA_IDS].sort());
+    for (const spec of merged.specs) {
+      const original = nodeById(version, spec.chunk_id) ?? nodeById(baseline, spec.chunk_id)!;
+      expect(spec.version).toBe("baseline");
+      expect(spec.uri).toBe(bu(spec.type, spec.chunk_id));
+      expect(spec.metadata).toEqual({ source: "baseline", custom: original.metadata["custom"], note: "保留" });
+      for (const field of ["state", "action", "commit_id", "fsd_declaration_overrides"]) {
+        expect(spec.metadata).not.toHaveProperty(field);
+      }
+    }
+    expect(merged.edges).toHaveLength(2);
+    expectFilesUnchanged(before);
+    expect(nodeById(store.load("v11"), "[FSD]-alpha")?.metadata).toMatchObject({
+      state: "committed", action: "modify", commit_id: "promoted-commit", fsd_declaration_overrides: {},
+    });
+
+    // 版本生命周期由调用方完成；全图 sync 必须跳过已合入图，并过滤索引中的旧字段。
+    const versionIndex = indexes.loadVersionIndex("v11");
+    versionIndex.status = "merged";
+    indexes.saveVersionIndex(versionIndex);
+    const stable = snapshotFiles([
+      graphPathOf(root), indexFile, graphPathOf(root, "v11"), graphPathOf(root, "v10"),
+      path.join(root.meta, "chunks-index-v11.yaml"), path.join(root.meta, "chunks-index-v10.yaml"),
+    ]);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      store.sync();
+      expectFilesUnchanged(stable);
+    }
+  });
+
   it("版本节点改写为 baseline、边并入、被取代的 depends_on 删除、版本图文件不变", () => {
     const root = makeRoot();
     writeDocs(root, ALPHA_TREE);

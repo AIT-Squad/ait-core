@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
 
 type Data = Record<string, any>;
-type Entry = "dispatch" | "bin";
+type Entry = "dispatch" | "bin" | "wrapper";
 type Snapshot = Map<string, Buffer>;
 interface Run { status: number; stdout: string; stderr: string }
 interface Envelope { ok: boolean; data?: Data; code?: string; error?: string }
@@ -19,7 +19,7 @@ interface Delivery {
   target_file: string; tdd_root: string; source_file: string; generation_token: string;
   next_action: Data;
 }
-interface Feature { cwd: string; version: string; prd: string; fsd: string }
+interface Feature { cwd: string; version: string; prd: string; fsd: string; entry?: Entry }
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TIMEOUT = 240_000;
 const TARGET = "system-contract-output.cjs";
@@ -36,6 +36,7 @@ let bin: string;
 let apiRunner: string;
 let fixture: string;
 const deliveries = new Set<string>();
+const sourceArtifacts: Map<string, Snapshot> = new Map();
 
 function write(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -86,20 +87,128 @@ function baseline(cwd: string): Snapshot {
 function caseDir(): string { return fs.mkdtempSync(path.join(suiteDir, "case-")); }
 function cloneDocs(source: string): string {
   const cwd = caseDir();
-  // Copy only managed data; no source git/worktree link or wrapper is executed.
-  for (const name of ["docs", ".meta", "versions"]) {
+  // Existing wrappers are copied as data, then refreshed before they can run.
+  for (const name of ["docs", ".meta", "versions", ".ait"]) {
     const directory = path.join(source, name);
     snapshot(directory); // Reject links before copying or invoking any command.
     if (fs.existsSync(directory)) fs.cpSync(directory, path.join(projectDocs(cwd), name), { recursive: true });
   }
+  for (const target of corpusTargets(source)) copyArtifact(path.dirname(source), cwd, target);
   return cwd;
 }
 function cloneFixture(): string { return cloneDocs(projectDocs(fixture)); }
-function run(executable: string, args: string[], cwd: string, timeout = TIMEOUT): Promise<Run> {
+
+function corpusTargets(sourceDocs: string): string[] {
+  const index = yaml(path.join(sourceDocs, ".meta", "chunks-index.yaml"));
+  const targets = new Set<string>();
+  for (const entry of index.chunks as Data[]) {
+    if (!String(entry.id).startsWith("[TDD]-")) continue;
+    const file = path.join(sourceDocs, "docs", String(entry.file).replace(/\.md$/, "") + ".md");
+    const declaration = /^\s*target_file:[^\r\n]*/m.exec(fs.readFileSync(file, "utf8"));
+    expect(declaration, `Missing target_file in ${file}`).not.toBeNull();
+    const value = parse(declaration![0]) as Data;
+    expect(value.target_file).toBeTypeOf("string");
+    targets.add(value.target_file as string);
+  }
+  return [...targets].sort();
+}
+function copyArtifact(source: string, destination: string, relative: string): boolean {
+  const original = path.resolve(source, relative);
+  const local = path.relative(source, original);
+  expect(local !== ".." && !local.startsWith(`..${path.sep}`) && !path.isAbsolute(local), relative).toBe(true);
+  if (!fs.existsSync(original)) return false; // Preserve real missing-file failures.
+  expect(fs.lstatSync(original).isFile(), `Fixture must be a regular file: ${original}`).toBe(true);
+  const real = path.relative(fs.realpathSync(source), fs.realpathSync(original));
+  expect(real !== ".." && !real.startsWith(`..${path.sep}`) && !path.isAbsolute(real), original).toBe(true);
+  const copied = path.join(destination, local);
+  fs.mkdirSync(path.dirname(copied), { recursive: true });
+  fs.copyFileSync(original, copied);
+  const originals = sourceArtifacts.get(source) ?? new Map<string, Buffer>();
+  originals.set(local, fs.readFileSync(original));
+  sourceArtifacts.set(source, originals);
+  return true;
+}
+async function git(cwd: string, args: string[]): Promise<string> {
+  const result = await run("git", args, cwd);
+  expect(result.status, `git ${args.join(" ")} in ${cwd}: ${result.stderr}`).toBe(0);
+  return result.stdout;
+}
+async function tracking(cwd: string): Promise<string[]> {
+  return (await git(cwd, ["ls-files", "-z", "--"])).split("\0").filter(Boolean).sort();
+}
+async function gitEvidence(cwd: string, label: string): Promise<Data> {
+  const head = (await git(cwd, ["rev-parse", "HEAD"])).trim();
+  const status = await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const eol = await run("git", ["config", "--get", "core.autocrlf"], cwd);
+  expect([0, 1]).toContain(eol.status);
+  console.info(`[system-contracts] ${label}: HEAD=${head}; clean=${status.trim() === ""}; core.autocrlf=${eol.stdout.trim() || "unset"}; status=${JSON.stringify(status)}`);
+  return { head, status };
+}
+async function seedGit(cwd: string, tracked: string[], copied: string[], host: boolean): Promise<void> {
+  await git(cwd, ["init", "--quiet"]);
+  // Avoid checkout newline conversion; historical assertions still compare exact bytes.
+  await git(cwd, ["config", "core.autocrlf", "false"]);
+  const index = new Set(tracked);
+  const ignored = copied.filter((file) => !index.has(file))
+    .map((file) => "/" + file.replace(/[\\*?\[\]#! ]/g, "\\function cloneFixture(): string { return cloneDocs(projectDocs(fixture)); }"));
+  ignored.push(...(host ? ["/project-docs/"] : ["/.ait/", "/.meta/config.local.yaml"]));
+  write(path.join(cwd, ".git", "info", "exclude"), ignored.join("\n") + "\n");
+  if (tracked.length > 0) {
+    const list = path.join(caseDir(), "tracked-paths");
+    fs.writeFileSync(list, tracked.join("\0") + "\0");
+    await git(cwd, ["--literal-pathspecs", "add", "--force", `--pathspec-from-file=${list}`, "--pathspec-file-nul"]);
+  }
+  await git(cwd, ["commit", "--quiet", "--allow-empty", "-m", "Copy corpus worktree and original tracking scope"]);
+  expect(await tracking(cwd)).toEqual(tracked);
+  expect((await gitEvidence(cwd, "copied repository")).status).toBe("");
+}
+async function cloneTakeover(sourceDocs: string): Promise<string> {
+  const cwd = cloneDocs(sourceDocs);
+  const source = path.dirname(sourceDocs);
+  const hostTracked = fs.existsSync(path.join(source, ".git")) ? await tracking(source) : corpusTargets(sourceDocs);
+  const docsTracked = fs.existsSync(path.join(sourceDocs, ".git")) ? await tracking(sourceDocs) : [...managed(source).keys()].sort();
+  for (const [from, to, tracked] of [[source, cwd, hostTracked], [sourceDocs, projectDocs(cwd), docsTracked]] as const) {
+    if (fs.existsSync(path.join(from, ".git"))) await gitEvidence(from, "original read-only repository");
+    for (const file of tracked) expect(copyArtifact(from, to, file), `Tracked source missing: ${from}/${file}`).toBe(true);
+  }
+  const copiedHost = [...new Set([...hostTracked, ...corpusTargets(sourceDocs).filter((file) => fs.existsSync(path.join(cwd, file)))])];
+  const copiedDocs = [...snapshot(projectDocs(cwd)).keys()];
+  await seedGit(cwd, hostTracked, copiedHost, true);
+  await seedGit(projectDocs(cwd), docsTracked, copiedDocs, false);
+  return cwd;
+}
+function wrapperPath(cwd: string): string {
+  return path.join(projectDocs(cwd), ".ait", process.platform === "win32" ? "ait-cli.cmd" : "ait-cli");
+}
+async function runWrapper(cwd: string, argv: string[]): Promise<Run> {
+  const wrapper = wrapperPath(cwd);
+  expect(fs.statSync(wrapper).isFile()).toBe(true);
+  if (process.platform !== "win32") return run(wrapper, argv, cwd);
+  // These tests use content files and an acceptance script, so no shell source is an argument.
+  for (const value of [wrapper, ...argv]) expect(value).not.toMatch(/["\r\n%]/);
+  const quoted = [wrapper, ...argv].map((value) => `"${value}"`).join(" ");
+  return run(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `"${quoted}"`], cwd, TIMEOUT, true);
+}
+async function refreshInstalledWrapper(cwd: string): Promise<void> {
+  const before = managed(cwd);
+  await ok(cwd, ["init", "--refresh-wrapper"], "bin");
+  expectSame(before, managed(cwd));
+  const wrapper = fs.readFileSync(wrapperPath(cwd));
+  expect(wrapper.toString("utf8")).toContain(process.execPath);
+  expect(wrapper.toString("utf8")).toContain(bin);
+  await ok(cwd, ["--version"], "wrapper");
+  await rejectWithoutWrites(cwd, ["unknown-command"], "USAGE_ERROR", "wrapper");
+  await ok(cwd, ["init", "--refresh-wrapper"], "wrapper");
+  expect(fs.readFileSync(wrapperPath(cwd)).equals(wrapper)).toBe(true);
+  expectSame(before, managed(cwd));
+  console.info(`[system-contracts] actual project wrapper: ${wrapperPath(cwd)}; installed bin=${bin}; single JSON and nonzero error verified; receipt registration uses the public Node API`);
+}
+
+function run(executable: string, args: string[], cwd: string, timeout = TIMEOUT, verbatim = false): Promise<Run> {
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
-      cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GIT_AUTHOR_NAME: "AIT contract tests", GIT_AUTHOR_EMAIL: "ait-tests@example.invalid",
+      cwd, windowsHide: true, windowsVerbatimArguments: verbatim, stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`, GIT_AUTHOR_NAME: "AIT contract tests", GIT_AUTHOR_EMAIL: "ait-tests@example.invalid",
         GIT_COMMITTER_NAME: "AIT contract tests", GIT_COMMITTER_EMAIL: "ait-tests@example.invalid" },
     });
     let stdout = "";
@@ -144,7 +253,7 @@ function nextAction(action: unknown): void {
   }
 }
 async function command(cwd: string, argv: string[], entry: Entry = "dispatch"): Promise<Envelope> {
-  const result = entry === "bin"
+  const result = entry === "wrapper" ? await runWrapper(cwd, argv) : entry === "bin"
     ? await run(process.execPath, [bin, ...argv], cwd)
     : await run(process.execPath, [apiRunner, "dispatch", JSON.stringify(argv)], cwd);
   const value = oneJson(result) as unknown as Envelope;
@@ -189,7 +298,11 @@ async function create(cwd: string, argv: string[], content: string, entry: Entry
   expect(discussion.next_action.type).toBe("present_and_collect");
   expect(discussion.next_action.required_next_call).toContain(discussion.context_token);
   expectSame(before, managed(cwd));
-  const written = await ok(cwd, [...argv, "--content", content, "--context-token", discussion.context_token], entry);
+  // File input keeps multiline content out of cmd.exe argument parsing.
+  const contentFile = path.join(caseDir(), "content.md");
+  if (entry === "wrapper") write(contentFile, content);
+  const written = await ok(cwd, [...argv, entry === "wrapper" ? "--content-file" : "--content",
+    entry === "wrapper" ? contentFile : content, "--context-token", discussion.context_token], entry);
   expect(written.mode).toBe("written");
   expect(written.next_action).toBeNull();
   return written;
@@ -204,8 +317,8 @@ function fsdSplit(id: string, prd: string): string {
 function tddContent(id = TDD, target = TARGET): string {
   return chunk(id, `\`\`\`yaml\ntarget_file: ${target}\n\`\`\`\n\nSYSTEM_CONTRACT_VALUE=42\n生成 CommonJS 模块，导出 value=42 与 source=${id}。`);
 }
-async function startFeature(cwd: string): Promise<Feature> {
-  const graph = await ok(cwd, ["specgraph", "export"]);
+async function startFeature(cwd: string, entry?: Entry): Promise<Feature> {
+  const graph = await ok(cwd, ["specgraph", "export"], entry);
   const nodes = new Map<string, Data>((graph.specs as Data[]).map((node) => [node.uri as string, node]));
   const roots = (graph.specs as Data[]).filter((node) => node.type === "prd" && !node.chunk_id.includes(":"));
   expect(roots.length, "Python fixture must contain a PRD root").toBeGreaterThan(0);
@@ -218,28 +331,29 @@ async function startFeature(cwd: string): Promise<Feature> {
   const versions = fs.readdirSync(path.join(projectDocs(cwd), ".meta", "versions"));
   const major = Math.max(0, ...versions.map((name) => Number(/^v(\d+)\./.exec(name)?.[1] ?? 0))) + 1;
   const version = `v${major}.0`;
-  const created = await ok(cwd, ["version", "create", version], "bin");
+  const created = await ok(cwd, ["version", "create", version], entry ?? "bin");
   expect(created.next_action.type).toBe("report");
-  const feature = { cwd, version, prd: prd.chunk_id as string, fsd: fsd.chunk_id as string };
-  await create(cwd, ["prd", "create", `${feature.prd}:system_contract`], requirement(`${feature.prd}:system_contract`));
-  await ok(cwd, ["prd", "confirm"], "bin");
+  const feature: Feature = { cwd, version, prd: prd.chunk_id as string, fsd: fsd.chunk_id as string,
+    ...(entry === undefined ? {} : { entry }) };
+  await create(cwd, ["prd", "create", `${feature.prd}:system_contract`], requirement(`${feature.prd}:system_contract`), entry);
+  await ok(cwd, ["prd", "confirm"], entry ?? "bin");
   return feature;
 }
 async function writeFeature(feature: Feature): Promise<void> {
-  const { cwd, prd, fsd } = feature;
-  await create(cwd, ["fsd", "create", `${fsd}:system_contract`], fsdSplit(`${fsd}:system_contract`, `${prd}:system_contract`), "bin");
+  const { cwd, prd, fsd, entry } = feature;
+  await create(cwd, ["fsd", "create", `${fsd}:system_contract`], fsdSplit(`${fsd}:system_contract`, `${prd}:system_contract`), entry ?? "bin");
   await create(cwd, ["fsd", "decompose", `${fsd}:system_contract`, CHILD_FSD],
-    chunk(CHILD_FSD, "独立制品功能分区。") + "\n" + fsdSplit(`${CHILD_FSD}:implementation`, `${prd}:system_contract`));
-  await ok(cwd, ["fsd", "confirm"], "bin");
+    chunk(CHILD_FSD, "独立制品功能分区。") + "\n" + fsdSplit(`${CHILD_FSD}:implementation`, `${prd}:system_contract`), entry);
+  await ok(cwd, ["fsd", "confirm"], entry ?? "bin");
 }
-async function prepare(cwd: string): Promise<Feature> {
-  const feature = await startFeature(cwd);
+async function prepare(cwd: string, entry?: Entry): Promise<Feature> {
+  const feature = await startFeature(cwd, entry);
   await writeFeature(feature);
-  await create(cwd, ["tdd", "create", TDD, "--parent", `${CHILD_FSD}:implementation`], tddContent(), "bin");
-  await ok(cwd, ["tdd", "confirm"]);
+  await create(cwd, ["tdd", "create", TDD, "--parent", `${CHILD_FSD}:implementation`], tddContent(), entry ?? "bin");
+  await ok(cwd, ["tdd", "confirm"], entry);
   return feature;
 }
-async function deliver(feature: Feature, entry: Entry = "dispatch", id = TDD): Promise<Delivery> {
+async function deliver(feature: Feature, entry: Entry = feature.entry ?? "dispatch", id = TDD): Promise<Delivery> {
   const pointer = await ok(feature.cwd, ["codegen", "prepare", id], entry) as unknown as Delivery;
   expect(pointer.version).toBe(feature.version);
   expect(pointer.tdd_root).toBe(id);
@@ -278,13 +392,16 @@ function policy(cwd: string, enforcement: "report" | "block"): void {
   const file = path.join(projectDocs(cwd), ".meta", "config.local.yaml");
   write(file, stringify({ ...(fs.existsSync(file) ? yaml(file) : {}), generation_receipts: { enforcement } }));
 }
-async function acceptance(cwd: string): Promise<void> {
+async function acceptance(cwd: string, entry?: Entry): Promise<void> {
   const script = `const a=require('node:assert/strict');const x=require('./${TARGET}');a.equal(x.value,42);a.equal(x.source,'${TDD}');`;
-  await ok(cwd, ["acceptance", "set", `"${process.execPath}" -e "${script}"`], "bin");
-  expect(await ok(cwd, ["acceptance", "run"])).toMatchObject({ ran: true, passed: true, exitCode: 0 });
+  const harness = "system-contract-acceptance.cjs";
+  if (entry === "wrapper") write(path.join(cwd, harness), script);
+  await ok(cwd, ["acceptance", "set", entry === "wrapper" ? `node ${harness}` : `"${process.execPath}" -e "${script}"`], entry ?? "bin");
+  expect(await ok(cwd, ["acceptance", "run"], entry)).toMatchObject({ ran: true, passed: true, exitCode: 0 });
 }
 
 function pythonFixture(cwd: string): void {
+  write(path.join(cwd, "legacy.cjs"), "module.exports = { value: 42, source: '[TDD]-legacy' };\n");
   const stamp = "2025-01-01T00:00:00+00:00";
   const records = [
     { id: "[PRD]-legacy", file: "prd/[PRD]-legacy", content: chunk("[PRD]-legacy", "Python 管理的原有需求根。") },
@@ -433,7 +550,7 @@ beforeAll(async () => {
   write(apiRunner, API_RUNNER);
   fixture = path.join(suiteDir, "python-shape-source");
   pythonFixture(fixture);
-  console.info(`[system-contracts] installed ait-core ${manifest.version} from ${tarball}`);
+  console.info(`[system-contracts] installed ait-core ${manifest.version} from ${tarball}; sha256=${hash(fs.readFileSync(tarball))}`);
   console.info(`[system-contracts] public API/bin, cross-domain gates and built-in Python-shaped fixture enabled`);
   console.info(CORPORA.length > 0
     ? `[system-contracts] real Python corpora: ${CORPORA.join("; ")}`
@@ -593,12 +710,157 @@ describe("cross-domain write and version gates", () => {
   }, TIMEOUT);
 });
 
-async function takeover(sourceDocs: string, label: string): Promise<void> {
+
+async function governanceRejection(feature: Feature, code: string, details: Data = {}): Promise<void> {
+  const before = managed(feature.cwd);
+  for (const argv of [["specgraph", "validate-new-model"], ["specgraph", "validate-new-model", "--version", feature.version]]) {
+    const diagnostic = await ok(feature.cwd, argv, "wrapper");
+    expect(diagnostic).toMatchObject({ passed: true, violations: [] });
+    // Retain a missing CLI-contract failure while still exercising the actual confirmation gate.
+    expect.soft(diagnostic.policy_violations).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
+    if (code === "TDD_TARGET_FILE_MISSING") expect.soft(diagnostic.target_file_missing).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
+    if (code === "DERIVES_RESIDUE") expect.soft(diagnostic.derives_residue).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
+    expectSame(before, managed(feature.cwd));
+  }
+  const rejected = await command(feature.cwd, ["version", "confirm", feature.version], "wrapper");
+  expect(rejected).toMatchObject({ ok: false, code: "INVARIANT_VIOLATION" });
+  expect(rejected.error).toContain(code);
+  expectSame(before, managed(feature.cwd));
+}
+async function realPythonGovernance(feature: Feature, originalFsd: string): Promise<void> {
+  const { cwd } = feature;
+  expect(yaml(metaFile(cwd, feature.version)).phase).toBe("fsd-confirm");
+  const shared = path.join(projectDocs(cwd), ".meta", "config.yaml");
+  const local = path.join(projectDocs(cwd), ".meta", "config.local.yaml");
+  const config = { ...yaml(shared), ...(fs.existsSync(local) ? yaml(local) : {}) };
+  expect(config.target_file_existence).toMatchObject({ enforcement: "block" });
+  expect(config.derives_residue).toMatchObject({ enforcement: "block" });
+  const scopes = Object.entries(config.artifact_scopes as Data);
+  expect(scopes.length).toBeGreaterThan(0);
+  const target = corpusTargets(projectDocs(cwd)).find((file) => fs.existsSync(path.join(cwd, file)))!;
+  expect(target).toBeTypeOf("string");
+  const artifact = path.join(cwd, target);
+  const held = path.join(caseDir(), "held-artifact");
+  fs.renameSync(artifact, held);
+  try { await governanceRejection(feature, "TDD_TARGET_FILE_MISSING", { targetFile: target }); }
+  finally { fs.renameSync(held, artifact); }
+
+  for (const [prefix, scope] of scopes) {
+    expect(scope.enforcement).toBe("block");
+    const unowned = path.posix.join(prefix, "__ait_system_contract_unowned__.cjs");
+    expect(fs.existsSync(path.join(cwd, unowned))).toBe(false);
+    write(path.join(cwd, unowned), "module.exports = 1;\n");
+    await git(cwd, ["--literal-pathspecs", "add", "--force", "--", unowned]);
+    try { await governanceRejection(feature, "UNCOVERED_ARTIFACT", { targetFile: unowned }); }
+    finally {
+      await git(cwd, ["--literal-pathspecs", "rm", "--cached", "--", unowned]);
+      fs.unlinkSync(path.join(cwd, unowned));
+    }
+    const policyFile = fs.existsSync(local) && yaml(local).artifact_scopes !== undefined ? local : shared;
+    const policyBytes = fs.readFileSync(policyFile);
+    // Removing an existing exemption strengthens the copied policy; restore its exact original bytes.
+    for (const [field, code] of [["exempt_paths", "UNCOVERED_ARTIFACT"], ["exempt_test_splits", "TEST_SPLIT_UNCOVERED"]] as const) {
+      const values = scope[field] as string[];
+      expect(values.length, "Corpus must exercise " + field + ": " + prefix).toBeGreaterThan(0);
+      const tightened = yaml(policyFile);
+      tightened.artifact_scopes[prefix][field] = values.slice(1);
+      write(policyFile, stringify(tightened));
+      try { await governanceRejection(feature, code); }
+      finally { fs.writeFileSync(policyFile, policyBytes); }
+    }
+  }
+
+  const graph = await ok(cwd, ["specgraph", "export"], "wrapper");
+  const requirementId = (graph.specs as Data[]).find((node) => node.type === "prd" && node.chunk_id.includes(":") && node.chunk_id !== feature.prd + ":system_contract")!.chunk_id as string;
+  const implementation = CHILD_FSD + ":implementation";
+  const reworkFsd = async (content: string): Promise<void> => {
+    await ok(cwd, ["fsd", "revert"], "wrapper");
+    await create(cwd, ["fsd", "create", implementation, "--action", "modify"], content, "wrapper");
+    await ok(cwd, ["fsd", "confirm"], "wrapper");
+  };
+  await reworkFsd(originalFsd + "\nUnmapped requirement reference: " + requirementId + "\n");
+  try { await governanceRejection(feature, "DERIVES_RESIDUE", { chunkId: implementation }); }
+  finally { await reworkFsd(originalFsd); }
+
+  const declaredFsdFiles = new Set((yaml(path.join(projectDocs(cwd), ".meta", `chunks-index-${feature.version}.yaml`)).chunks as Data[])
+    .filter((entry) => String(entry.id).startsWith("[FSD]-"))
+    .map((entry) => String(entry.file).replace(/\.md$/, "")));
+  const exemptIds = scopes.flatMap(([, scope]) => scope.exempt_test_splits as string[]);
+  const exempt = (yaml(path.join(projectDocs(cwd), ".meta", "chunks-index.yaml")).chunks as Data[])
+    .find((entry) => String(entry.id).startsWith("[FSD]-") && String(entry.id).endsWith(":TEST") &&
+      exemptIds.includes(entry.id as string) && !declaredFsdFiles.has(String(entry.file).replace(/\.md$/, "")))!;
+  expect(exempt, "Corpus must contain an exact exempt baseline TEST split outside this version's declared FSD files").toBeDefined();
+  const exemptId = exempt.id as string;
+  const exemptFile = path.join(projectDocs(cwd), "docs", String(exempt.file).replace(/\.md$/, "") + ".md");
+  const exemptBytes = fs.readFileSync(exemptFile);
+  const content = exemptBytes.toString("utf8");
+  const marker = "<!-- @id:" + exemptId + " -->";
+  const start = content.indexOf(marker);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const next = content.indexOf("<!-- @id:", start + marker.length);
+  const at = next < 0 ? content.length : next;
+  write(exemptFile, content.slice(0, at) + "\nAcceptance-only reference: " + requirementId + "\n\n" + content.slice(at));
+  try {
+    const diagnostic = await ok(cwd, ["specgraph", "validate-new-model", "--version", feature.version], "wrapper");
+    expect.soft(diagnostic).toMatchObject({ policy_violations: [], warnings: [], target_file_missing: [], derives_residue: [] });
+    expect(await ok(cwd, ["version", "confirm", feature.version], "wrapper")).toMatchObject({ passed: true });
+  } finally { fs.writeFileSync(exemptFile, exemptBytes); }
+  console.info("[system-contracts] original Python block policies rejected missing targets, unowned tracked artifacts and derives residue; original path/TEST exemptions retained");
+}
+function baselineHasNoVersionFields(cwd: string): void {
+  const index = yaml(path.join(projectDocs(cwd), ".meta", "chunks-index.yaml"));
+  expect(Object.keys(index).sort()).toEqual(["chunks", "scope", "updated", "version"]);
+  for (const entry of index.chunks as Data[]) {
+    expect(Object.keys(entry).sort()).toEqual(["file", "heading", "id", "level", "metadata", "summary"]);
+  }
+  const graph = yaml(path.join(projectDocs(cwd), ".meta", "specgraph.yaml"));
+  for (const node of graph.specs as Data[]) {
+    expect(node.version).toBe("baseline");
+    expect(node.uri).toContain(":baseline:");
+  }
+}
+async function secondIteration(first: Feature, history: Snapshot, real: boolean): Promise<void> {
+  const { cwd, prd } = first;
+  const stable = baseline(cwd);
+  const check = (): void => { expectSame(stable, baseline(cwd)); expectPreserved(history, managed(cwd)); };
+  const version = first.version.replace(/\.0$/, ".1");
+  const feature: Feature = { ...first, version, entry: "wrapper" };
+  await ok(cwd, ["version", "create", version], "wrapper"); check();
+  await create(cwd, ["prd", "create", prd + ":system_contract", "--action", "modify"], requirement(prd + ":system_contract") + "\nSecond iteration.\n", "wrapper"); check();
+  await ok(cwd, ["prd", "confirm"], "wrapper"); check();
+  const fsdContent = fsdSplit(CHILD_FSD + ":implementation", prd + ":system_contract") + "\nSecond iteration.\n";
+  await create(cwd, ["fsd", "create", CHILD_FSD + ":implementation", "--action", "modify"], fsdContent, "wrapper"); check();
+  await ok(cwd, ["fsd", "confirm"], "wrapper"); check();
+  if (real) { await realPythonGovernance(feature, fsdContent); check(); }
+  for (const note of ["Second iteration", "Reworked iteration"]) {
+    await create(cwd, ["tdd", "create", TDD, "--parent", CHILD_FSD + ":implementation", "--action", "modify"], tddContent() + "\n" + note + ".\n", "wrapper"); check();
+    await ok(cwd, ["tdd", "confirm"], "wrapper"); check();
+    const pointer = await deliver(feature);
+    generate(cwd, pointer);
+    await receipt(cwd, pointer);
+    await ok(cwd, ["version", "confirm", version], "wrapper"); check();
+    if (note === "Second iteration") {
+      expect(await ok(cwd, ["tdd", "revert"], "wrapper")).toMatchObject({ reverted: [TDD], phase: "tdd-creating" }); check();
+    }
+  }
+  expect(await ok(cwd, ["version", "revert", version, "--confirm"], "wrapper")).toMatchObject({ reverted: true, mode: "unmerged" }); check();
+  expect(fs.existsSync(metaFile(cwd, version))).toBe(false);
+  baselineHasNoVersionFields(cwd);
+  for (const repo of [cwd, projectDocs(cwd)]) expect((await gitEvidence(repo, "after second iteration/rework/revert")).status).toBe("");
+  console.info("[system-contracts] " + version + ": baseline and merged history preserved byte-for-byte through opening, layer confirmation, version confirmation, TDD rework and cancellation");
+}
+
+async function takeover(sourceDocs: string, label: string, real = false): Promise<void> {
   const originalCwd = path.dirname(sourceDocs);
   const sourceBefore = managed(originalCwd);
+  const sourceWrappers = snapshot(path.join(sourceDocs, ".ait"));
+  const localFile = path.join(sourceDocs, ".meta", "config.local.yaml");
+  const localConfig = fs.existsSync(localFile) ? yaml(localFile) : {};
+  const pythonDirectory = typeof localConfig.skill_dir === "string" && fs.existsSync(localConfig.skill_dir) ? localConfig.skill_dir as string : null;
+  const pythonBefore = pythonDirectory === null ? null : snapshot(pythonDirectory, true);
   expect(sourceBefore.size, `Empty Python corpus: ${sourceDocs}`).toBeGreaterThan(0);
   try {
-    const cwd = cloneDocs(sourceDocs);
+    const cwd = await cloneTakeover(sourceDocs);
     const copied = managed(cwd);
     expectSame(sourceBefore, copied);
     const metas = fs.readdirSync(path.join(projectDocs(cwd), ".meta", "versions")).filter((name) => name.endsWith(".yaml"))
@@ -614,31 +876,32 @@ async function takeover(sourceDocs: string, label: string): Promise<void> {
     }
     const oldHistory = new Map([...copied].filter(([file]) => historical.has(file) || merged.some((meta) => file.startsWith(`versions/${meta.version}/`))));
     const originalBaseline = baseline(cwd);
+    await refreshInstalledWrapper(cwd);
     const statusArgs = ["version", "status", merged.at(-1)!.version as string];
-    expect(await command(cwd, statusArgs)).toEqual(await command(cwd, statusArgs, "bin"));
-    expect(await command(cwd, ["specgraph", "export"])).toEqual(await command(cwd, ["specgraph", "export"], "bin"));
+    expect(await command(cwd, statusArgs)).toEqual(await command(cwd, statusArgs, "wrapper"));
+    expect(await command(cwd, ["specgraph", "export"])).toEqual(await command(cwd, ["specgraph", "export"], "wrapper"));
     const session = await namedOk(cwd, "getSessionContext") as Data;
     expectSame(copied, managed(cwd));
     if (session.active_version !== null) {
-      await ok(cwd, ["version", "revert", session.active_version as string, "--confirm"], "bin");
+      await ok(cwd, ["version", "revert", session.active_version as string, "--confirm"], "wrapper");
     }
     expectSame(originalBaseline, baseline(cwd));
     expectPreserved(oldHistory, managed(cwd));
-    expect(await ok(cwd, ["specgraph", "validate-new-model"], "bin"), `${label}: historical invariant violation`).toMatchObject({ passed: true, violations: [] });
-    const feature = await prepare(cwd);
+    expect(await ok(cwd, ["specgraph", "validate-new-model"], "wrapper"), `${label}: historical invariant violation`).toMatchObject({ passed: true, violations: [] });
+    const feature = await prepare(cwd, "wrapper");
     policy(cwd, "block");
-    const pointer = await deliver(feature, "bin");
+    const pointer = await deliver(feature);
     expect(fs.existsSync(path.join(cwd, TARGET))).toBe(false);
     generate(cwd, pointer);
     await receipt(cwd, pointer);
-    await acceptance(cwd);
-    const confirmed = await ok(cwd, ["version", "confirm", feature.version]);
+    await acceptance(cwd, "wrapper");
+    const confirmed = await ok(cwd, ["version", "confirm", feature.version], "wrapper");
     expect(confirmed).toMatchObject({ passed: true, generation_receipts: { enforcement: "block", passed: true, findings: [] } });
     expectSame(originalBaseline, baseline(cwd));
     const plan = yaml(metaFile(cwd, feature.version)).confirmed_plan as Data;
     const declaredFiles = new Set<string>((plan.operations as Data[]).map((operation) =>
       `docs/${String(operation.file).replace(/\.md$/, "")}.md`));
-    const mergedResult = await ok(cwd, ["version", "merge", feature.version], "bin");
+    const mergedResult = await ok(cwd, ["version", "merge", feature.version], "wrapper");
     expect(mergedResult.merged_chunks).toContain(TDD);
     expect(yaml(metaFile(cwd, feature.version))).toMatchObject({ phase: "merged" });
     expectPreserved(oldHistory, managed(cwd));
@@ -652,11 +915,29 @@ async function takeover(sourceDocs: string, label: string): Promise<void> {
       else expect(after.get(file)?.equals(bytes), file).toBe(true);
     }
     expect(fs.readFileSync(path.join(cwd, TARGET), "utf8")).toContain('"value":42');
-    await acceptance(cwd);
+    await acceptance(cwd, "wrapper");
+    baselineHasNoVersionFields(cwd);
+    const mergedMeta = yaml(metaFile(cwd, feature.version));
+    expect(mergedMeta.code_result).toBe((await gitEvidence(cwd, "after first merge host")).head);
+    expect((await gitEvidence(projectDocs(cwd), "after first merge docs")).status).toBe("");
+    expect((await git(projectDocs(cwd), ["rev-parse", mergedMeta.revert_anchor.docs_ref as string])).trim()).toBe((await git(projectDocs(cwd), ["rev-parse", "HEAD"])).trim());
+    const firstHistory = new Map([...managed(cwd)].filter(([file]) => historical.has(file) ||
+      merged.some((meta) => file.startsWith(`versions/${meta.version}/`)) ||
+      file.startsWith(`versions/${feature.version}/`) ||
+      [`.meta/versions/${feature.version}.yaml`, `.meta/chunks-index-${feature.version}.yaml`, `.meta/specgraph-${feature.version}.yaml`,
+        ...(mergedMeta.changes as string[]).map((change) => `.meta/changes/${change}.yaml`)].includes(file)));
+    await secondIteration(feature, firstHistory, real);
     expect(await namedOk(cwd, "getSessionContext")).toMatchObject({ active_version: null, phase: null, baseline_empty: false });
     console.info(`[system-contracts] ${label}: takeover completed; ${merged.length} historical versions preserved; ${feature.version} merged; artifact ${TARGET} executed`);
   } finally {
     expectSame(sourceBefore, managed(originalCwd));
+    expectSame(sourceWrappers, snapshot(path.join(sourceDocs, ".ait")));
+    if (pythonDirectory !== null) expectSame(pythonBefore!, snapshot(pythonDirectory, true));
+    for (const source of [originalCwd, sourceDocs]) {
+      for (const [file, bytes] of sourceArtifacts.get(source) ?? []) {
+        expect(fs.readFileSync(path.join(source, file)).equals(bytes), `Source artifact changed: ${source}/${file}`).toBe(true);
+      }
+    }
   }
 }
 
@@ -673,7 +954,7 @@ describe("Python-project takeover", () => {
         : fs.existsSync(path.join(absolute, "project-docs", ".meta")) ? path.join(absolute, "project-docs") : absolute;
       expect(path.basename(sourceDocs), "AIT_CORPUS_DIRS must identify project-docs, its .meta directory, or the project root").toBe("project-docs");
       expect(fs.statSync(path.join(sourceDocs, ".meta")).isDirectory()).toBe(true);
-      await takeover(sourceDocs, `real Python corpus ${sourceDocs}`);
+      await takeover(sourceDocs, `real Python corpus ${sourceDocs}`, true);
     }, TIMEOUT);
   }
 });
