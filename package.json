@@ -1,0 +1,40 @@
+{
+  "name": "ait-core",
+  "version": "0.1.0",
+  "description": "AIT — chunk-level spec version control and AI implementation orchestration (TypeScript)",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "bin": {
+    "ait": "./dist/src/bin.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "yaml": "^2.5.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  }
+}
