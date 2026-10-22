@@ -14,8 +14,9 @@
  * - 取正文的三类根因不得归并：文件缺失 / 文件内无该 chunk → MERGE_SOURCE_MISSING；
  *   文件存在但解析失败（如重复 chunk id）→ CHUNK_PARSE_ERROR 带文件与行列，原样上抛；
  * - 宿主 git 操作经子进程，失败不吞；宿主非 git 仓 code_result=null，其余语义不变；
- * - merged 版本 revert：只读预检零写入 → 写补偿基准（recovery_journal）→ 双仓
- *   reset（任一失败恢复操作前 HEAD）→ 清理后续版本 → 校验双仓 clean 且锚点达成。
+ * - merged 版本 revert：只读预检零写入 → 写补偿基准（recovery_journal）→ 参与仓
+ *   reset（任一失败恢复操作前 HEAD）→ 清理后续版本 → 校验参与仓 clean 且锚点达成；
+ *   历史无宿主绑定时只切换 docs，宿主 HEAD、暂存与工作内容保持原样。
  *
  * 持久化布局（与 Python 版 ait 当前形态一致，doc-model schema 为权威）：
  * - 版本元数据：`.meta/versions/<v>.yaml`（VersionMetaSchema，含 `version` 字段）；
@@ -938,9 +939,9 @@ export class VersionManager {
 
   /**
    * 回滚：未合入→物理清空工作区/版本索引/版本图/版本元数据/本版本产生的变更记录；
-   * merged→只读预检（锚点解析 + 两仓可访问，皆失败 REVERT_PRECHECK_FAILED 零写入）
-   * → 写 recovery_journal{phase:"prepared"} → 双仓 reset（任一失败恢复操作前 HEAD）
-   * → 清理后续版本 → 校验双仓 clean 且锚点达成。
+   * merged→只读预检（docs 始终参与，宿主仅在历史有非空绑定时参与；
+   * 仓或锚点不可用 REVERT_PRECHECK_FAILED 零写入）→ 写 recovery_journal{phase:"prepared"}
+   * → 参与仓 reset（任一失败恢复操作前 HEAD）→ 清理后续版本 → 校验 clean 且锚点达成。
    */
   async versionRevert(
     id: string,
@@ -975,7 +976,10 @@ export class VersionManager {
         `docs 仓不可访问（非 git 仓）：${docsCwd}，预检失败零写入`,
       );
     }
-    const hostRepo = this.isGitRepo(hostCwd);
+    const hasHostBinding = [
+      meta.revert_anchor?.code_result, meta.code_result, meta.code_base,
+    ].some((ref) => typeof ref === "string" && ref.trim() !== "");
+    const hostRepo = hasHostBinding && this.isGitRepo(hostCwd);
 
     const docsAnchor = this.resolveAnchor(meta, { cwd: docsCwd, side: "docs", version: id });
     const hostAnchor = hostRepo
@@ -988,10 +992,17 @@ export class VersionManager {
           `依次 cat-file -e 均失败），预检失败零写入`,
       );
     }
-    if (hostRepo && hostAnchor === null) {
+    if (hasHostBinding && !hostRepo) {
       throw new VersionManagerError(
         "REVERT_PRECHECK_FAILED",
-        `版本 ${id} 已绑定宿主锚点但不可解析（code_result/code_base 均 cat-file -e 失败），预检失败零写入`,
+        `版本 ${id} 已绑定宿主锚点但宿主仓不可访问（非 git 仓）：${hostCwd}，预检失败零写入`,
+      );
+    }
+    if (hasHostBinding && hostAnchor === null) {
+      throw new VersionManagerError(
+        "REVERT_PRECHECK_FAILED",
+        `版本 ${id} 已绑定宿主锚点但不可解析（revert_anchor.code_result → code_result → code_base ` +
+          `依次 cat-file -e 均失败），预检失败零写入`,
       );
     }
 
@@ -1054,9 +1065,9 @@ export class VersionManager {
       this.purgeVersionArtifacts(v, { removeChangeRecords: true });
     }
 
-    // ── 校验双仓 clean 且锚点达成 ────────────────────────────────────────
+    // ── 只校验实际参与 reset 的仓库；无历史绑定的宿主允许保持 dirty ────────
     this.assertRepoState(docsCwd, docsAnchor, "docs");
-    if (hostRepo) {
+    if (hostAnchor !== null) {
       this.assertRepoState(hostCwd, hostAnchor, "host");
     }
 
@@ -1320,7 +1331,7 @@ export class VersionManager {
 
   /**
    * 锚点解析（按 meta 与仓侧）：docs 侧 `revert_anchor.docs_ref` → `refs/tags/ait/<v>`
-   * → `docs_commit`；host 侧 `revert_anchor.code_result` → `code_base`。
+   * → `docs_commit`；host 侧 `revert_anchor.code_result` → `code_result` → `code_base`。
    * 每个候选先 `git cat-file -e <ref>^{commit}` 验证，再 rev-parse 为 commit SHA；
    * 全部失败返回 null（只读，零写入）。
    */
@@ -1337,11 +1348,12 @@ export class VersionManager {
       if (meta.docs_commit !== null) candidates.push(meta.docs_commit);
     } else {
       if (anchor !== null && anchor.code_result !== null) candidates.push(anchor.code_result);
+      if (meta.code_result !== null) candidates.push(meta.code_result);
       if (meta.code_base !== null) candidates.push(meta.code_base);
     }
 
     for (const ref of candidates) {
-      if (ref === "" ) continue;
+      if (ref.trim() === "") continue;
       if (this.gitTry(cwd, ["cat-file", "-e", `${ref}^{commit}`]) === null) continue;
       const sha = this.gitTry(cwd, ["rev-parse", `${ref}^{commit}`]);
       if (sha !== null && sha !== "") {

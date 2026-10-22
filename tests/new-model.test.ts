@@ -1,5 +1,5 @@
 // [TDD]-new_model_tests — new_model 域三个制品（model-manager/validator/codegen）的集成验收。
-// 覆盖 [FSD]-ait-core-new_model:TEST 全部验收条款及 v0.10 生产路径回归。
+// 覆盖 [FSD]-ait-core-new_model:TEST 全部验收条款及 v0.10/v0.12 生产路径回归。
 // 约束：每个用例在 os.tmpdir() 下自建 project-docs 骨架与版本工作区（init 语义由
 // 测试手工搭骨架替代），用例间零共享状态；全流程用例按 phase 机顺序推进；
 // 内联文档文本一律用行数组 join，避免 ``` 围栏与 @id 注释自嵌套。
@@ -326,7 +326,7 @@ describe("全流程", () => {
     // 3. 下层未 confirm 上层时拒绝：phase=prd-creating 时 fsd create → PRD_NOT_CONFIRMED 零落盘
     await expectErrCode(
       mgr.createDocument("fsd", "[FSD]-alpha", {
-        content: FSD_ROOT_DOC,
+        content: fsdFixture("[FSD]-alpha"),
         skipContext: true,
       }),
       "PRD_NOT_CONFIRMED",
@@ -2497,5 +2497,372 @@ describe("持久化形态", () => {
     const index = loadModel(path.join(root.meta, "chunks-index-" + VERSION + ".yaml"), VersionIndexSchema);
     expect(index.chunks.length).toBe(3);
     for (const entry of index.chunks) expect(entry.discussion_usage).toEqual({ mode: "skipped", receipt_digest: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.12 正式写入：真实 manager 入口的文档位置、提交完整性与讨论意图
+// ---------------------------------------------------------------------------
+
+type WriteLayer = "prd" | "fsd" | "tdd";
+type WriteOperation = WriteLayer | "decompose";
+type WriteOptions = Parameters<NewModelManager["createDocument"]>[2];
+const WRITE_OPERATIONS = ["prd", "fsd", "tdd", "decompose"] as const;
+
+/** 经实际上层 create/confirm 到达写入相位，供四种入口复用同一断言矩阵。 */
+async function formalWriteFixture(operation: WriteOperation) {
+  const { root, mgr } = makeProject();
+  const layer: WriteLayer = operation === "decompose" ? "fsd" : operation;
+  if (operation === "fsd" || operation === "decompose") await advanceToPrdConfirm(mgr);
+  if (operation === "tdd") await advanceToFsdConfirm(mgr);
+  if (operation === "decompose") {
+    await mgr.createDocument("fsd", "[FSD]-alpha", {
+      content: fsdFixture(), parent: "[PRD]-demo", skipContext: true,
+    });
+  }
+  const id = operation === "prd" ? "[PRD]-demo" : operation === "fsd" ? "[FSD]-alpha"
+    : operation === "tdd" ? "[TDD]-impl" : "[FSD]-child";
+  const parent = operation === "fsd" ? "[PRD]-demo" : operation === "tdd" ? "[FSD]-demo:svc"
+    : operation === "decompose" ? "[FSD]-alpha:splitA" : undefined;
+  const content = layer === "prd" ? PRD_REQUIREMENTS : layer === "fsd" ? fsdFixture(id)
+    : tddDoc(id, "src/impl.ts");
+  const request = (options: WriteOptions) => operation === "decompose"
+    ? mgr.decompose(parent!, id, options)
+    : mgr.createDocument(layer, id, { ...(parent === undefined ? {} : { parent }), ...options });
+  return { root, mgr, layer, id, parent, content, request };
+}
+
+describe("v0.12 显式文档路径", () => {
+  const forms = [
+    { label: "name", input: "document", relative: "document.md" },
+    { label: "kind/name", input: "{kind}/document", relative: "document.md" },
+    { label: "name.md", input: "document.md", relative: "document.md" },
+    { label: "kind/name.md", input: "{kind}/document.md", relative: "document.md" },
+    { label: "安全子目录", input: "design/details/document", relative: "design/details/document.md" },
+    { label: "带层目录的子目录", input: "{kind}/design/details/document.md", relative: "design/details/document.md" },
+    { label: "Unicode 与空格", input: "设计 目录/文档 名称", relative: "设计 目录/文档 名称.md" },
+    { label: "带层目录的 Unicode 与空格", input: "{kind}/设计 目录/文档 名称.md", relative: "设计 目录/文档 名称.md" },
+  ];
+  const cases = WRITE_OPERATIONS.flatMap((operation) => forms.map((form) => ({ operation, ...form })));
+
+  it.each(cases)("$operation 的 $label 正确落盘、等价 file 复用令牌并可确认读取", async ({ operation, input, relative }) => {
+    const fixture = await formalWriteFixture(operation);
+    const { root, mgr, layer, id, content, request } = fixture;
+    const file = input.replace("{kind}", layer);
+    const canonicalFile = layer + "/" + relative;
+    const beforeDiscussion = treeSnapshot(root);
+    const context = await request({ file });
+    const canonicalContext = await request({ file: canonicalFile });
+    expect(tokenOf(context)).toBe(tokenOf(canonicalContext));
+    expect(await request({ file })).toEqual(context);
+    expect(treeSnapshot(root)).toEqual(beforeDiscussion);
+
+    const result = await request({ file, content, contextToken: tokenOf(canonicalContext) });
+    expect(result).toMatchObject({ mode: "written", file: canonicalFile, phase: layer + "-creating" });
+    const physicalFile = versionFile(root, canonicalFile);
+    expect(fs.existsSync(physicalFile)).toBe(true);
+    const parsed = parseFile(physicalFile, root.root);
+    expect(parsed.chunks.map((chunk) => chunk.id)).toContain(id);
+    expect(new IndexManager(root).queryVersion(VERSION, id)).toMatchObject({
+      file: canonicalFile.slice(0, -3), state: "working",
+    });
+    expect(combinedView(root, VERSION).nodes.get(id)?.file).toBe(canonicalFile.slice(0, -3));
+    const physicalDocuments = Object.keys(treeSnapshot(root))
+      .filter((name) => name.startsWith("versions/" + VERSION + "/") && !name.endsWith("/"));
+    expect(physicalDocuments).toContain("versions/" + VERSION + "/" + canonicalFile);
+    expect(physicalDocuments.every((name) => name.endsWith(".md"))).toBe(true);
+    expect(physicalDocuments.some((name) => name.startsWith("versions/" + VERSION + "/" + layer + "/" + layer + "/"))).toBe(false);
+    expect(fs.existsSync(versionFile(root, canonicalFile.slice(0, -3)))).toBe(false);
+    expect(fs.existsSync(physicalFile + ".md")).toBe(false);
+
+    const stored = fs.readFileSync(physicalFile, "utf8");
+    expect(mgr.confirmLayer(layer)).toMatchObject({
+      phase: layer + "-confirm", confirmed: expect.arrayContaining([id]),
+    });
+    expect(fs.readFileSync(physicalFile, "utf8")).toBe(stored);
+    expect(new IndexManager(root).queryVersion(VERSION, id)?.state).toBe("committed");
+    if (layer === "tdd") {
+      const bundle = codegenPrepare(root, VERSION, id);
+      expect(bundle).toMatchObject({ version: VERSION, sourceFile: physicalFile, targetFile: "src/impl.ts" });
+      expect(bundle.upstream[0]?.content).toBe(stored);
+    }
+  });
+
+  const invalidForms = [
+    { label: "空串", file: "" },
+    { label: "仅空白", file: " \t " },
+    { label: "绝对路径", file: "/absolute.md" },
+    { label: "Windows 根路径", file: "\\absolute.md" },
+    { label: "驱动器绝对路径", file: "C:/absolute.md" },
+    { label: "驱动器相对路径", file: "C:relative.md" },
+    { label: "冒号", file: "bad:name.md" },
+    { label: "UNC", file: "\\\\server\\share\\document.md" },
+    { label: "正斜杠 UNC", file: "//server/share/document.md" },
+    { label: "NUL", file: "bad\0name.md" },
+    { label: "当前目录名", file: "." },
+    { label: "父目录名", file: ".." },
+    { label: "起始点段", file: "./document.md" },
+    { label: "内部点段", file: "sub/./document.md" },
+    { label: "内部父目录段", file: "sub/../document.md" },
+    { label: "起始父目录段", file: "../document.md" },
+    { label: "跨 kind", file: "{other}/document.md" },
+    { label: "空路径段", file: "sub//document.md" },
+    { label: "层后的空段", file: "{kind}//document.md" },
+    { label: "末尾空段", file: "sub/" },
+  ];
+  const invalidCases = WRITE_OPERATIONS.flatMap((operation) => invalidForms.map((form) => ({ operation, ...form })));
+
+  it.each(invalidCases)("$operation 的 $label 在讨论和写入均 INVALID_FILE_NAME 且整树不变", async ({ operation, file }) => {
+    const { root, layer, content, request } = await formalWriteFixture(operation);
+    const invalidFile = file.replace("{kind}", layer).replace("{other}", layer === "prd" ? "fsd" : "prd");
+    const before = treeSnapshot(root);
+    await expectErrCode(request({ file: invalidFile }), "INVALID_FILE_NAME");
+    expect(treeSnapshot(root)).toEqual(before);
+    await expectErrCode(request({ file: invalidFile, content, skipContext: true }), "INVALID_FILE_NAME");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+});
+
+type MissingChunkOperation = WriteOperation | "split";
+
+/** baseline 与版本均可含目标，提交必须自行携带目标，不能由合成阶段补足。 */
+async function missingChunkFixture(operation: MissingChunkOperation, baseline: boolean) {
+  const { root, mgr } = makeProject();
+  if (baseline) {
+    writeDocs(root, {
+      "prd/[PRD]-demo.md": PRD_REQUIREMENTS.split("\n"),
+      "fsd/[FSD]-alpha.md": fsdFixture().split("\n"),
+      "fsd/[FSD]-child.md": fsdFixture("[FSD]-child").split("\n"),
+      "tdd/[TDD]-impl.md": tddDoc("[TDD]-impl", "src/impl.ts").split("\n"),
+    });
+    syncBaseline(root);
+    baselineEdges(root, [
+      ["[PRD]-demo", "[FSD]-alpha", "derives"],
+      ["[FSD]-alpha:splitA", "[FSD]-child", "decomposes"],
+      ["[FSD]-child:splitA", "[TDD]-impl", "details"],
+    ]);
+  }
+  if (operation !== "prd") await advanceToPrdConfirm(mgr);
+  if (operation === "split" || operation === "decompose" || operation === "tdd") {
+    await mgr.createDocument("fsd", "[FSD]-alpha", {
+      content: fsdFixture(), parent: "[PRD]-demo", skipContext: true,
+    });
+  }
+  if (operation === "tdd") {
+    await mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", {
+      content: fsdFixture("[FSD]-child"), action: baseline ? "modify" : "add", skipContext: true,
+    });
+    mgr.confirmLayer("fsd");
+  }
+  const layer: WriteLayer = operation === "prd" || operation === "tdd" ? operation : "fsd";
+  const id = operation === "prd" ? "[PRD]-demo" : operation === "fsd" ? "[FSD]-alpha"
+    : operation === "tdd" ? "[TDD]-impl" : operation === "split" ? "[FSD]-alpha:splitA" : "[FSD]-child";
+  const parent = operation === "fsd" ? { parent: "[PRD]-demo" }
+    : operation === "tdd" ? { parent: "[FSD]-child:splitA" } : {};
+  const request = (options: WriteOptions) => operation === "decompose"
+    ? mgr.decompose("[FSD]-alpha:splitA", id, options)
+    : mgr.createDocument(layer, id, { ...parent, ...options });
+  const otherContent = operation === "prd" ? PRD_DOC.replaceAll("[PRD]-demo", "[PRD]-other")
+    : operation === "tdd" ? tddDoc("[TDD]-other", "src/other.ts")
+      : operation === "split" ? fsdFixture("[FSD]-alpha", {}, ["splitB"])
+        : fsdFixture("[FSD]-other");
+  return { root, id, request, otherContent };
+}
+
+describe("v0.12 提交必须包含请求 chunk", () => {
+  const operations: MissingChunkOperation[] = ["prd", "fsd", "tdd", "split", "decompose"];
+  const cases = operations.flatMap((operation) => [false, true].flatMap((baseline) =>
+    ["空正文", "仅空白", "仅其它合法 chunk"].map((body) => ({ operation, baseline, body }))));
+
+  it.each(cases)("$operation baseline=$baseline：$body 报 ROOT_CHUNK_REQUIRED，undefined 仍只取背景", async ({ operation, baseline, body }) => {
+    const { root, id, request, otherContent } = await missingChunkFixture(operation, baseline);
+    if (baseline) expect(new IndexManager(root).queryBaseline(id)).not.toBeNull();
+    const before = treeSnapshot(root);
+    const context = await request({});
+    expect(context.mode).toBe("discussion-context");
+    expect(await request({})).toEqual(context);
+    expect(treeSnapshot(root)).toEqual(before);
+    const content = body === "空正文" ? "" : body === "仅空白" ? " \n\t\n" : otherContent;
+    await expectErrCode(request({ content, contextToken: tokenOf(context) }), "ROOT_CHUNK_REQUIRED");
+    expect(treeSnapshot(root)).toEqual(before);
+    await expectErrCode(request({ content, skipContext: true }), "ROOT_CHUNK_REQUIRED");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it("split 提交只需包含请求 split，省略根仍能写入并保留其它 chunk", async () => {
+    const { root, mgr } = await formalWriteFixture("decompose");
+    const id = "[FSD]-alpha:splitA";
+    const file = versionFile(root, "fsd/[FSD]-alpha.md");
+    const before = parseFile(file, root.root);
+    const content = ["<!-- @id:" + id + " -->", "## 更新 splitA", "只提交请求 split 的新正文。"].join("\n");
+    const contextToken = tokenOf(await mgr.createDocument("fsd", id, { action: "modify" }));
+    expect((await mgr.createDocument("fsd", id, { action: "modify", content, contextToken })).mode).toBe("written");
+    const after = parseFile(file, root.root);
+    expect(after.chunks.map((chunk) => chunk.id)).toEqual(before.chunks.map((chunk) => chunk.id));
+    expect(after.chunks.find((chunk) => chunk.id === id)?.content).toBe(content);
+    for (const chunk of before.chunks.filter((item) => item.id !== id)) {
+      expect(after.chunks.find((item) => item.id === chunk.id)?.content).toBe(chunk.content);
+    }
+    expect(mgr.confirmLayer("fsd").phase).toBe("fsd-confirm");
+  });
+});
+
+/** 根改名的合法基线：两个既有子 FSD 分别由同根的两个 split 拆分。 */
+async function decomposeOverrideFixture() {
+  const { root, mgr } = makeProject();
+  writeDocs(root, {
+    "prd/[PRD]-demo.md": PRD_REQUIREMENTS.split("\n"),
+    "fsd/[FSD]-alpha.md": fsdFixture().split("\n"),
+    "fsd/[FSD]-old_child.md": fsdFixture("[FSD]-old_child", {}, []).split("\n"),
+    "fsd/[FSD]-other_child.md": fsdFixture("[FSD]-other_child", {}, []).split("\n"),
+  });
+  syncBaseline(root);
+  baselineEdges(root, [
+    ["[PRD]-demo", "[FSD]-alpha", "derives"],
+    ["[FSD]-alpha:splitA", "[FSD]-old_child", "decomposes"],
+    ["[FSD]-alpha:splitB", "[FSD]-other_child", "decomposes"],
+  ]);
+  await advanceToPrdConfirm(mgr);
+  await mgr.createDocument("fsd", "[FSD]-alpha", {
+    content: fsdFixture(), parent: "[PRD]-demo", action: "modify", skipContext: true,
+  });
+  return { root, mgr };
+}
+
+describe("v0.12 完整讨论意图", () => {
+  it.each(WRITE_OPERATIONS)("%s 的 A 文件令牌不能写入 B 文件，整树不变", async (operation) => {
+    const { root, content, request } = await formalWriteFixture(operation);
+    const contextToken = tokenOf(await request({ file: "first.md" }));
+    const before = treeSnapshot(root);
+    await expectErrCode(request({ file: "second.md", content, contextToken }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+    expect(tokenOf(await request({ file: "second.md" }))).not.toBe(contextToken);
+  });
+
+  it.each(WRITE_OPERATIONS)("%s 改变有效 action 时旧令牌失效", async (operation) => {
+    const { root, content, request } = await formalWriteFixture(operation);
+    const contextToken = tokenOf(await request({ action: "add" }));
+    const before = treeSnapshot(root);
+    await expectErrCode(request({ action: "modify", content, contextToken }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it.each([false, true])("默认 action 与基线推导的有效值一致且令牌确定（baseline=%s）", async (baseline) => {
+    const { root, mgr } = makeProject();
+    if (baseline) {
+      writeDocs(root, { "prd/[PRD]-demo.md": PRD_REQUIREMENTS.split("\n") });
+      syncBaseline(root);
+    }
+    const before = treeSnapshot(root);
+    const implicit = await mgr.createDocument("prd", "[PRD]-demo", {});
+    const explicit = await mgr.createDocument("prd", "[PRD]-demo", { action: baseline ? "modify" : "add" });
+    expect(tokenOf(implicit)).toBe(tokenOf(explicit));
+    expect(await mgr.createDocument("prd", "[PRD]-demo", {})).toEqual(implicit);
+    expect(treeSnapshot(root)).toEqual(before);
+    expect((await mgr.createDocument("prd", "[PRD]-demo", {
+      content: PRD_REQUIREMENTS, action: baseline ? "modify" : "add", contextToken: tokenOf(implicit),
+    })).mode).toBe("written");
+  });
+
+  it("create 改变 overrides 拒绝，即使两份被替换根均真实存在", async () => {
+    const { root, mgr } = makeProject();
+    writeDocs(root, {
+      "prd/[PRD]-old.md": PRD_DOC.replaceAll("[PRD]-demo", "[PRD]-old").split("\n"),
+      "prd/[PRD]-other.md": PRD_DOC.replaceAll("[PRD]-demo", "[PRD]-other").split("\n"),
+    });
+    syncBaseline(root);
+    const contextToken = tokenOf(await mgr.createDocument("prd", "[PRD]-demo", {
+      action: "modify", overrides: "[PRD]-old",
+    }));
+    const before = treeSnapshot(root);
+    await expectErrCode(mgr.createDocument("prd", "[PRD]-demo", {
+      action: "modify", overrides: "[PRD]-other", content: PRD_DOC, contextToken,
+    }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it("decompose 改变 overrides 拒绝且整树不变", async () => {
+    const { root, mgr } = await decomposeOverrideFixture();
+    const contextToken = tokenOf(await mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", {
+      action: "modify", file: "design/child.md", overrides: "[FSD]-old_child",
+    }));
+    const before = treeSnapshot(root);
+    await expectErrCode(mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", {
+      action: "modify", file: "design/child.md", overrides: "[FSD]-other_child",
+      content: fsdFixture("[FSD]-child"), contextToken,
+    }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it.each(["create-to-decompose", "decompose-to-create"] as const)("%s 只改变 operation 也必须重取令牌", async (direction) => {
+    const { root, mgr, id, parent, content } = await formalWriteFixture("decompose");
+    const options = { parent: parent!, file: "child.md", action: "add" as const };
+    const create = (extra: WriteOptions) => mgr.createDocument("fsd", id, { ...options, ...extra });
+    const decompose = (extra: WriteOptions) => mgr.decompose(parent!, id, { ...options, ...extra });
+    const [discuss, write] = direction === "create-to-decompose" ? [create, decompose] : [decompose, create];
+    const contextToken = tokenOf(await discuss!({}));
+    const before = treeSnapshot(root);
+    await expectErrCode(write!({ content, contextToken }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it("改变 parent 或请求 id 拒绝，正文始终包含实际请求 id", async () => {
+    const { root, mgr } = makeProject();
+    await mgr.createDocument("prd", "[PRD]-demo", { content: PRD_REQUIREMENTS, skipContext: true });
+    await mgr.createDocument("prd", "[PRD]-other", {
+      content: PRD_DOC.replaceAll("[PRD]-demo", "[PRD]-other"), skipContext: true,
+    });
+    mgr.confirmLayer("prd");
+    const contextToken = tokenOf(await mgr.createDocument("fsd", "[FSD]-alpha", { parent: "[PRD]-demo" }));
+    const before = treeSnapshot(root);
+    await expectErrCode(mgr.createDocument("fsd", "[FSD]-alpha", {
+      parent: "[PRD]-other", content: fsdFixture(), contextToken,
+    }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+    await expectErrCode(mgr.createDocument("fsd", "[FSD]-other", {
+      parent: "[PRD]-demo", content: fsdFixture("[FSD]-other"), contextToken,
+    }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it("同意图的既有目标正文变化使背景令牌失效", async () => {
+    const { root, mgr } = makeProject();
+    await mgr.createDocument("prd", "[PRD]-demo", { content: PRD_DOC, skipContext: true });
+    const contextToken = tokenOf(await mgr.createDocument("prd", "[PRD]-demo", { action: "modify" }));
+    await mgr.createDocument("prd", "[PRD]-demo", {
+      action: "modify", content: PRD_DOC + "\n背景已经更新。", skipContext: true,
+    });
+    const before = treeSnapshot(root);
+    await expectErrCode(mgr.createDocument("prd", "[PRD]-demo", {
+      action: "modify", content: PRD_DOC + "\n继续修改。", contextToken,
+    }), "CONTEXT_TOKEN_STALE");
+    expect(treeSnapshot(root)).toEqual(before);
+  });
+
+  it("decompose 自定义 file/overrides/action 的同意图讨论与写入成功，并可冻结读取", async () => {
+    const { root, mgr } = await decomposeOverrideFixture();
+    const options = { action: "modify" as const, overrides: "[FSD]-old_child", file: "fsd/设计 目录/新 子域" };
+    const before = treeSnapshot(root);
+    const context = await mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", options);
+    const equivalent = await mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", {
+      ...options, file: "设计 目录/新 子域.md",
+    });
+    expect(tokenOf(equivalent)).toBe(tokenOf(context));
+    expect(treeSnapshot(root)).toEqual(before);
+    const result = await mgr.decompose("[FSD]-alpha:splitA", "[FSD]-child", {
+      ...options, file: "设计 目录/新 子域.md", content: fsdFixture("[FSD]-child"), contextToken: tokenOf(context),
+    });
+    expect(result).toMatchObject({
+      mode: "written", file: "fsd/设计 目录/新 子域.md",
+      src: "[FSD]-alpha:splitA", dst: "[FSD]-child", rel: "decomposes",
+    });
+    expect(new IndexManager(root).queryVersion(VERSION, "[FSD]-child")).toMatchObject({
+      file: "fsd/设计 目录/新 子域", overrides: "[FSD]-old_child", action: "modify",
+      discussion_usage: { mode: "receipt", receipt_digest: "sha256:" + tokenOf(context).slice("ctx-v1.".length) },
+    });
+    expect(hasEdge(combinedView(root, VERSION), "[FSD]-alpha:splitA", "[FSD]-child", "decomposes")).toBe(true);
+    expect(mgr.confirmLayer("fsd")).toMatchObject({ phase: "fsd-confirm", confirmed: expect.arrayContaining(["[FSD]-child"]) });
+    expect(parseFile(versionFile(root, "fsd/设计 目录/新 子域.md"), root.root).chunks.map((chunk) => chunk.id))
+      .toEqual(["[FSD]-child", "[FSD]-child:splitA", "[FSD]-child:splitB", "[FSD]-child:TEST"]);
   });
 });

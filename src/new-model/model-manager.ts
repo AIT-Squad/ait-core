@@ -83,12 +83,21 @@ export interface CreateOpts {
   overrides?: string;
 }
 
-/** 上下文令牌绑定的意图：层级/目标/父锚点/action。 */
+/** 上下文令牌绑定的完整写入意图；省略字段按实际写入的默认值归一。 */
 export interface ContextIntent {
   layer: DocLayer;
   id: string;
   parent?: string;
   action?: Action;
+  file?: string;
+  overrides?: string;
+  operation?: "create" | "decompose";
+}
+
+interface NormalizedContextIntent extends ContextIntent {
+  action: Action;
+  file: string;
+  operation: "create" | "decompose";
 }
 
 export interface SkipContextAudit {
@@ -339,6 +348,33 @@ function chunkRoot(id: string): string {
   return id.split(":", 1)[0] as string;
 }
 
+/** Python 索引路径与 Node 文档路径统一为 kind/subdir/name.md。 */
+function normalizeDocumentFile(layer: DocLayer, id: string, file: string | undefined): string {
+  const supplied = file ?? chunkRoot(id);
+  const normalized = supplied.replace(/\\/g, "/");
+  const parts = normalized.split("/");
+  if (normalized.trim() === "" || normalized.startsWith("/") ||
+      normalized.includes(":") || normalized.includes("\0") ||
+      parts.some((part) => part.trim() === "" || part === "." || part === "..")) {
+    throw new ModelManagerError("INVALID_FILE_NAME", `非法文档路径：${supplied}`);
+  }
+  // 层前缀最多剥一次；其余部分是层目录内的相对文件名。
+  if (parts.length > 1 && (LAYERS as readonly string[]).includes(parts[0] as string)) {
+    if (parts[0] !== layer) {
+      throw new ModelManagerError("INVALID_FILE_NAME", `文档路径不能跨层：${supplied}（目标层 ${layer}）`);
+    }
+    parts.shift();
+  }
+  const name = parts.join("/");
+  return `${layer}/${name.endsWith(".md") ? name : `${name}.md`}`;
+}
+
+/** 限制在当前层目录内，不能仅以整个 project-docs 为越界边界。 */
+function documentPath(base: string, layer: DocLayer, file: string): string {
+  const layerDir = ensureWithin(base, path.join(base, layer));
+  return ensureWithin(layerDir, path.join(base, file));
+}
+
 // ---------------------------------------------------------------------------
 // NewModelManager
 // ---------------------------------------------------------------------------
@@ -379,10 +415,9 @@ export class NewModelManager {
       );
     }
 
-    const intent = this.intentOf(checkedLayer, id, opts);
-
     if (opts.content === undefined) {
       // 讨论背景模式：零写入
+      const intent = this.intentOf(checkedLayer, id, opts, "create");
       const { version, background } = this.assembleBackground(checkedLayer, id, opts.parent);
       return {
         mode: "discussion-context",
@@ -395,7 +430,7 @@ export class NewModelManager {
       };
     }
 
-    return this.writeDocument(checkedLayer, id, opts, this.parentEdge(checkedLayer, id, opts.parent));
+    return this.writeDocument(checkedLayer, id, opts, this.parentEdge(checkedLayer, id, opts.parent), "create");
   }
 
   /**
@@ -422,12 +457,10 @@ export class NewModelManager {
       );
     }
 
-    const intent = this.intentOf("fsd", childRootId, {
-      ...(opts.action !== undefined ? { action: opts.action } : {}),
-      parent: parentSplit,
-    });
+    const childOpts: CreateOpts = { ...opts, parent: parentSplit };
 
     if (opts.content === undefined) {
+      const intent = this.intentOf("fsd", childRootId, childOpts, "decompose");
       const { version, background } = this.assembleBackground("fsd", childRootId, parentSplit);
       return {
         mode: "discussion-context",
@@ -440,12 +473,12 @@ export class NewModelManager {
       };
     }
 
-    const written = this.writeDocument("fsd", childRootId, { ...opts, parent: parentSplit }, {
+    const written = this.writeDocument("fsd", childRootId, childOpts, {
       src: parentSplit,
       dst: childRootId,
       rel: "decomposes",
       source: EDGE_SOURCE_CLI,
-    });
+    }, "decompose");
     return {
       mode: "written",
       src: parentSplit,
@@ -525,7 +558,7 @@ export class NewModelManager {
     return { version, reverted, phase: meta.phase };
   }
 
-  /** 令牌签发（FSD 能力契约形态）：绑定层级/目标/父锚点/action 与背景摘要，前缀 ctx-v1.。 */
+  /** 令牌签发（FSD 能力契约形态）：绑定规范化写入意图与背景摘要，前缀 ctx-v1.。 */
   issueContextToken(intent: ContextIntent, background: string): string {
     return this.issueToken(intent, background);
   }
@@ -549,29 +582,30 @@ export class NewModelManager {
     id: string,
     opts: CreateOpts,
     parent: TaggedEdge | null,
+    operation: "create" | "decompose",
   ): WrittenResult {
     const { version, meta } = this.activeVersionMeta();
     this.assertNotLocked(id);
     this.createPhaseGate(layer, meta.phase);
+    const intent = this.intentOf(layer, id, opts, operation);
     if (opts.skipContext !== true) {
-      this.verifyToken(opts.contextToken, this.intentOf(layer, id, opts),
+      this.verifyToken(opts.contextToken, intent,
         this.assembleBackground(layer, id, opts.parent).background);
     }
-    if (opts.file?.includes(":")) {
-      throw new ModelManagerError("INVALID_FILE_NAME", `--file 含冒号：${opts.file}`);
-    }
-    const action = this.effectiveAction(id, opts.action);
-    const view = combinedView(this.root, version);
+    const action = intent.action;
     const content = opts.content as string;
-    const fileName = this.fileNameFor(id, opts.file);
-    const sourceFile = `${layer}/${fileName}`;
+    const sourceFile = intent.file;
     const parsed = parseText(content, sourceFile);
+    if (!parsed.chunks.some((chunk) => chunk.id === id)) {
+      throw new ModelManagerError("ROOT_CHUNK_REQUIRED", `提交正文必须包含请求 chunk：${id}（${sourceFile}）`);
+    }
+    const view = combinedView(this.root, version);
     this.rejectViolations(scanContentRelations(content, layer));
     const declarations = layer === "fsd"
       ? this._parseFsdDeclarations(id, content, sourceFile, parsed.chunks)
       : { derives: new Map<string, string[]>(), dependsOn: new Map<string, string[]>(), replacements: [] };
     const stripped = this._stripDeclarationBlocks(content, declarations);
-    const prepared = this.prepareChunkFile(layer, version, fileName, stripped);
+    const prepared = this.prepareChunkFile(layer, version, sourceFile, stripped);
     const roots = new Set(prepared.chunks.map((chunk) => chunkRoot(chunk.id)));
     roots.add(chunkRoot(id));
     const hydrated = this.hydrateFsdDeclarationEdges(roots, view);
@@ -598,7 +632,7 @@ export class NewModelManager {
     this.withVersionTransaction(version, [prepared.target], () => {
       fs.mkdirSync(path.dirname(prepared.target), { recursive: true });
       atomicWriteText(prepared.target, prepared.text);
-      this.registerVersionNodes(version, id, action, prepared.file, prepared.submitted, declarations);
+      this.registerVersionNodes(version, action, prepared.file, prepared.submitted, declarations);
       const graph = this.graph.load(version);
       const known = new Map(graph.specs.map((node) => [node.uri, node.chunk_id]));
       const existing = new Set(graph.edges.map((edge) => edgeKey({
@@ -651,12 +685,6 @@ export class NewModelManager {
         ...(target === undefined ? {} : { target_file: target }),
       };
       nodes.set(chunk.id, node);
-    }
-    if (!nodes.has(id)) {
-      nodes.set(id, {
-        chunk_id: id, type: specType(id, file), version, file, title: id,
-        heading: id, uri: makeUri(id, version, file), summary: null,
-      });
     }
     const allEdges = new Map<string, ViewEdge>();
     for (const node of view.nodes.keys()) {
@@ -742,8 +770,8 @@ export class NewModelManager {
     for (const entry of index.chunks) {
       if (!entry.id.startsWith(idPrefixOf(layer)) || entry.file === null || seen.has(entry.file)) continue;
       seen.add(entry.file);
-      const file = ensureWithin(this.root.root, path.join(this.root.root, "versions", version,
-        entry.file.endsWith(".md") ? entry.file : `${entry.file}.md`));
+      const relative = normalizeDocumentFile(layer, entry.id, entry.file);
+      const file = documentPath(path.join(this.root.root, "versions", version), layer, relative);
       const content = fs.readFileSync(file, "utf-8");
       this.rejectViolations(scanContentRelations(content, layer));
       for (const chunk of parseText(content, file).chunks) {
@@ -858,11 +886,28 @@ export class NewModelManager {
     };
   }
 
-  private intentOf(layer: DocLayer, id: string, opts: CreateOpts): ContextIntent {
-    const intent: ContextIntent = { layer, id };
-    if (opts.parent !== undefined) intent.parent = opts.parent;
-    if (opts.action !== undefined) intent.action = opts.action;
-    return intent;
+  private intentOf(
+    layer: DocLayer,
+    id: string,
+    opts: CreateOpts,
+    operation: "create" | "decompose",
+  ): NormalizedContextIntent {
+    return this.normalizeIntent({
+      layer, id, operation,
+      ...(opts.parent === undefined ? {} : { parent: opts.parent }),
+      ...(opts.action === undefined ? {} : { action: opts.action }),
+      ...(opts.file === undefined ? {} : { file: opts.file }),
+      ...(opts.overrides === undefined ? {} : { overrides: opts.overrides }),
+    });
+  }
+
+  private normalizeIntent(intent: ContextIntent): NormalizedContextIntent {
+    return {
+      ...intent,
+      action: this.effectiveAction(intent.id, intent.action),
+      file: normalizeDocumentFile(intent.layer, intent.id, intent.file),
+      operation: intent.operation ?? "create",
+    };
   }
 
   private effectiveAction(id: string, action: Action | undefined): Action {
@@ -1040,10 +1085,11 @@ export class NewModelManager {
       if (node === undefined) continue;
       const record = index.chunks.find((entry) => entry.id === chunkId);
       const relative = record?.file ?? node.file;
-      const file = relative.endsWith(".md") ? relative : `${relative}.md`;
+      const chunkLayer = layerOfId(chunkId) as DocLayer;
+      const file = normalizeDocumentFile(chunkLayer, chunkId, relative);
       const candidates = [
-        ensureWithin(this.root.root, path.join(this.root.root, "versions", active, file)),
-        ensureWithin(this.root.root, path.join(this.root.docs, file)),
+        documentPath(path.join(this.root.root, "versions", active), chunkLayer, file),
+        documentPath(this.root.docs, chunkLayer, file),
       ];
       let body: string | undefined;
       for (let position = 0; position < candidates.length; position++) {
@@ -1069,16 +1115,20 @@ export class NewModelManager {
     return { version: active, background: lines.join("\n") };
   }
 
-  /** 令牌签发：ctx-v1. + SHA-256(层级/目标/父锚点/action/背景摘要) 拼装摘要。 */
+  /** 签发与核验共用规范化意图；JSON 元组避免字段内换行造成摘要歧义。 */
   private issueToken(intent: ContextIntent, background: string): string {
-    const payload = [
+    const normalized = this.normalizeIntent(intent);
+    const payload = JSON.stringify([
       "ctx-v1",
-      intent.layer,
-      intent.id,
-      intent.parent ?? "",
-      intent.action ?? "",
+      normalized.layer,
+      normalized.id,
+      normalized.parent ?? null,
+      normalized.action,
+      normalized.file,
+      normalized.overrides ?? null,
+      normalized.operation,
       sha256hex(background),
-    ].join("\n");
+    ]);
     return TOKEN_PREFIX + sha256hex(payload);
   }
 
@@ -1097,7 +1147,7 @@ export class NewModelManager {
     if (this.issueToken(intent, background) !== token) {
       throw new ModelManagerError(
         "CONTEXT_TOKEN_STALE",
-        "上下文令牌已失效：背景或意图（层级/目标/父锚点/action）已变化，请重新获取令牌",
+        "上下文令牌已失效：背景或写入意图（层级/目标/父锚点/action/file/overrides/operation）已变化，请重新获取令牌",
       );
     }
   }
@@ -1306,19 +1356,6 @@ export class NewModelManager {
   // -------------------------------------------------------------------------
 
   /**
-   * 目标文件名：显式 --file 优先；split create 省略 --file 时落父根文件
-   * （`fsd/[FSD]-<父根>.md`），不派生含冒号文件名。
-   */
-  private fileNameFor(id: string, file: string | undefined): string {
-    if (file !== undefined) return file;
-    const colon = id.indexOf(":");
-    if (colon >= 0) {
-      return `${id.slice(0, colon)}.md`;
-    }
-    return `${id}.md`;
-  }
-
-  /**
    * 解析写入版本工作区文件：源文本优先取版本工作区同名文件，否则取基线同名文件；
    * 提交正文按 chunk id 逐条覆盖合成——正文中出现的 id 替换源文本中同 id chunk 的
    * 行区间，源文本中未出现的既有 chunk 原样保留，整体保持源顺序；正文中新增的
@@ -1328,19 +1365,18 @@ export class NewModelManager {
   private prepareChunkFile(
     layer: DocLayer,
     version: string,
-    fileName: string,
+    file: string,
     content: string,
   ): PreparedFile {
-    const layerDir = path.join(this.root.root, "versions", version, layer);
-    const target = ensureWithin(this.root.root, path.join(layerDir, fileName));
-    const baselineFile = ensureWithin(this.root.root, path.join(this.root.docs, layer, fileName));
+    const target = documentPath(path.join(this.root.root, "versions", version), layer, file);
+    const baselineFile = documentPath(this.root.docs, layer, file);
     let sourceText = "";
     if (fs.existsSync(target)) sourceText = fs.readFileSync(target, "utf-8");
     else if (fs.existsSync(baselineFile)) sourceText = fs.readFileSync(baselineFile, "utf-8");
     const composed = sourceText.trim() === "" ? content : composeByChunkId(sourceText, content, target);
     const text = composed.endsWith("\n") ? composed : `${composed}\n`;
     return {
-      target, file: `${layer}/${fileName}`, text,
+      target, file, text,
       chunks: parseText(text, target).chunks,
       submitted: parseText(content, target).chunks,
     };
@@ -1354,7 +1390,6 @@ export class NewModelManager {
    */
   private registerVersionNodes(
     version: string,
-    id: string,
     action: Action,
     file: string,
     chunks: Chunk[],
@@ -1400,12 +1435,6 @@ export class NewModelManager {
     };
     for (const chunk of chunks) {
       place(chunk.id, chunk.heading);
-    }
-    // 内容可能未包含目标 chunk 本体（异常输入），兜底注册目标 id（title=id）
-    if (!chunks.some((c) => c.id === id)) {
-      if (!graph.specs.some((s) => s.chunk_id === id)) {
-        place(id, id);
-      }
     }
     this.graph.save(version, graph);
   }

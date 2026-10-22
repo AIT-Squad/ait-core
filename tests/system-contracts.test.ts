@@ -20,8 +20,11 @@ interface Delivery {
   next_action: Data;
 }
 interface Feature { cwd: string; version: string; prd: string; fsd: string; entry?: Entry }
+interface GitState { head: string; status: string; refs: string; tracked: string[] }
+interface HistoricalAnchor { version: string; docs: string; host: string | null }
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TIMEOUT = 240_000;
+// A real project's configured acceptance can build and run its entire own suite.
+const TIMEOUT = 3_600_000;
 const TARGET = "system-contract-output.cjs";
 const TDD = "[TDD]-system-contract";
 const CHILD_FSD = "[FSD]-system-contract";
@@ -37,6 +40,9 @@ let apiRunner: string;
 let fixture: string;
 const deliveries = new Set<string>();
 const sourceArtifacts: Map<string, Snapshot> = new Map();
+const sourceDependencies: Map<string, Snapshot> = new Map();
+const acceptanceProjects = new Set<string>();
+const originalAcceptance = new Map<string, string | null>();
 
 function write(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -85,6 +91,93 @@ function baseline(cwd: string): Snapshot {
     [".meta/chunks-index.yaml", ".meta/specgraph.yaml"].includes(file)));
 }
 function caseDir(): string { return fs.mkdtempSync(path.join(suiteDir, "case-")); }
+function owned(file: string): string {
+  const resolved = path.resolve(file);
+  const relative = path.relative(fs.realpathSync(suiteDir), resolved);
+  if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`Refusing an operation outside the test-owned copy: ${resolved}`);
+  }
+  return resolved;
+}
+function unlinkedPath(file: string): string {
+  const resolved = path.resolve(file);
+  let current = path.parse(resolved).root;
+  for (const component of resolved.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error(`Refusing a fixture link: ${current}`);
+  }
+  return resolved;
+}
+function regularTree(directory: string, dependencies = false): void {
+  if (fs.lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing a fixture link: ${directory}`);
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const file = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) throw new Error(`Refusing a fixture link: ${file}`);
+    if (entry.isDirectory()) {
+      if (dependencies && [".git", "project-docs"].includes(entry.name)) {
+        throw new Error(`Refusing an embedded workspace in acceptance dependencies: ${file}`);
+      }
+      regularTree(file, dependencies);
+    }
+    else if (!entry.isFile()) throw new Error(`Not a regular fixture file: ${file}`);
+  }
+}
+function copyAcceptanceDependencies(source: string, cwd: string): void {
+  const modules = path.join(source, "node_modules");
+  const manifest = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8")) as Data;
+  const required = Object.keys({ ...manifest.dependencies, ...manifest.devDependencies });
+  if (!fs.existsSync(modules)) {
+    if (required.length > 0) throw new Error(`Original acceptance dependencies are missing: ${required.join(", ")} in ${modules}`);
+    return;
+  }
+  unlinkedPath(modules);
+  regularTree(modules, true);
+  for (const name of required) {
+    const dependency = path.resolve(modules, name);
+    const relative = path.relative(modules, dependency);
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`Acceptance dependency escapes node_modules: ${name}`);
+    }
+    if (!fs.existsSync(dependency)) throw new Error(`Original acceptance dependency is missing: ${name} at ${dependency}`);
+    unlinkedPath(dependency);
+  }
+  const before = snapshot(modules);
+  sourceDependencies.set(modules, before);
+  const destination = path.join(owned(cwd), "node_modules");
+  unlinkedPath(cwd);
+  expect(fs.lstatSync(destination, { throwIfNoEntry: false }), "Acceptance dependencies must be an independent new copy").toBeUndefined();
+  fs.cpSync(modules, destination, {
+    recursive: true, dereference: false, force: false, errorOnExist: true,
+    filter: (file) => {
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) throw new Error(`Refusing a fixture link: ${file}`);
+      if (stat.isDirectory() && [".git", "project-docs"].includes(path.basename(file))) {
+        throw new Error(`Refusing an embedded workspace in acceptance dependencies: ${file}`);
+      }
+      return true;
+    },
+  });
+  regularTree(destination, true);
+  expectSame(before, snapshot(destination));
+  expectSame(before, snapshot(modules));
+  console.info(`[system-contracts] copied ${before.size} original dependency files with identical bytes into independent ${destination}; source=${modules}`);
+}
+function effectiveConfig(cwd: string): Data {
+  const directory = path.join(projectDocs(cwd), ".meta");
+  const local = path.join(directory, "config.local.yaml");
+  return { ...yaml(path.join(directory, "config.yaml")), ...(fs.existsSync(local) ? yaml(local) : {}) };
+}
+function acceptanceCommand(cwd: string): string | null {
+  for (const name of ["config.local.yaml", "config.yaml"]) {
+    const file = path.join(projectDocs(cwd), ".meta", name);
+    if (!fs.existsSync(file)) continue;
+    const layer = yaml(file);
+    for (const key of ["acceptance_command", "acceptanceCommand"]) {
+      if (typeof layer[key] === "string" && layer[key].trim() !== "") return layer[key] as string;
+    }
+  }
+  return null;
+}
 function cloneDocs(source: string): string {
   const cwd = caseDir();
   // Existing wrappers are copied as data, then refreshed before they can run.
@@ -117,6 +210,11 @@ function copyArtifact(source: string, destination: string, relative: string): bo
   const local = path.relative(source, original);
   expect(local !== ".." && !local.startsWith(`..${path.sep}`) && !path.isAbsolute(local), relative).toBe(true);
   if (!fs.existsSync(original)) return false; // Preserve real missing-file failures.
+  let parent = original;
+  while (parent !== source) {
+    expect(fs.lstatSync(parent).isSymbolicLink(), `Refusing a fixture link: ${parent}`).toBe(false);
+    parent = path.dirname(parent);
+  }
   expect(fs.lstatSync(original).isFile(), `Fixture must be a regular file: ${original}`).toBe(true);
   const real = path.relative(fs.realpathSync(source), fs.realpathSync(original));
   expect(real !== ".." && !real.startsWith(`..${path.sep}`) && !path.isAbsolute(real), original).toBe(true);
@@ -129,20 +227,21 @@ function copyArtifact(source: string, destination: string, relative: string): bo
   return true;
 }
 async function git(cwd: string, args: string[]): Promise<string> {
-  const result = await run("git", args, cwd);
+  if (["init", "add", "commit", "rm", "reset", "checkout", "restore", "clean", "tag"].includes(args.find((item) => !item.startsWith("--")) ?? "")) owned(cwd);
+  const result = await run("git", ["-c", "core.fsmonitor=false", ...args], cwd);
   expect(result.status, `git ${args.join(" ")} in ${cwd}: ${result.stderr}`).toBe(0);
   return result.stdout;
 }
 async function tracking(cwd: string): Promise<string[]> {
   return (await git(cwd, ["ls-files", "-z", "--"])).split("\0").filter(Boolean).sort();
 }
-async function gitEvidence(cwd: string, label: string): Promise<Data> {
+async function gitEvidence(cwd: string, label: string): Promise<GitState> {
   const head = (await git(cwd, ["rev-parse", "HEAD"])).trim();
   const status = await git(cwd, ["status", "--porcelain=v1", "--untracked-files=all"]);
   const eol = await run("git", ["config", "--get", "core.autocrlf"], cwd);
   expect([0, 1]).toContain(eol.status);
   console.info(`[system-contracts] ${label}: HEAD=${head}; clean=${status.trim() === ""}; core.autocrlf=${eol.stdout.trim() || "unset"}; status=${JSON.stringify(status)}`);
-  return { head, status };
+  return { head, status, refs: await git(cwd, ["show-ref", "--head"]), tracked: await tracking(cwd) };
 }
 async function seedGit(cwd: string, tracked: string[], copied: string[], host: boolean): Promise<void> {
   await git(cwd, ["init", "--quiet"]);
@@ -150,7 +249,7 @@ async function seedGit(cwd: string, tracked: string[], copied: string[], host: b
   await git(cwd, ["config", "core.autocrlf", "false"]);
   const index = new Set(tracked);
   const ignored = copied.filter((file) => !index.has(file))
-    .map((file) => "/" + file.replace(/[\\*?\[\]#! ]/g, "\\function cloneFixture(): string { return cloneDocs(projectDocs(fixture)); }"));
+    .map((file) => "/" + file.replace(/[\\*?\[\]#! ]/g, "\\$&"));
   ignored.push(...(host ? ["/project-docs/"] : ["/.ait/", "/.meta/config.local.yaml"]));
   write(path.join(cwd, ".git", "info", "exclude"), ignored.join("\n") + "\n");
   if (tracked.length > 0) {
@@ -162,19 +261,45 @@ async function seedGit(cwd: string, tracked: string[], copied: string[], host: b
   expect(await tracking(cwd)).toEqual(tracked);
   expect((await gitEvidence(cwd, "copied repository")).status).toBe("");
 }
+async function copyRepository(source: string, destination: string): Promise<void> {
+  owned(destination);
+  const original = path.join(source, ".git");
+  expect(fs.existsSync(original), `Real history is required: ${original}`).toBe(true);
+  expect(fs.lstatSync(original).isDirectory() && !fs.lstatSync(original).isSymbolicLink(),
+    `Linked worktrees and external gitdirs cannot be copied safely: ${original}`).toBe(true);
+  regularTree(original);
+  for (const name of ["commondir", "objects/info/alternates", "objects/info/http-alternates"]) {
+    const file = path.join(original, name);
+    expect(!fs.existsSync(file) || fs.readFileSync(file, "utf8").trim() === "",
+      `External Git storage must be isolated before takeover: ${file}`).toBe(true);
+  }
+  const config = await run("git", ["config", "--local", "--get-regexp", "^(core\\.worktree|include.*\\.path|extensions\\.worktreeconfig)$"], source);
+  expect(config.status, `Unsafe Git worktree/include configuration in ${source}: ${config.stdout}${config.stderr}`).toBe(1);
+  const sourceState = await gitEvidence(source, "original read-only repository");
+  const objects = await git(source, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"]);
+  fs.cpSync(original, path.join(destination, ".git"), { recursive: true });
+  // Disable copied hooks before any command runs in the copy. Do not change global Git configuration.
+  const hooks = path.join(suiteDir, "disabled-hooks");
+  fs.mkdirSync(hooks, { recursive: true });
+  fs.appendFileSync(path.join(destination, ".git", "config"), `\n[core]\n\thooksPath = "${hooks.replace(/\\/g, "/")}"\n\tfsmonitor = false\n`);
+  expect((await git(destination, ["config", "core.hooksPath"])).trim()).toBe(hooks.replace(/\\/g, "/"));
+  const copiedState = await gitEvidence(destination, "copied original Git history");
+  expect(copiedState.head).toBe(sourceState.head);
+  expect(copiedState.refs).toBe(sourceState.refs);
+  expect(copiedState.tracked).toEqual(sourceState.tracked);
+  expect(await git(destination, ["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])).toBe(objects);
+}
 async function cloneTakeover(sourceDocs: string): Promise<string> {
   const cwd = cloneDocs(sourceDocs);
   const source = path.dirname(sourceDocs);
-  const hostTracked = fs.existsSync(path.join(source, ".git")) ? await tracking(source) : corpusTargets(sourceDocs);
-  const docsTracked = fs.existsSync(path.join(sourceDocs, ".git")) ? await tracking(sourceDocs) : [...managed(source).keys()].sort();
+  const hostTracked = await tracking(source);
+  const docsTracked = await tracking(sourceDocs);
   for (const [from, to, tracked] of [[source, cwd, hostTracked], [sourceDocs, projectDocs(cwd), docsTracked]] as const) {
-    if (fs.existsSync(path.join(from, ".git"))) await gitEvidence(from, "original read-only repository");
     for (const file of tracked) expect(copyArtifact(from, to, file), `Tracked source missing: ${from}/${file}`).toBe(true);
+    await copyRepository(from, to);
   }
-  const copiedHost = [...new Set([...hostTracked, ...corpusTargets(sourceDocs).filter((file) => fs.existsSync(path.join(cwd, file)))])];
-  const copiedDocs = [...snapshot(projectDocs(cwd)).keys()];
-  await seedGit(cwd, hostTracked, copiedHost, true);
-  await seedGit(projectDocs(cwd), docsTracked, copiedDocs, false);
+  acceptanceProjects.add(path.resolve(cwd));
+  originalAcceptance.set(cwd, acceptanceCommand(cwd));
   return cwd;
 }
 function wrapperPath(cwd: string): string {
@@ -206,10 +331,23 @@ async function refreshInstalledWrapper(cwd: string): Promise<void> {
 
 function run(executable: string, args: string[], cwd: string, timeout = TIMEOUT, verbatim = false): Promise<Run> {
   return new Promise((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: "0",
+      PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`,
+      GIT_AUTHOR_NAME: "AIT contract tests", GIT_AUTHOR_EMAIL: "ait-tests@example.invalid",
+      GIT_COMMITTER_NAME: "AIT contract tests", GIT_COMMITTER_EMAIL: "ait-tests@example.invalid" };
+    for (const name of Object.keys(env)) {
+      if (/^GIT_(DIR|WORK_TREE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|CONFIG.*)$/.test(name)) delete env[name];
+    }
+    // Only takeover children lose the corpus list. Their acceptance may invoke this
+    // very suite, which must still run its built-in case without recursive takeover.
+    if (acceptanceProjects.has(path.resolve(cwd))) {
+      delete env.AIT_CORPUS_DIRS;
+      const scripts = path.join(cwd, ".venv", process.platform === "win32" ? "Scripts" : "bin");
+      if (fs.existsSync(scripts)) env.PATH = `${scripts}${path.delimiter}${env.PATH ?? ""}`;
+    }
     const child = spawn(executable, args, {
       cwd, windowsHide: true, windowsVerbatimArguments: verbatim, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH ?? ""}`, GIT_AUTHOR_NAME: "AIT contract tests", GIT_AUTHOR_EMAIL: "ait-tests@example.invalid",
-        GIT_COMMITTER_NAME: "AIT contract tests", GIT_COMMITTER_EMAIL: "ait-tests@example.invalid" },
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -392,12 +530,53 @@ function policy(cwd: string, enforcement: "report" | "block"): void {
   const file = path.join(projectDocs(cwd), ".meta", "config.local.yaml");
   write(file, stringify({ ...(fs.existsSync(file) ? yaml(file) : {}), generation_receipts: { enforcement } }));
 }
-async function acceptance(cwd: string, entry?: Entry): Promise<void> {
-  const script = `const a=require('node:assert/strict');const x=require('./${TARGET}');a.equal(x.value,42);a.equal(x.source,'${TDD}');`;
-  const harness = "system-contract-acceptance.cjs";
-  if (entry === "wrapper") write(path.join(cwd, harness), script);
-  await ok(cwd, ["acceptance", "set", entry === "wrapper" ? `node ${harness}` : `"${process.execPath}" -e "${script}"`], entry ?? "bin");
-  expect(await ok(cwd, ["acceptance", "run"], entry)).toMatchObject({ ran: true, passed: true, exitCode: 0 });
+function expectAccepted(cwd: string, confirmed: Data): void {
+  expect(confirmed).toMatchObject({ passed: true });
+  expect(confirmed.acceptance).toEqual({ ran: true, passed: true, exitCode: 0 });
+  const original = originalAcceptance.get(cwd);
+  if (original != null) expect(acceptanceCommand(cwd)).toBe(original);
+}
+async function acceptance(cwd: string, entry?: Entry, options: { executeCommand?: boolean } = {}): Promise<void> {
+  const script = `const a=require('node:assert/strict');const x=require(require('node:path').resolve('${TARGET}'));a.equal(x.value,42);a.equal(x.source,'${TDD}');`;
+  if (acceptanceCommand(cwd) === null) {
+    const harness = "system-contract-acceptance.cjs";
+    if (entry === "wrapper") {
+      expect(fs.existsSync(path.join(cwd, harness)), "Do not overwrite an existing project artifact").toBe(false);
+      write(path.join(cwd, harness), script);
+      if (fs.existsSync(path.join(cwd, ".git", "info"))) {
+        fs.appendFileSync(path.join(owned(cwd), ".git", "info", "exclude"), `\n/${harness}\n`);
+      }
+    }
+    await ok(cwd, ["acceptance", "set", entry === "wrapper" ? `node ${harness}` : `"${process.execPath}" -e "${script}"`], entry ?? "bin");
+  }
+  const original = originalAcceptance.get(cwd);
+  if (original != null) expect(acceptanceCommand(cwd)).toBe(original);
+  if (options.executeCommand !== false) {
+    expect(await ok(cwd, ["acceptance", "run"], entry)).toMatchObject({ ran: true, passed: true, exitCode: 0 });
+  }
+  const probe = await run(process.execPath, ["-e", script], cwd);
+  expect(probe.status, `Generated artifact probe failed: ${probe.stdout}${probe.stderr}`).toBe(0);
+}
+async function prepareAcceptance(cwd: string, source: string): Promise<void> {
+  const configured = originalAcceptance.get(cwd);
+  if (configured == null) return;
+  const before = acceptanceCommand(cwd);
+  if (fs.existsSync(path.join(cwd, "package.json"))) {
+    const lockfile = path.join(cwd, "package-lock.json");
+    const lock = fs.existsSync(lockfile) ? fs.readFileSync(lockfile) : null;
+    copyAcceptanceDependencies(source, cwd);
+    if (lock !== null) expect(fs.readFileSync(lockfile).equals(lock), "Dependency preparation must preserve the original lockfile bytes").toBe(true);
+    else expect(fs.existsSync(lockfile)).toBe(false);
+  } else if (fs.existsSync(path.join(cwd, "pyproject.toml")) && /(?:python|pytest|\.venv)/i.test(configured)) {
+    const environment = path.join(owned(cwd), ".venv");
+    const created = await run(process.platform === "win32" ? "python" : "python3", ["-m", "venv", environment], cwd);
+    expect(created.status, created.stdout + created.stderr).toBe(0);
+    const python = path.join(environment, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const installed = await run(python, ["-m", "pip", "install", "-e", ".[dev]"], cwd);
+    expect(installed.status, installed.stdout + installed.stderr).toBe(0);
+  }
+  expect(acceptanceCommand(cwd)).toBe(before);
+  console.info(`[system-contracts] original acceptance retained: ${configured}; copied project=${cwd}; AIT_CORPUS_DIRS removed only from its child environment`);
 }
 
 function pythonFixture(cwd: string): void {
@@ -550,6 +729,10 @@ beforeAll(async () => {
   write(apiRunner, API_RUNNER);
   fixture = path.join(suiteDir, "python-shape-source");
   pythonFixture(fixture);
+  const fixtureDocs = [...managed(fixture).keys()].sort();
+  await seedGit(projectDocs(fixture), fixtureDocs, fixtureDocs, false);
+  await git(projectDocs(fixture), ["tag", "ait/v1.0"]);
+  await seedGit(fixture, ["legacy.cjs"], ["legacy.cjs"], true);
   console.info(`[system-contracts] installed ait-core ${manifest.version} from ${tarball}; sha256=${hash(fs.readFileSync(tarball))}`);
   console.info(`[system-contracts] public API/bin, cross-domain gates and built-in Python-shaped fixture enabled`);
   console.info(CORPORA.length > 0
@@ -711,47 +894,83 @@ describe("cross-domain write and version gates", () => {
 });
 
 
-async function governanceRejection(feature: Feature, code: string, details: Data = {}): Promise<void> {
+async function governanceResult(feature: Feature, code: string, enforcement: string, details: Data = {},
+  options: { deferWarningConfirmation?: boolean } = {}): Promise<void> {
   const before = managed(feature.cwd);
+  const blocked = enforcement === "block";
   for (const argv of [["specgraph", "validate-new-model"], ["specgraph", "validate-new-model", "--version", feature.version]]) {
     const diagnostic = await ok(feature.cwd, argv, "wrapper");
     expect(diagnostic).toMatchObject({ passed: true, violations: [] });
-    // Retain a missing CLI-contract failure while still exercising the actual confirmation gate.
-    expect.soft(diagnostic.policy_violations).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
-    if (code === "TDD_TARGET_FILE_MISSING") expect.soft(diagnostic.target_file_missing).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
-    if (code === "DERIVES_RESIDUE") expect.soft(diagnostic.derives_residue).toEqual(expect.arrayContaining([expect.objectContaining({ code, ...details })]));
+    const finding = expect.objectContaining({ code, ...details });
+    expect(diagnostic[blocked ? "policy_violations" : "warnings"]).toEqual(expect.arrayContaining([finding]));
+    expect(diagnostic[blocked ? "warnings" : "policy_violations"]).not.toEqual(expect.arrayContaining([finding]));
+    if (code === "TDD_TARGET_FILE_MISSING") expect(diagnostic.target_file_missing).toEqual(expect.arrayContaining([finding]));
+    if (code === "DERIVES_RESIDUE") expect(diagnostic.derives_residue).toEqual(expect.arrayContaining([finding]));
     expectSame(before, managed(feature.cwd));
   }
-  const rejected = await command(feature.cwd, ["version", "confirm", feature.version], "wrapper");
-  expect(rejected).toMatchObject({ ok: false, code: "INVARIANT_VIOLATION" });
-  expect(rejected.error).toContain(code);
-  expectSame(before, managed(feature.cwd));
+  if (!blocked && options.deferWarningConfirmation === true) {
+    console.info(`[system-contracts] ${code}: ${enforcement}; warning verified with zero managed writes; original acceptance will run after target restoration`);
+    return;
+  }
+  const result = await command(feature.cwd, ["version", "confirm", feature.version], "wrapper");
+  if (blocked) {
+    expect(result).toMatchObject({ ok: false, code: "INVARIANT_VIOLATION" });
+    expect(result.error).toContain(code);
+    expectSame(before, managed(feature.cwd));
+  } else {
+    expect(result).toMatchObject({ ok: true, data: { passed: true } });
+    expectAccepted(feature.cwd, result.data!);
+  }
+  console.info(`[system-contracts] ${code}: ${enforcement}; ${blocked ? "confirmation blocked with zero managed writes" : "warning reported; confirmation allowed"}`);
 }
-async function realPythonGovernance(feature: Feature, originalFsd: string): Promise<void> {
+async function missingTargetGovernance(feature: Feature, target: string, enforcement: string): Promise<string | null> {
+  const { cwd } = feature;
+  const artifact = path.join(cwd, target);
+  const held = path.join(caseDir(), "held-artifact");
+  const targetBytes = fs.readFileSync(artifact);
+  const restoreBeforeConfirmation = enforcement !== "block" && originalAcceptance.get(cwd) != null;
+  fs.renameSync(artifact, held);
+  try {
+    await governanceResult(feature, "TDD_TARGET_FILE_MISSING", enforcement, { targetFile: target },
+      { deferWarningConfirmation: restoreBeforeConfirmation });
+  }
+  finally { fs.renameSync(held, artifact); }
+  expect(fs.readFileSync(artifact).equals(targetBytes)).toBe(true);
+  if (restoreBeforeConfirmation) {
+    const restored = managed(cwd);
+    const diagnostic = await ok(cwd, ["specgraph", "validate-new-model", "--version", feature.version], "wrapper");
+    expect(diagnostic.target_file_missing).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "TDD_TARGET_FILE_MISSING", targetFile: target }),
+    ]));
+    expectSame(restored, managed(cwd));
+    expect(acceptanceCommand(cwd)).toBe(originalAcceptance.get(cwd));
+    console.info(`[system-contracts] ${target} restored byte-for-byte with zero diagnostic writes; original acceptance continuation will be checked at the next normal TDD version confirmation`);
+    return target;
+  }
+  return null;
+}
+async function realPythonGovernance(feature: Feature, originalFsd: string): Promise<string | null> {
   const { cwd } = feature;
   expect(yaml(metaFile(cwd, feature.version)).phase).toBe("fsd-confirm");
   const shared = path.join(projectDocs(cwd), ".meta", "config.yaml");
   const local = path.join(projectDocs(cwd), ".meta", "config.local.yaml");
-  const config = { ...yaml(shared), ...(fs.existsSync(local) ? yaml(local) : {}) };
-  expect(config.target_file_existence).toMatchObject({ enforcement: "block" });
-  expect(config.derives_residue).toMatchObject({ enforcement: "block" });
-  const scopes = Object.entries(config.artifact_scopes as Data);
-  expect(scopes.length).toBeGreaterThan(0);
-  const target = corpusTargets(projectDocs(cwd)).find((file) => fs.existsSync(path.join(cwd, file)))!;
+  const config = effectiveConfig(cwd);
+  const existence = config.target_file_existence?.enforcement ?? "warn";
+  const derives = config.derives_residue?.enforcement ?? "warn";
+  const scopes = Object.entries((config.artifact_scopes ?? {}) as Data);
+  // Use the actual declaration, retaining its case; normalized graph keys are not filesystem paths.
+  const target = corpusTargets(projectDocs(cwd)).find((file) => file !== TARGET && fs.existsSync(path.join(cwd, file)))!;
   expect(target).toBeTypeOf("string");
-  const artifact = path.join(cwd, target);
-  const held = path.join(caseDir(), "held-artifact");
-  fs.renameSync(artifact, held);
-  try { await governanceRejection(feature, "TDD_TARGET_FILE_MISSING", { targetFile: target }); }
-  finally { fs.renameSync(held, artifact); }
+  const restoredTarget = await missingTargetGovernance(feature, target, existence);
 
+  if (scopes.length === 0) console.info("[system-contracts] no configured artifact_scopes; scope and scope-exemption faults are not applicable");
   for (const [prefix, scope] of scopes) {
-    expect(scope.enforcement).toBe("block");
+    const enforcement = scope.enforcement ?? "warn";
     const unowned = path.posix.join(prefix, "__ait_system_contract_unowned__.cjs");
     expect(fs.existsSync(path.join(cwd, unowned))).toBe(false);
     write(path.join(cwd, unowned), "module.exports = 1;\n");
     await git(cwd, ["--literal-pathspecs", "add", "--force", "--", unowned]);
-    try { await governanceRejection(feature, "UNCOVERED_ARTIFACT", { targetFile: unowned }); }
+    try { await governanceResult(feature, "UNCOVERED_ARTIFACT", enforcement, { targetFile: unowned }); }
     finally {
       await git(cwd, ["--literal-pathspecs", "rm", "--cached", "--", unowned]);
       fs.unlinkSync(path.join(cwd, unowned));
@@ -760,13 +979,17 @@ async function realPythonGovernance(feature: Feature, originalFsd: string): Prom
     const policyBytes = fs.readFileSync(policyFile);
     // Removing an existing exemption strengthens the copied policy; restore its exact original bytes.
     for (const [field, code] of [["exempt_paths", "UNCOVERED_ARTIFACT"], ["exempt_test_splits", "TEST_SPLIT_UNCOVERED"]] as const) {
-      const values = scope[field] as string[];
-      expect(values.length, "Corpus must exercise " + field + ": " + prefix).toBeGreaterThan(0);
-      const tightened = yaml(policyFile);
-      tightened.artifact_scopes[prefix][field] = values.slice(1);
-      write(policyFile, stringify(tightened));
-      try { await governanceRejection(feature, code); }
-      finally { fs.writeFileSync(policyFile, policyBytes); }
+      const values = (scope[field] ?? []) as string[];
+      if (values.length === 0) console.info(`[system-contracts] ${prefix} has no ${field}; only that exemption fault is not applicable`);
+      for (const value of values) {
+        const tightened = yaml(policyFile);
+        tightened.artifact_scopes[prefix][field] = values.filter((item) => item !== value);
+        write(policyFile, stringify(tightened));
+        try {
+          await governanceResult(feature, code, enforcement,
+            field === "exempt_paths" ? { targetFile: value } : { chunkId: value });
+        } finally { fs.writeFileSync(policyFile, policyBytes); }
+      }
     }
   }
 
@@ -779,17 +1002,20 @@ async function realPythonGovernance(feature: Feature, originalFsd: string): Prom
     await ok(cwd, ["fsd", "confirm"], "wrapper");
   };
   await reworkFsd(originalFsd + "\nUnmapped requirement reference: " + requirementId + "\n");
-  try { await governanceRejection(feature, "DERIVES_RESIDUE", { chunkId: implementation }); }
+  try { await governanceResult(feature, "DERIVES_RESIDUE", derives, { chunkId: implementation }); }
   finally { await reworkFsd(originalFsd); }
 
   const declaredFsdFiles = new Set((yaml(path.join(projectDocs(cwd), ".meta", `chunks-index-${feature.version}.yaml`)).chunks as Data[])
     .filter((entry) => String(entry.id).startsWith("[FSD]-"))
     .map((entry) => String(entry.file).replace(/\.md$/, "")));
-  const exemptIds = scopes.flatMap(([, scope]) => scope.exempt_test_splits as string[]);
+  const exemptIds = scopes.flatMap(([, scope]) => (scope.exempt_test_splits ?? []) as string[]);
   const exempt = (yaml(path.join(projectDocs(cwd), ".meta", "chunks-index.yaml")).chunks as Data[])
     .find((entry) => String(entry.id).startsWith("[FSD]-") && String(entry.id).endsWith(":TEST") &&
-      exemptIds.includes(entry.id as string) && !declaredFsdFiles.has(String(entry.file).replace(/\.md$/, "")))!;
-  expect(exempt, "Corpus must contain an exact exempt baseline TEST split outside this version's declared FSD files").toBeDefined();
+      exemptIds.includes(entry.id as string) && !declaredFsdFiles.has(String(entry.file).replace(/\.md$/, "")));
+  if (exempt === undefined) {
+    console.info("[system-contracts] no configured exempt baseline TEST outside declared FSD files; only the acceptance-node exemption fault is not applicable");
+    return restoredTarget;
+  }
   const exemptId = exempt.id as string;
   const exemptFile = path.join(projectDocs(cwd), "docs", String(exempt.file).replace(/\.md$/, "") + ".md");
   const exemptBytes = fs.readFileSync(exemptFile);
@@ -802,10 +1028,11 @@ async function realPythonGovernance(feature: Feature, originalFsd: string): Prom
   write(exemptFile, content.slice(0, at) + "\nAcceptance-only reference: " + requirementId + "\n\n" + content.slice(at));
   try {
     const diagnostic = await ok(cwd, ["specgraph", "validate-new-model", "--version", feature.version], "wrapper");
-    expect.soft(diagnostic).toMatchObject({ policy_violations: [], warnings: [], target_file_missing: [], derives_residue: [] });
-    expect(await ok(cwd, ["version", "confirm", feature.version], "wrapper")).toMatchObject({ passed: true });
+    expect(diagnostic).toMatchObject({ policy_violations: [], warnings: [], target_file_missing: [], derives_residue: [] });
+    expectAccepted(cwd, await ok(cwd, ["version", "confirm", feature.version], "wrapper"));
   } finally { fs.writeFileSync(exemptFile, exemptBytes); }
-  console.info("[system-contracts] original Python block policies rejected missing targets, unowned tracked artifacts and derives residue; original path/TEST exemptions retained");
+  console.info("[system-contracts] configured path/TEST exemptions verified and restored byte-for-byte");
+  return restoredTarget;
 }
 function baselineHasNoVersionFields(cwd: string): void {
   const index = yaml(path.join(projectDocs(cwd), ".meta", "chunks-index.yaml"));
@@ -831,14 +1058,19 @@ async function secondIteration(first: Feature, history: Snapshot, real: boolean)
   const fsdContent = fsdSplit(CHILD_FSD + ":implementation", prd + ":system_contract") + "\nSecond iteration.\n";
   await create(cwd, ["fsd", "create", CHILD_FSD + ":implementation", "--action", "modify"], fsdContent, "wrapper"); check();
   await ok(cwd, ["fsd", "confirm"], "wrapper"); check();
-  if (real) { await realPythonGovernance(feature, fsdContent); check(); }
+  const restoredTarget = await realPythonGovernance(feature, fsdContent); check();
   for (const note of ["Second iteration", "Reworked iteration"]) {
     await create(cwd, ["tdd", "create", TDD, "--parent", CHILD_FSD + ":implementation", "--action", "modify"], tddContent() + "\n" + note + ".\n", "wrapper"); check();
     await ok(cwd, ["tdd", "confirm"], "wrapper"); check();
     const pointer = await deliver(feature);
     generate(cwd, pointer);
     await receipt(cwd, pointer);
-    await ok(cwd, ["version", "confirm", version], "wrapper"); check();
+    await acceptance(cwd, "wrapper", { executeCommand: false });
+    expectAccepted(cwd, await ok(cwd, ["version", "confirm", version], "wrapper")); check();
+    if (note === "Second iteration" && restoredTarget !== null) {
+      expect(fs.existsSync(path.join(cwd, restoredTarget))).toBe(true);
+      console.info(`[system-contracts] ${restoredTarget}: next normal TDD version confirmation ran the unchanged original acceptance successfully after restoring the warned missing target`);
+    }
     if (note === "Second iteration") {
       expect(await ok(cwd, ["tdd", "revert"], "wrapper")).toMatchObject({ reverted: [TDD], phase: "tdd-creating" }); check();
     }
@@ -847,7 +1079,83 @@ async function secondIteration(first: Feature, history: Snapshot, real: boolean)
   expect(fs.existsSync(metaFile(cwd, version))).toBe(false);
   baselineHasNoVersionFields(cwd);
   for (const repo of [cwd, projectDocs(cwd)]) expect((await gitEvidence(repo, "after second iteration/rework/revert")).status).toBe("");
-  console.info("[system-contracts] " + version + ": baseline and merged history preserved byte-for-byte through opening, layer confirmation, version confirmation, TDD rework and cancellation");
+  console.info("[system-contracts] " + version + ": " + (real ? "real corpus" : "built-in fixture") + " baseline and merged history preserved byte-for-byte through opening, layer confirmation, version confirmation, TDD rework and cancellation");
+}
+
+async function historicalAnchors(cwd: string, merged: Data[]): Promise<HistoricalAnchor[]> {
+  const ordered = [...merged].sort((left, right) => String(right.version).localeCompare(String(left.version), "en", { numeric: true }));
+  const anchors: HistoricalAnchor[] = [];
+  const hostRef = (meta: Data): string | null => (meta.revert_anchor?.code_result ?? meta.code_result ?? meta.code_base ?? null) as string | null;
+  const candidates = [ordered, ordered.filter((meta) => hostRef(meta) === null)];
+  for (const group of candidates) {
+    for (const meta of group) {
+      const reference = meta.revert_anchor?.docs_ref ?? `refs/tags/ait/${meta.version}`;
+      const docs = await run("git", ["rev-parse", "--verify", `${reference}^{commit}`], projectDocs(cwd));
+      if (docs.status !== 0) {
+        console.info(`[system-contracts] ${meta.version}: historical rollback NOT VERIFIED; original docs anchor ${reference} is missing`);
+        continue;
+      }
+      const host = hostRef(meta);
+      if (host !== null) {
+        const object = await run("git", ["cat-file", "-e", `${host}^{commit}`], cwd);
+        expect(object.status, `Original host anchor is not available: ${meta.version} ${host}: ${object.stderr}`).toBe(0);
+      }
+      const anchored = await git(projectDocs(cwd), ["show", `${docs.stdout.trim()}:.meta/versions/${meta.version}.yaml`]);
+      const anchoredMeta = parse(anchored) as Data;
+      expect(anchoredMeta).toMatchObject({ version: meta.version });
+      expect(anchoredMeta.merged_at != null || anchoredMeta.phase === "merged", `Original anchor is not merged: ${meta.version}`).toBe(true);
+      if (!anchors.some((anchor) => anchor.version === meta.version)) anchors.push({ version: meta.version as string, docs: docs.stdout.trim(), host });
+      break;
+    }
+  }
+  expect(anchors.length, "No verifiable original merged-version anchor; refusing to fabricate rollback history").toBeGreaterThan(0);
+  if (!anchors.some((anchor) => anchor.host === null)) {
+    console.info("[system-contracts] this corpus has no verifiable host-unbound historical anchor; that case remains covered by the built-in Python-shaped fixture");
+  }
+  return anchors;
+}
+async function rollbackHistory(cwd: string, anchors: HistoricalAnchor[], history: Snapshot): Promise<void> {
+  for (const anchor of anchors) {
+    owned(cwd); owned(projectDocs(cwd));
+    const hostBefore = await gitEvidence(cwd, "before original-history rollback host");
+    const hostFiles: Snapshot = new Map();
+    for (const file of hostBefore.tracked) {
+      if (fs.existsSync(path.join(cwd, file))) hostFiles.set(file, fs.readFileSync(path.join(cwd, file)));
+    }
+    expect(await ok(cwd, ["version", "revert", anchor.version, "--confirm"], "wrapper")).toMatchObject({ reverted: true });
+    const docs = await gitEvidence(projectDocs(cwd), `after rollback to original ${anchor.version} docs`);
+    expect(docs.head).toBe(anchor.docs);
+    expect(docs.status).toBe("");
+    const host = await gitEvidence(cwd, `after rollback to original ${anchor.version} host`);
+    if (anchor.host === null) {
+      expect(host).toEqual(hostBefore);
+      for (const [file, bytes] of hostFiles) expect(fs.readFileSync(path.join(cwd, file)).equals(bytes), `Host-unbound rollback changed ${file}`).toBe(true);
+    } else {
+      expect(host.head).toBe(anchor.host);
+      expect(host.status).toBe("");
+    }
+    // A historical checkout may use core.autocrlf. Verify the original Git blobs
+    // and clean checkout instead of treating legitimate CRLF conversion as a rewrite.
+    const present = new Set(docs.tracked);
+    const tree = new Map((await git(projectDocs(cwd), ["ls-tree", "-r", "-z", anchor.docs])).split("\0").filter(Boolean).map((entry) => {
+      const match = /^\d+ \S+ ([a-f0-9]+)\t([\s\S]+)$/.exec(entry)!;
+      return [match[2]!, match[1]!];
+    }));
+    const index = new Map((await git(projectDocs(cwd), ["ls-files", "--stage", "-z"])).split("\0").filter(Boolean).map((entry) => {
+      const match = /^\d+ ([a-f0-9]+) 0\t([\s\S]+)$/.exec(entry)!;
+      return [match[2]!, match[1]!];
+    }));
+    let checked = 0;
+    let converted = 0;
+    for (const [file, bytes] of history) {
+      if (!present.has(file)) continue;
+      expect(index.get(file), `Historical Git content changed: ${file}`).toBe(tree.get(file));
+      if (!fs.readFileSync(path.join(projectDocs(cwd), file)).equals(bytes)) converted++;
+      checked++;
+    }
+    expect(checked, "Rollback must verify actual original historical records").toBeGreaterThan(0);
+    console.info(`[system-contracts] original ${anchor.version} restored: docs=${anchor.docs}; host=${anchor.host ?? "unbound, unchanged"}; ${checked} historical blobs verified; ${converted} checkout byte differences evaluated with Git filters and clean status`);
+  }
 }
 
 async function takeover(sourceDocs: string, label: string, real = false): Promise<void> {
@@ -858,6 +1166,8 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
   const localConfig = fs.existsSync(localFile) ? yaml(localFile) : {};
   const pythonDirectory = typeof localConfig.skill_dir === "string" && fs.existsSync(localConfig.skill_dir) ? localConfig.skill_dir as string : null;
   const pythonBefore = pythonDirectory === null ? null : snapshot(pythonDirectory, true);
+  const sourceGit = new Map<string, GitState>();
+  for (const repository of [originalCwd, sourceDocs]) sourceGit.set(repository, await gitEvidence(repository, "source before takeover"));
   expect(sourceBefore.size, `Empty Python corpus: ${sourceDocs}`).toBeGreaterThan(0);
   try {
     const cwd = await cloneTakeover(sourceDocs);
@@ -884,9 +1194,12 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
     expectSame(copied, managed(cwd));
     if (session.active_version !== null) {
       await ok(cwd, ["version", "revert", session.active_version as string, "--confirm"], "wrapper");
+      console.info(`[system-contracts] cancelled copied active ${String(session.active_version)} through version revert; no claim of cross-implementation continuation of an active version`);
     }
     expectSame(originalBaseline, baseline(cwd));
     expectPreserved(oldHistory, managed(cwd));
+    const anchors = await historicalAnchors(cwd, merged);
+    await prepareAcceptance(cwd, originalCwd);
     expect(await ok(cwd, ["specgraph", "validate-new-model"], "wrapper"), `${label}: historical invariant violation`).toMatchObject({ passed: true, violations: [] });
     const feature = await prepare(cwd, "wrapper");
     policy(cwd, "block");
@@ -894,8 +1207,9 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
     expect(fs.existsSync(path.join(cwd, TARGET))).toBe(false);
     generate(cwd, pointer);
     await receipt(cwd, pointer);
-    await acceptance(cwd, "wrapper");
+    await acceptance(cwd, "wrapper", { executeCommand: false });
     const confirmed = await ok(cwd, ["version", "confirm", feature.version], "wrapper");
+    expectAccepted(cwd, confirmed);
     expect(confirmed).toMatchObject({ passed: true, generation_receipts: { enforcement: "block", passed: true, findings: [] } });
     expectSame(originalBaseline, baseline(cwd));
     const plan = yaml(metaFile(cwd, feature.version)).confirmed_plan as Data;
@@ -915,7 +1229,7 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
       else expect(after.get(file)?.equals(bytes), file).toBe(true);
     }
     expect(fs.readFileSync(path.join(cwd, TARGET), "utf8")).toContain('"value":42');
-    await acceptance(cwd, "wrapper");
+    await acceptance(cwd, "wrapper", { executeCommand: false });
     baselineHasNoVersionFields(cwd);
     const mergedMeta = yaml(metaFile(cwd, feature.version));
     expect(mergedMeta.code_result).toBe((await gitEvidence(cwd, "after first merge host")).head);
@@ -928,20 +1242,69 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
         ...(mergedMeta.changes as string[]).map((change) => `.meta/changes/${change}.yaml`)].includes(file)));
     await secondIteration(feature, firstHistory, real);
     expect(await namedOk(cwd, "getSessionContext")).toMatchObject({ active_version: null, phase: null, baseline_empty: false });
-    console.info(`[system-contracts] ${label}: takeover completed; ${merged.length} historical versions preserved; ${feature.version} merged; artifact ${TARGET} executed`);
+    await rollbackHistory(cwd, anchors, oldHistory);
+    const configuredAcceptance = originalAcceptance.get(cwd);
+    if (configuredAcceptance !== null) expect(acceptanceCommand(cwd)).toBe(configuredAcceptance);
+    console.info(`[system-contracts] ${label}: CLI+Node mixed-receipt takeover regression completed; ${merged.length} historical versions preserved; ${feature.version} merged; artifact ${TARGET} executed; original historical anchors restored; this is not manual takeover or LLM-quality evidence`);
   } finally {
     expectSame(sourceBefore, managed(originalCwd));
     expectSame(sourceWrappers, snapshot(path.join(sourceDocs, ".ait")));
     if (pythonDirectory !== null) expectSame(pythonBefore!, snapshot(pythonDirectory, true));
+    const modules = path.join(originalCwd, "node_modules");
+    const dependencies = sourceDependencies.get(modules);
+    if (dependencies !== undefined) {
+      regularTree(modules, true);
+      expectSame(dependencies, snapshot(modules));
+    }
     for (const source of [originalCwd, sourceDocs]) {
       for (const [file, bytes] of sourceArtifacts.get(source) ?? []) {
         expect(fs.readFileSync(path.join(source, file)).equals(bytes), `Source artifact changed: ${source}/${file}`).toBe(true);
       }
+      expect(await gitEvidence(source, "source after takeover")).toEqual(sourceGit.get(source));
     }
   }
 }
 
 describe("Python-project takeover", () => {
+  it("retains original acceptance with independent dependency bytes and restores a warned missing target before running it", async () => {
+    const source = caseDir();
+    pythonFixture(source);
+    const configured = "node original-acceptance.cjs";
+    write(path.join(projectDocs(source), ".meta", "config.local.yaml"), stringify({ acceptance_command: configured }));
+    write(path.join(source, "package.json"), JSON.stringify({ private: true, dependencies: { "original-acceptance-dependency": "1.0.0" } }));
+    const lock = '{"lockfileVersion":3,"packages":{}}\n';
+    write(path.join(source, "package-lock.json"), lock);
+    const dependency = path.join("node_modules", "original-acceptance-dependency", "index.cjs");
+    write(path.join(source, dependency), "module.exports = 42;\n");
+    write(path.join(source, "original-acceptance.cjs"),
+      "const fs=require('node:fs');const a=require('node:assert/strict');a.equal(require('./legacy.cjs').value,42);" +
+      "a.equal(require('./node_modules/original-acceptance-dependency/index.cjs'),42);fs.writeFileSync('original-acceptance-ran','passed');\n");
+    const before = snapshot(source);
+    const cwd = cloneDocs(projectDocs(source));
+    for (const file of ["package.json", "package-lock.json", "original-acceptance.cjs"]) copyArtifact(source, cwd, file);
+    originalAcceptance.set(cwd, configured);
+    acceptanceProjects.add(path.resolve(cwd));
+    await prepareAcceptance(cwd, source);
+    await refreshInstalledWrapper(cwd);
+    const feature = await startFeature(cwd, "wrapper");
+    await writeFeature(feature);
+    expect(fs.existsSync(path.join(cwd, "original-acceptance-ran"))).toBe(false);
+    expect(await missingTargetGovernance(feature, "legacy.cjs", "warn")).toBe("legacy.cjs");
+    expect(fs.existsSync(path.join(cwd, "original-acceptance-ran"))).toBe(false);
+    await create(cwd, ["tdd", "create", TDD, "--parent", CHILD_FSD + ":implementation"], tddContent(), "wrapper");
+    await ok(cwd, ["tdd", "confirm"], "wrapper");
+    const pointer = await deliver(feature);
+    generate(cwd, pointer);
+    await receipt(cwd, pointer);
+    await acceptance(cwd, "wrapper", { executeCommand: false });
+    expectAccepted(cwd, await ok(cwd, ["version", "confirm", feature.version], "wrapper"));
+    expect(fs.readFileSync(path.join(cwd, "original-acceptance-ran"), "utf8")).toBe("passed");
+    expect(acceptanceCommand(cwd)).toBe(configured);
+    expect(fs.readFileSync(path.join(cwd, "package-lock.json"), "utf8")).toBe(lock);
+    write(path.join(cwd, dependency), "module.exports = 0;\n");
+    expect(await ok(cwd, ["acceptance", "run"], "wrapper")).toMatchObject({ ran: true, passed: false, exitCode: 1 });
+    expectSame(before, snapshot(source));
+  }, TIMEOUT);
   it("always continues a built-in Python-shaped merged project through actual generation and merge", async () => {
     await takeover(projectDocs(fixture), "built-in Python-shaped fixture (not evidence of real Python takeover)");
   }, TIMEOUT);

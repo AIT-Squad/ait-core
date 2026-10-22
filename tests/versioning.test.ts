@@ -1,4 +1,4 @@
-// [TDD]-versioning_tests v0.11 — versioning 域三个制品（version-manager / merge-engine /
+// [TDD]-versioning_tests v0.12 — versioning 域三个制品（version-manager / merge-engine /
 // publish）的集成验收，覆盖 [FSD]-ait-core-versioning:TEST 第 1~8 条全部断言点。
 //
 // 持久化形态按 Python 当前形态断言（v0.5 对齐，doc-model schemas 为权威）：
@@ -24,7 +24,7 @@
 // 必返 EBUSY（已实测：stdio[0]='pipe' 100% 失败，'ignore'/'inherit' 100% 正常，
 // 与 node 版本、cwd、沙箱无关）；被测实现与 git 命令均不读 stdin，故经
 // vi.mock("node:child_process") 将 spawnSync 的 stdin 形态 'pipe' 改写为 'ignore'，
-// stdout/stderr 管道与其余选项原样保留。
+// stdout/stderr 管道保留；子进程另移除 AIT_CORPUS_DIRS，防止副本验收递归发现语料。
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -32,20 +32,25 @@ vi.mock("node:child_process", async (importOriginal) => {
   const original =
     await importOriginal<typeof import("node:child_process")>();
   type Options = Record<string, unknown> | undefined;
-  /** stdin 形态 'pipe' → 'ignore'（缺省/字符串 'pipe'/数组首元素）；其余原样。 */
+  /** 语料只由本层发现；验收子进程仍运行内置回归，但不能再次枚举真实项目。 */
   const fixStdin = (opts: Options): Record<string, unknown> => {
+    const env = { ...(opts?.["env"] as NodeJS.ProcessEnv | undefined ?? process.env) };
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase() === "AIT_CORPUS_DIRS") delete env[key];
+    }
+    const isolated = { ...opts, env };
     const stdio = opts?.["stdio"];
     if (stdio === undefined || stdio === "pipe") {
-      return { ...opts, stdio: ["ignore", "pipe", "pipe"] };
+      return { ...isolated, stdio: ["ignore", "pipe", "pipe"] };
     }
     if (Array.isArray(stdio)) {
       const next = [...stdio];
       if (next[0] === "pipe") {
         next[0] = "ignore";
       }
-      return { ...opts, stdio: next };
+      return { ...isolated, stdio: next };
     }
-    return { ...opts };
+    return isolated;
   };
   const spawnSyncPatched = ((
     command: string,
@@ -140,13 +145,15 @@ const V = "v0.4";
 /** 全流程用例 git 子进程密集，给足超时。 */
 const T = 30_000;
 /** 真实语料接管用例（整树拷贝 + 全流程 + git），单独放长超时。 */
-const T_CORPUS = 600_000;
+const T_CORPUS = 1_800_000;
 
 let tmpDirs: string[] = [];
+const ownedFixtureRoots = new Set<string>();
 
 function mkTmp(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ait-versioning-"));
   tmpDirs.push(dir);
+  ownedFixtureRoots.add(path.resolve(dir));
   return dir;
 }
 
@@ -164,6 +171,7 @@ afterEach(() => {
     }
   }
   tmpDirs = [];
+  ownedFixtureRoots.clear();
 });
 
 // ---------------------------------------------------------------------------
@@ -416,13 +424,14 @@ async function advanceToMerged(root: ProjectRoot): Promise<{
 // ---------------------------------------------------------------------------
 
 /** 目录全量字节摘要：相对路径 → 内容 sha256；目录不存在返回空表。 */
-function treeDigest(dir: string): Map<string, string> {
+function treeDigest(dir: string, omitAtRoot: readonly string[] = []): Map<string, string> {
   const out = new Map<string, string>();
   if (!fs.existsSync(dir)) {
     return out;
   }
   const walk = (cur: string): void => {
     for (const entry of fs.readdirSync(cur, { withFileTypes: true })) {
+      if (cur === dir && omitAtRoot.includes(entry.name)) continue;
       const abs = path.join(cur, entry.name);
       if (entry.isDirectory()) {
         walk(abs);
@@ -1097,6 +1106,131 @@ describe("merge 原子性", () => {
 // ---------------------------------------------------------------------------
 
 describe("revert 双态", () => {
+  /** 历史字段形态必须写入文档锚点本身，不能只改当前工作区的元数据。 */
+  function anchorHistoricalMeta(root: ProjectRoot, meta: unknown): string {
+    saveModel(metaPathOf(root, V), meta);
+    gitCommitAll(root.root, "historical binding shape");
+    const anchor = git(root.root, ["rev-parse", "HEAD"]);
+    git(root.root, ["tag", "-f", `ait/${V}`, anchor]);
+    fs.writeFileSync(path.join(root.root, "later-docs.txt"), "later docs\n");
+    gitCommitAll(root.root, "later docs");
+    return anchor;
+  }
+
+  function hostSnapshot(root: ProjectRoot): {
+    head: string | null; index: Buffer | null; files: Map<string, string>;
+  } {
+    const index = path.join(root.cwd, ".git", "index");
+    return {
+      head: gitTry(root.cwd, ["rev-parse", "HEAD"]),
+      index: fs.existsSync(index) ? fs.readFileSync(index) : null,
+      files: treeDigest(root.cwd, [".git", "project-docs"]),
+    };
+  }
+
+  function expectHostUnchanged(root: ProjectRoot, before: ReturnType<typeof hostSnapshot>): void {
+    const after = hostSnapshot(root);
+    expect(after.head).toBe(before.head);
+    expect(after.index).toEqual(before.index);
+    expectSameDigest(before.files, after.files);
+  }
+
+  it.each(["missing", "null", "blank"] as const)(
+    "历史宿主绑定为 %s：仅回滚 docs，宿主额外提交、暂存区、工作区与未跟踪字节不变",
+    { timeout: T },
+    async (shape) => {
+      const { root } = makeEnv();
+      const tracked = path.join(root.cwd, "host-tracked.txt");
+      fs.writeFileSync(tracked, "original host\n");
+      gitCommitAll(root.cwd, "original host content");
+      const { vm } = await advanceToMerged(root);
+      const meta = readMeta(root, V);
+      const { code_base: _base, code_result: _result, revert_anchor: _anchor, ...legacy } = meta;
+      const empty = shape === "blank" ? "   " : null;
+      const historical = shape === "missing"
+        ? { ...legacy, revert_anchor: { docs_ref: `refs/tags/ait/${V}` } }
+        : { ...meta, code_base: empty, code_result: empty,
+          revert_anchor: { docs_ref: `refs/tags/ait/${V}`, code_result: empty } };
+      const docsAnchor = anchorHistoricalMeta(root, historical);
+
+      fs.writeFileSync(tracked, "extra host commit\n");
+      gitCommitAll(root.cwd, "extra host commit after historical docs");
+      fs.writeFileSync(tracked, "staged host bytes\n");
+      const added = path.join(root.cwd, "staged-new.bin");
+      fs.writeFileSync(added, Buffer.from([0, 255, 1, 13, 10]));
+      git(root.cwd, ["add", "--", "host-tracked.txt", "staged-new.bin"]);
+      fs.writeFileSync(tracked, "unstaged host bytes\n");
+      fs.writeFileSync(path.join(root.cwd, "untracked.bin"), Buffer.from([255, 0, 13, 10, 2]));
+      expect(git(root.cwd, ["diff", "--cached", "--name-only"])).toContain("staged-new.bin");
+      expect(git(root.cwd, ["diff", "--name-only"])).toContain("host-tracked.txt");
+      const hostBefore = hostSnapshot(root);
+      expect(hostBefore.head).not.toBe(meta.code_result);
+
+      const reverted = await vm.versionRevert(V, { confirm: true });
+      expect(reverted).toMatchObject({ mode: "merged", docs_anchor: docsAnchor, host_anchor: null });
+      expectHostUnchanged(root, hostBefore);
+      expect(git(root.root, ["rev-parse", "HEAD"])).toBe(docsAnchor);
+      expect(git(root.root, ["status", "--porcelain"])).toBe("");
+      expect(fs.existsSync(path.join(root.root, "later-docs.txt"))).toBe(false);
+    },
+  );
+
+  it.each(["code_result", "code_base"] as const)(
+    "历史宿主仅 %s 有效：跳过不可解析的优先候选，双仓达到各自锚点且 clean",
+    { timeout: T },
+    async (field) => {
+      const { root } = makeEnv();
+      const tracked = path.join(root.cwd, "host-tracked.txt");
+      fs.writeFileSync(tracked, "historical host\n");
+      gitCommitAll(root.cwd, "historical host content");
+      const { vm, confirm } = await advanceToMerged(root);
+      const hostAnchor = confirm.code_result as string;
+      const bogus = "1".repeat(40);
+      const meta = readMeta(root, V);
+      meta.revert_anchor = { docs_ref: `refs/tags/ait/${V}`, code_result: bogus };
+      meta.code_result = field === "code_result" ? hostAnchor : bogus;
+      meta.code_base = field === "code_base" ? hostAnchor : null;
+      const docsAnchor = anchorHistoricalMeta(root, meta);
+      fs.writeFileSync(tracked, "later host\n");
+      fs.writeFileSync(path.join(root.cwd, "later-host.txt"), "later host\n");
+      gitCommitAll(root.cwd, "later host");
+
+      const reverted = await vm.versionRevert(V, { confirm: true });
+      expect(reverted).toMatchObject({ mode: "merged", docs_anchor: docsAnchor, host_anchor: hostAnchor });
+      expect(git(root.root, ["rev-parse", "HEAD"])).toBe(docsAnchor);
+      expect(git(root.cwd, ["rev-parse", "HEAD"])).toBe(hostAnchor);
+      expect(git(root.root, ["status", "--porcelain"])).toBe("");
+      expect(git(root.cwd, ["status", "--porcelain"])).toBe("");
+      // 检出内容按本仓 Git 换行配置解释；不是异常补偿的逐字节恢复断言。
+      expect(fs.readFileSync(tracked, "utf8").replaceAll("\r\n", "\n")).toBe(
+        git(root.cwd, ["show", `${hostAnchor}:host-tracked.txt`]) + "\n",
+      );
+      expect(fs.existsSync(path.join(root.cwd, "later-host.txt"))).toBe(false);
+      expect(readMeta(root, V)[field]).toBe(hostAnchor);
+    },
+  );
+
+  it("历史已声明宿主绑定但宿主 Git 缺失：预检拒绝且 docs/index/工作内容零写入", { timeout: T }, async () => {
+    const { root } = makeEnv({ hostGit: false });
+    const { vm } = await advanceToMerged(root);
+    const meta = readMeta(root, V);
+    meta.code_result = "1".repeat(40);
+    anchorHistoricalMeta(root, meta);
+    fs.writeFileSync(path.join(root.cwd, "untracked.bin"), Buffer.from([1, 0, 255]));
+    const before = managedSnapshot(root);
+    const hostBefore = hostSnapshot(root);
+    const docsHead = git(root.root, ["rev-parse", "HEAD"]);
+    const docsIndex = fs.readFileSync(path.join(root.root, ".git", "index"));
+
+    await expectErrCode(vm.versionRevert(V, { confirm: true }), "REVERT_PRECHECK_FAILED");
+    expectManagedUnchanged(root, before);
+    expectHostUnchanged(root, hostBefore);
+    expect(fs.existsSync(path.join(root.cwd, ".git"))).toBe(false);
+    expect(git(root.root, ["rev-parse", "HEAD"])).toBe(docsHead);
+    expect(fs.readFileSync(path.join(root.root, ".git", "index"))).toEqual(docsIndex);
+    expect(readMeta(root, V).recovery_journal).toBeNull();
+  });
+
   it(
     "未合入版本：confirm:false 拒绝；confirm:true 物理清空工作区、索引/图/元数据与本版本 chg 文件，基线不动",
     { timeout: T },
@@ -1298,6 +1432,9 @@ describe("revert 双态", () => {
 
       const docsBefore = treeDigest(root.docs);
       const metaBefore = treeDigest(root.meta);
+      const managedBefore = managedSnapshot(root);
+      const hostBefore = hostSnapshot(root);
+      const docsIndexBefore = fs.readFileSync(path.join(root.root, ".git", "index"));
       const docsHeadBefore = git(root.root, ["rev-parse", "HEAD"]);
       const hostHeadBefore = git(root.cwd, ["rev-parse", "HEAD"]);
 
@@ -1306,6 +1443,9 @@ describe("revert 双态", () => {
       // 零写入：docs/.meta 字节、双仓 HEAD 与补偿基准零变化
       expectSameDigest(docsBefore, treeDigest(root.docs));
       expectSameDigest(metaBefore, treeDigest(root.meta));
+      expectManagedUnchanged(root, managedBefore);
+      expectHostUnchanged(root, hostBefore);
+      expect(fs.readFileSync(path.join(root.root, ".git", "index"))).toEqual(docsIndexBefore);
       expect(git(root.root, ["rev-parse", "HEAD"])).toBe(docsHeadBefore);
       expect(git(root.cwd, ["rev-parse", "HEAD"])).toBe(hostHeadBefore);
       expect(readMeta(root, V).recovery_journal ?? null).toBe(null);
@@ -1330,12 +1470,18 @@ describe("revert 双态", () => {
       saveModel(metaPathOf(root, V), meta);
 
       const metaBefore = treeDigest(root.meta);
+      const before = managedSnapshot(root);
+      const hostBefore = hostSnapshot(root);
+      const docsIndex = fs.readFileSync(path.join(root.root, ".git", "index"));
       const docsHeadBefore = git(root.root, ["rev-parse", "HEAD"]);
       const hostHeadBefore = git(root.cwd, ["rev-parse", "HEAD"]);
 
       const err = await captureErr(vm.versionRevert(V, { confirm: true }));
       expect((err as { code?: unknown }).code).toBe("REVERT_PRECHECK_FAILED");
       expectSameDigest(metaBefore, treeDigest(root.meta));
+      expectManagedUnchanged(root, before);
+      expectHostUnchanged(root, hostBefore);
+      expect(fs.readFileSync(path.join(root.root, ".git", "index"))).toEqual(docsIndex);
       expect(git(root.root, ["rev-parse", "HEAD"])).toBe(docsHeadBefore);
       expect(git(root.cwd, ["rev-parse", "HEAD"])).toBe(hostHeadBefore);
     },
@@ -2226,7 +2372,7 @@ async function generatedVersion(root: ProjectRoot): Promise<{
 }
 
 function managedSnapshot(root: ProjectRoot): Map<string, string>[] {
-  return [root.docs, root.meta, path.join(root.root, "versions")].map(treeDigest);
+  return [root.docs, root.meta, path.join(root.root, "versions")].map((dir) => treeDigest(dir));
 }
 
 function expectManagedUnchanged(root: ProjectRoot, before: Map<string, string>[]): void {
@@ -2730,7 +2876,7 @@ describe("既有治理策略的版本门禁", () => {
 // [TDD]-versioning_tests v0.5 — 接管 Python 版 ait 已管理仓库（:TEST 7/8）。
 
 /** AIT_CORPUS_DIRS（";" 分隔的 .meta 目录或 project-docs 目录列表）。 */
-function corpusProjectDocs(): { configured: string[]; existing: string[] } {
+function corpusProjectDocs(): { configured: string[]; existing: string[]; missing: string[] } {
   const raw = process.env["AIT_CORPUS_DIRS"];
   const configured =
     raw !== undefined && raw.trim() !== ""
@@ -2739,63 +2885,234 @@ function corpusProjectDocs(): { configured: string[]; existing: string[] } {
           .map((item) => item.trim())
           .filter((item) => item !== "")
       : [];
-  return {
-    configured,
-    existing: configured
-      .map((item) =>
-        path.basename(item) === ".meta" ? path.dirname(item) : item,
-      )
-      .filter(
-        (dir) =>
-          fs.existsSync(path.join(dir, "docs")) &&
-          fs.existsSync(path.join(dir, ".meta")),
-      ),
-  };
+  const existing: string[] = [];
+  const missing: string[] = [];
+  for (const item of configured) {
+    const normalized = path.resolve(item);
+    const dir = path.basename(normalized) === ".meta" ? path.dirname(normalized) : normalized;
+    if (fs.existsSync(path.join(dir, "docs")) && fs.existsSync(path.join(dir, ".meta"))) {
+      if (!existing.includes(dir)) existing.push(dir);
+    } else {
+      missing.push(item);
+    }
+  }
+  return { configured, existing, missing };
 }
 
-/**
- * 整树拷贝 project-docs（**保留 .git**）：:TEST 8 要求 docs 仓可用（合入提交 +
- * 锚点 tag），历史文件须能在副本上原样比对。
- */
-function copyProjectDocsWithGit(src: string, base: string): string {
-  const dst = path.join(base, "project-docs");
-  fs.cpSync(src, dst, { recursive: true });
-  // 语料配置可能要求 TDD 制品真实存在；只复制其声明且实际存在的宿主文件。
-  const root = resolveProjectRoot(base);
-  for (const node of combinedView(root).nodes.values()) {
-    if (typeof node.target_file !== "string") continue;
-    const source = path.resolve(path.dirname(src), node.target_file);
-    const relative = path.relative(path.dirname(src), source);
-    if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(".." + path.sep)) {
-      throw new Error("语料制品路径越界：" + node.target_file);
-    }
-    if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
-    const target = path.join(base, relative);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.copyFileSync(source, target);
+/** 先规范化并校验每个现存路径组件；链接/junction 不得借真实路径绕过词法边界。 */
+function checkedCorpusPath(root: string, candidate: string, allowMissing = false): string {
+  const normalizedRoot = path.resolve(root);
+  const target = path.resolve(normalizedRoot, candidate);
+  const relative = path.relative(normalizedRoot, target);
+  if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(".." + path.sep)) {
+    throw new Error(`语料路径越界：${candidate}（根目录 ${normalizedRoot}）`);
   }
-  const scopes = loadConfig(root.meta)["artifact_scopes"] as Record<string, unknown> | undefined;
-  if (scopes !== undefined && Object.keys(scopes).length > 0) {
-    // 配置 scope 的副本使用真实 Git 跟踪清单，连同未建 TDD 的受治理文件一起核验。
-    const sourceRoot = path.dirname(src);
-    const tracked = git(sourceRoot, ["ls-files", "-z", "--", ...Object.keys(scopes)]).split("\0").filter(Boolean);
-    for (const relative of tracked) {
-      const source = path.resolve(sourceRoot, relative);
-      const within = path.relative(sourceRoot, source);
-      if (path.isAbsolute(within) || within === ".." || within.startsWith(".." + path.sep)) {
-        throw new Error("语料受治理路径越界：" + relative);
+  let current = path.parse(target).root;
+  for (const component of target.slice(current.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return target;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error(`语料路径不能包含链接：${current}`);
+  }
+  return target;
+}
+
+/** 复制只写 mkTmp 创建的目录；不解引用链接，也不把嵌套工作区当成依赖复制。 */
+function copyCorpusEntry(source: string, target: string, base: string, dependencies = false): void {
+  if (!ownedFixtureRoots.has(path.resolve(base))) throw new Error(`副本不属于 mkTmp：${base}`);
+  checkedCorpusPath(base, target, true);
+  checkedCorpusPath(path.parse(source).root, source);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(source, target, {
+    recursive: true, dereference: false, force: false, errorOnExist: true,
+    filter: (entry) => {
+      const stat = fs.lstatSync(entry);
+      if (stat.isSymbolicLink()) throw new Error(`语料复制拒绝链接：${entry}`);
+      if (dependencies && stat.isDirectory() && [".git", "project-docs"].includes(path.basename(entry))) {
+        throw new Error(`语料依赖包含完整工作区，不能复制：${entry}`);
       }
-      if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
-      const target = path.join(base, relative);
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(source, target);
-    }
-    fs.writeFileSync(path.join(base, ".gitignore"), "project-docs/\n");
-    initRepo(base);
-    gitCommitAll(base, "corpus artifact baseline");
+      return true;
+    },
+  });
+}
+
+/** safe.directory 只作用于本条只读命令，绝不修改全局 Git 配置。 */
+function sourceGit(source: string, args: string[]): string {
+  return git(source, ["-c", `safe.directory=${source.replaceAll("\\", "/")}`, ...args]);
+}
+
+function assertPortableCorpusGit(repo: string): void {
+  const gitDir = checkedCorpusPath(repo, ".git");
+  if (!fs.statSync(gitDir).isDirectory()) {
+    throw new Error(`语料 Git 必须是独立目录，不能引用源 worktree：${gitDir}`);
   }
+  for (const name of ["commondir", "objects/info/alternates", "config.worktree"]) {
+    if (fs.existsSync(path.join(gitDir, name))) throw new Error(`语料 Git 含外部工作区引用：${gitDir}/${name}`);
+  }
+  const config = sourceGit(repo, ["config", "--local", "--list"]);
+  if (/^(?:core\.(?:worktree|hookspath)|include[^=]*\.path)=/im.test(config) || /^core\.fsmonitor=(?!false$)/im.test(config)) {
+    throw new Error(`语料 Git 配置依赖外部路径，无法安全复制：${gitDir}/config`);
+  }
+  const hooks = path.join(gitDir, "hooks");
+  if (fs.existsSync(hooks) && fs.readdirSync(hooks).some((name) => !name.endsWith(".sample"))) {
+    throw new Error(`语料含自定义 Git hook，不能在隔离验收中执行源脚本：${hooks}`);
+  }
+  expect(path.resolve(sourceGit(repo, ["rev-parse", "--show-toplevel"]))).toBe(path.resolve(repo));
+}
+
+/** 保留 docs 全历史、宿主真实 index/config 与工程文件，声明但被忽略的制品另行复制。 */
+function copyProjectDocsWithGit(src: string, base: string): string {
+  const destination = path.resolve(base);
+  if (!ownedFixtureRoots.has(destination)) throw new Error(`副本不属于 mkTmp：${base}`);
+  checkedCorpusPath(destination, destination);
+  if (fs.readdirSync(destination).length !== 0) throw new Error(`语料副本目标必须为空：${destination}`);
+  const sourceDocs = checkedCorpusPath(path.parse(path.resolve(src)).root, path.resolve(src));
+  if (path.basename(sourceDocs) !== "project-docs") throw new Error(`语料必须指向 project-docs：${sourceDocs}`);
+  const sourceRoot = path.dirname(sourceDocs);
+  assertPortableCorpusGit(sourceDocs);
+  const hasHostGit = fs.existsSync(path.join(sourceRoot, ".git"));
+  if (hasHostGit) assertPortableCorpusGit(sourceRoot);
+  const tracked = hasHostGit ? sourceGit(sourceRoot, ["ls-files", "-z"]).split("\0").filter(Boolean) : [];
+  const dst = path.join(destination, "project-docs");
+  copyCorpusEntry(sourceDocs, dst, destination);
+  const root = resolveProjectRoot(destination);
+  const config = loadConfig(root.meta);
+  const scopes = config["artifact_scopes"] as Record<string, unknown> | undefined;
+  const acceptance = acceptanceShow(root);
+  if (!hasHostGit && (acceptance !== null || (scopes !== undefined && Object.keys(scopes).length > 0))) {
+    throw new Error(`语料验收环境无法还原真实跟踪清单：宿主 Git 缺失（${sourceRoot}）`);
+  }
+  if (acceptance?.replaceAll("\\", "/").toLowerCase().includes(sourceRoot.replaceAll("\\", "/").toLowerCase())) {
+    throw new Error(`语料验收命令引用源项目绝对路径，拒绝在源路径执行：${acceptance}`);
+  }
+
+  const files = new Set(tracked);
+  const views = [combinedView(root)];
+  for (const version of new IndexManager(root).listVersions()) {
+    const meta = readMeta(root, version);
+    if (meta.merged_at === null && meta.phase !== "merged") views.push(combinedView(root, version));
+  }
+  for (const view of views) {
+    for (const node of view.nodes.values()) {
+      if (typeof node.target_file === "string") files.add(node.target_file);
+    }
+  }
+  const copied = new Set<string>();
+  for (const relative of files) {
+    const source = checkedCorpusPath(sourceRoot, relative, true);
+    const within = path.relative(sourceRoot, source);
+    if ([".git", "project-docs", "node_modules"].includes(within.split(path.sep)[0]!)) {
+      throw new Error(`语料宿主制品落入保留目录：${relative}`);
+    }
+    // 源仓中已删除的制品保持缺失；真正的存在性门禁仍由原治理配置判定。
+    if (!fs.existsSync(source)) continue;
+    if (!fs.statSync(source).isFile()) throw new Error(`语料跟踪项不是普通文件：${source}`);
+    const key = process.platform === "win32" ? within.toLowerCase() : within;
+    if (copied.has(key)) continue;
+    copyCorpusEntry(source, path.join(destination, within), destination);
+    copied.add(key);
+  }
+  if (hasHostGit) copyCorpusEntry(path.join(sourceRoot, ".git"), path.join(destination, ".git"), destination);
+
+  const packageFile = path.join(destination, "package.json");
+  const modules = checkedCorpusPath(sourceRoot, "node_modules", true);
+  if (acceptance !== null && fs.existsSync(packageFile)) {
+    const manifest = JSON.parse(fs.readFileSync(packageFile, "utf8")) as {
+      dependencies?: Record<string, string>; devDependencies?: Record<string, string>;
+    };
+    for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })) {
+      const dependency = checkedCorpusPath(modules, name, true);
+      if (!fs.existsSync(dependency)) {
+        throw new Error(`语料验收依赖缺失：${name}（${dependency}）；无法在隔离副本执行原命令 ${acceptance}`);
+      }
+    }
+  }
+  if (fs.existsSync(modules)) copyCorpusEntry(modules, path.join(destination, "node_modules"), destination, true);
+  expect(acceptanceShow(root)).toBe(acceptance);
+  if (hasHostGit) expect(git(destination, ["ls-files", "-z"]).split("\0").filter(Boolean)).toEqual(tracked);
   return dst;
 }
+
+describe("语料副本隔离", () => {
+  it("保留两仓历史、工程跟踪与忽略制品，原验收在复制的依赖上运行且子进程不继承语料目录", { timeout: T }, async () => {
+    const { root: source } = makeEnv();
+    fs.appendFileSync(path.join(source.cwd, ".gitignore"), "node_modules/\nsrc/demo.ts\nacceptance.json\n");
+    fs.writeFileSync(path.join(source.cwd, "package.json"), JSON.stringify({
+      name: "corpus-fixture", dependencies: { "fixture-dependency": "1.0.0" },
+    }));
+    const dependency = path.join(source.cwd, "node_modules", "fixture-dependency");
+    fs.mkdirSync(dependency, { recursive: true });
+    fs.writeFileSync(path.join(dependency, "package.json"), JSON.stringify({ name: "fixture-dependency", main: "index.cjs" }));
+    fs.writeFileSync(path.join(dependency, "index.cjs"), "module.exports = 42;\n");
+    fs.writeFileSync(path.join(source.cwd, "fixture-acceptance.cjs"), [
+      "const fs = require('node:fs');",
+      "if (require('fixture-dependency') !== 42) throw Error('dependency unavailable');",
+      "if (!fs.readFileSync('src/demo.ts', 'utf8').includes('value')) throw Error('ignored artifact missing');",
+      "if (process.env.AIT_CORPUS_DIRS) throw Error('recursive corpus discovery');",
+      "fs.writeFileSync('acceptance.json', JSON.stringify({cwd: process.cwd(), corpus: process.env.AIT_CORPUS_DIRS ?? null}));",
+    ].join("\n"));
+    const vm = await buildGenerationVersion(source);
+    writeDemoArtifact(source);
+    await vm.versionConfirm(V);
+    await versionMerge(source, V);
+    acceptanceSet(source, "node fixture-acceptance.cjs");
+    const sourceBefore = treeDigest(source.cwd);
+    const tracked = git(source.cwd, ["ls-files", "-z"]);
+    expect(tracked).toContain("fixture-acceptance.cjs");
+    expect(tracked).not.toContain("src/demo.ts");
+    const base = mkTmp();
+    copyProjectDocsWithGit(source.root, base);
+    const copied = resolveProjectRoot(base);
+    expect(git(copied.cwd, ["rev-parse", "HEAD"])).toBe(git(source.cwd, ["rev-parse", "HEAD"]));
+    expect(git(copied.root, ["show-ref", "--tags"])).toBe(git(source.root, ["show-ref", "--tags"]));
+    expectSameDigest(treeDigest(path.join(source.root, ".git")), treeDigest(path.join(copied.root, ".git")));
+    expectSameDigest(treeDigest(path.join(source.cwd, ".git")), treeDigest(path.join(copied.cwd, ".git")));
+    expect(git(copied.cwd, ["ls-files", "-z"])).toBe(tracked);
+    expect(fs.readFileSync(path.join(copied.cwd, "src/demo.ts"))).toEqual(fs.readFileSync(path.join(source.cwd, "src/demo.ts")));
+    expect(acceptanceShow(copied)).toBe("node fixture-acceptance.cjs");
+    const previous = process.env["AIT_CORPUS_DIRS"];
+    process.env["AIT_CORPUS_DIRS"] = source.root;
+    try {
+      expect(runAcceptance(copied)).toEqual({ ran: true, passed: true, exitCode: 0 });
+      expect(process.env["AIT_CORPUS_DIRS"]).toBe(source.root);
+    } finally {
+      if (previous === undefined) delete process.env["AIT_CORPUS_DIRS"];
+      else process.env["AIT_CORPUS_DIRS"] = previous;
+    }
+    expect(JSON.parse(fs.readFileSync(path.join(base, "acceptance.json"), "utf8"))).toEqual({ cwd: base, corpus: null });
+    fs.writeFileSync(path.join(base, "node_modules", "fixture-dependency", "index.cjs"), "module.exports = 0;\n");
+    expectSameDigest(sourceBefore, treeDigest(source.cwd));
+  });
+
+  it("验收依赖缺失明确诊断，不执行源项目验收", { timeout: T }, () => {
+    const { root: source } = makeEnv();
+    fs.writeFileSync(path.join(source.cwd, "package.json"), JSON.stringify({ dependencies: { "missing-corpus-dependency": "1.0.0" } }));
+    gitCommitAll(source.cwd, "corpus manifest");
+    acceptanceSet(source, "node must-run-only-in-copy.cjs");
+    const before = treeDigest(source.cwd);
+    expect(() => copyProjectDocsWithGit(source.root, mkTmp())).toThrow(/语料验收依赖缺失：missing-corpus-dependency/);
+    expectSameDigest(before, treeDigest(source.cwd));
+  });
+
+  it("复制前拒绝越界、链接与非 mkTmp 目标", () => {
+    const base = mkTmp();
+    const outside = mkTmp();
+    fs.writeFileSync(path.join(outside, "sentinel.txt"), "unchanged\n");
+    const before = treeDigest(outside);
+    expect(() => checkedCorpusPath(base, path.join("..", path.basename(outside), "sentinel.txt"))).toThrow(/越界/);
+    const link = path.join(base, "linked");
+    fs.symlinkSync(outside, link, process.platform === "win32" ? "junction" : "dir");
+    expect(() => checkedCorpusPath(base, path.join(link, "sentinel.txt"))).toThrow(/链接/);
+    expect(() => copyCorpusEntry(link, path.join(base, "copied"), base)).toThrow(/链接/);
+    expect(() => copyProjectDocsWithGit(outside, path.join(base, "unowned"))).toThrow(/不属于 mkTmp/);
+    expectSameDigest(before, treeDigest(outside));
+  });
+});
 
 /**
  * `.meta` 历史持久化文件的字节摘要：`versions/*.yaml`、`changes/*.yaml`、
@@ -2954,9 +3271,10 @@ function takeoverDocs(rootId: string, fsdRootId: string): {
   };
 }
 
+// 此组验证历史读取与版本生命周期；完整安装、生成与回执闭环由 system-contracts 负责。
 describe("接管 Python 仓库", () => {
   const corpus = corpusProjectDocs();
-  if (corpus.existing.length === 0) {
+  if (corpus.configured.length === 0) {
     // 语料缺席时显式登记一条 skip 用例：describe 内零用例会让 vitest 把整个
     // suite 判为失败（No test found in suite），而规格要求「skip 并打印原因」。
     it.skip(
@@ -2966,8 +3284,13 @@ describe("接管 Python 仓库", () => {
       `接管用例 skip：AIT_CORPUS_DIRS 未指向任何含 docs/ 与 .meta/ 的 project-docs 目录；` +
         `配置值 = ${JSON.stringify(corpus.configured)}`,
     );
-  } else {
+  } else if (corpus.existing.length > 0) {
     console.info(`接管用例启用：${corpus.existing.join(", ")}`);
+  }
+  for (const missing of corpus.missing) {
+    it(`已配置语料必须可用（${missing}）`, () => {
+      throw new Error(`AIT_CORPUS_DIRS 已配置的语料不存在或缺少 docs/.meta，不能跳过：${missing}`);
+    });
   }
 
   // ── :TEST 7 — 历史版本只读可用 ──
