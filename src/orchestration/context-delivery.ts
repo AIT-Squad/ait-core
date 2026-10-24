@@ -1,9 +1,10 @@
-/** [TDD]-context_delivery — 仓外完整上下文交付与可核验指针。 */
+/** [TDD]-context_delivery — 完整内存上下文与仓外文件交付。 */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { NextAction } from "../doc-model/schemas.js";
+import type { DeliveryPointer, MemoryDelivery } from "../api/types.js";
+import { reportProgress, type ProgressStage } from "../foundation/progress.js";
 import type { ProjectRoot } from "../foundation/root.js";
 import {
   codegenPrepare,
@@ -11,18 +12,13 @@ import {
   type ContextRole,
 } from "../new-model/codegen.js";
 import { issueGenerationToken } from "./generation-receipts.js";
-import { buildNextAction } from "./next-action.js";
 
-export interface DeliveryPointer {
-  bundle_path: string;
-  sha256: string;
-  bytes: number;
-  version: string | null;
-  target_file: string;
-  tdd_root: string;
-  source_file: string;
-  generation_token: string;
-  next_action: NextAction;
+export type { DeliveryMetadata, DeliveryPointer, MemoryDelivery } from "../api/types.js";
+
+interface DeliveryOptions {
+  tddRoot: string;
+  version?: string | null;
+  output?: "memory" | "file";
 }
 
 class DeliveryError extends Error {
@@ -42,6 +38,18 @@ const ROLES: readonly ContextRole[] = [
   "目标文件现状",
 ];
 
+function deliveryStage<T>(stage: ProgressStage, work: () => T): T {
+  reportProgress(stage, "started");
+  try {
+    const result = work();
+    reportProgress(stage, "completed");
+    return result;
+  } catch (error) {
+    reportProgress(stage, "failed");
+    throw error;
+  }
+}
+
 function assertOutsideProject(project: string, directory: string): void {
   const relative = path.relative(project, directory);
   if (relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))) {
@@ -57,7 +65,6 @@ function renderBundle(root: ProjectRoot, bundle: CodegenBundle): string {
     `tdd_root: ${JSON.stringify(bundle.tddRoot)}\n`,
     `source_file: ${JSON.stringify(bundle.sourceFile)}\n`,
     `target_state: ${bundle.targetState}\n\n`,
-    "仅修改 target_file；按下列章节顺序确定权威，完整保留并阅读各来源正文。\n",
   ];
   const items = [...bundle.upstream, ...bundle.dependencies];
   for (const [index, role] of ROLES.entries()) {
@@ -87,10 +94,10 @@ function renderBundle(root: ProjectRoot, bundle: CodegenBundle): string {
         parts.push(bundle.targetContent!, "\n");
         break;
       case "absent":
-        parts.push("（无）目标文件尚不存在，按规格新建。\n");
+        parts.push("（无）目标文件尚不存在。\n");
         break;
       case "unreadable":
-        parts.push("目标文件存在但读取失败（unreadable）。停止生成并报告读取错误；先解决读取问题并重新交付上下文，不得以空内容覆盖。\n");
+        parts.push("目标文件存在但读取失败（unreadable）。\n");
         break;
     }
   }
@@ -99,66 +106,80 @@ function renderBundle(root: ProjectRoot, bundle: CodegenBundle): string {
 
 export function prepareDelivery(
   root: ProjectRoot,
-  opts: { tddRoot: string; version?: string | null },
-): DeliveryPointer {
+  opts: DeliveryOptions & { output: "file" },
+): DeliveryPointer;
+export function prepareDelivery(
+  root: ProjectRoot,
+  opts: DeliveryOptions & { output?: "memory" },
+): MemoryDelivery;
+export function prepareDelivery(
+  root: ProjectRoot,
+  opts: DeliveryOptions,
+): MemoryDelivery | DeliveryPointer;
+export function prepareDelivery(
+  root: ProjectRoot,
+  opts: DeliveryOptions,
+): MemoryDelivery | DeliveryPointer {
   // 版本与来源门禁先于任何交付目录、文件或令牌写入。
-  const bundle = codegenPrepare(root, opts.version ?? null, opts.tddRoot);
-  const content = Buffer.from(renderBundle(root, bundle), "utf8");
-  const temporaryRoot = path.resolve(os.tmpdir());
-  assertOutsideProject(path.resolve(root.cwd), temporaryRoot);
-  const realProject = fs.realpathSync(root.cwd);
-  assertOutsideProject(realProject, fs.realpathSync(temporaryRoot));
+  const { bundle, content, bytes, metadata } = deliveryStage("assemble", () => {
+    const bundle = codegenPrepare(root, opts.version ?? null, opts.tddRoot);
+    const content = renderBundle(root, bundle);
+    const bytes = Buffer.from(content, "utf8");
+    return {
+      bundle,
+      content,
+      bytes,
+      metadata: {
+        sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+        bytes: bytes.length,
+        version: bundle.version,
+        target_file: bundle.targetFile,
+        tdd_root: bundle.tddRoot,
+        source_file: bundle.sourceFile,
+      },
+    };
+  });
 
   let createdDirectory: string | undefined;
   try {
-    createdDirectory = fs.mkdtempSync(path.join(temporaryRoot, "ait-codegen-"));
-    assertOutsideProject(path.resolve(root.cwd), path.resolve(createdDirectory));
-    const realDirectory = fs.realpathSync(createdDirectory);
-    assertOutsideProject(realProject, realDirectory);
-    const bundlePath = path.join(realDirectory, "bundle.md");
-    fs.writeFileSync(bundlePath, content, { flag: "wx", mode: 0o600 });
-    const stored = fs.readFileSync(bundlePath);
-    if (!stored.equals(content)) {
-      throw new DeliveryError("DELIVERY_CONTENT_MISMATCH", "上下文交付文件的实际字节与完整组装结果不一致");
+    let bundlePath: string | undefined;
+    if (opts.output === "file") {
+      bundlePath = deliveryStage("write_bundle", () => {
+        const temporaryRoot = path.resolve(os.tmpdir());
+        assertOutsideProject(path.resolve(root.cwd), temporaryRoot);
+        const realProject = fs.realpathSync(root.cwd);
+        assertOutsideProject(realProject, fs.realpathSync(temporaryRoot));
+        createdDirectory = fs.mkdtempSync(path.join(temporaryRoot, "ait-codegen-"));
+        assertOutsideProject(path.resolve(root.cwd), path.resolve(createdDirectory));
+        const realDirectory = fs.realpathSync(createdDirectory);
+        assertOutsideProject(realProject, realDirectory);
+        const destination = path.join(realDirectory, "bundle.md");
+        fs.writeFileSync(destination, bytes, { flag: "wx", mode: 0o600 });
+        const stored = fs.readFileSync(destination);
+        if (!stored.equals(bytes)) {
+          throw new DeliveryError("DELIVERY_CONTENT_MISMATCH", "上下文交付文件的实际字节与完整组装结果不一致");
+        }
+        return destination;
+      });
     }
-    const pointer = {
-      bundle_path: bundlePath,
-      sha256: crypto.createHash("sha256").update(stored).digest("hex"),
-      bytes: stored.length,
-      version: bundle.version,
-      target_file: bundle.targetFile,
-      tdd_root: bundle.tddRoot,
-      source_file: bundle.sourceFile,
-    };
-    const actionInput = { ...pointer, target_state: bundle.targetState };
-    // 纯函数预检在发布令牌之前完成；签发函数保证返回非空令牌。
-    const checkedAction = buildNextAction("codegen prepare", {
-      ...actionInput,
-      generation_token: "pending-generation-token",
-    });
-    if (checkedAction?.type !== "continue") {
-      throw new DeliveryError("DELIVERY_ACTION_INVALID", "上下文交付缺少可构造接续动作的完整信息");
-    }
-    const generationToken = issueGenerationToken(root, {
-      version: pointer.version,
-      tdd_root: pointer.tdd_root,
-      target_file: pointer.target_file,
-      bundle_path: pointer.bundle_path,
-      bundle_sha256: pointer.sha256,
-      bytes: pointer.bytes,
-    });
+
+    const generationToken = deliveryStage("register_delivery", () => issueGenerationToken(root, {
+      version: metadata.version,
+      tdd_root: metadata.tdd_root,
+      target_file: metadata.target_file,
+      content,
+      bundle_sha256: metadata.sha256,
+      bytes: metadata.bytes,
+    }));
     // 此后仅用已验证的同一输入与签发结果构造返回值，不再访问磁盘。
-    const nextAction = buildNextAction("codegen prepare", {
-      ...actionInput,
-      generation_token: generationToken,
-    }) as Extract<NextAction, { type: "continue" }>;
+    if (bundlePath !== undefined) {
+      return { ...metadata, generation_token: generationToken, bundle_path: bundlePath };
+    }
     return {
-      ...pointer,
+      ...metadata,
       generation_token: generationToken,
-      next_action: {
-        ...nextAction,
-        instruction: `${nextAction.instruction}\n执行规格要求的相关测试，测试通过后登记生成回执。`,
-      },
+      content,
+      target_state: bundle.targetState,
     };
   } catch (error) {
     if (createdDirectory !== undefined) {

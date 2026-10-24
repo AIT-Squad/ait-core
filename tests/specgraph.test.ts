@@ -22,8 +22,11 @@ import {
   SpecGraphStore,
   SpecGraphError,
   combinedView,
+  type EdgeRel,
   type SpecGraphErrorCode,
+  type ViewEdge,
 } from "../src/specgraph/graph-model.js";
+import type { Direction } from "../src/api/types.js";
 import type { Spec, SpecGraph } from "../src/doc-model/schemas.js";
 import {
   queryDeps,
@@ -1275,7 +1278,7 @@ describe("save", () => {
 // ---------------------------------------------------------------------------
 
 describe("queries", () => {
-  it("三向单跳（from/to/both）分别返回邻接边，默认 both", () => {
+  it("三向单跳（in/out/both）分别返回邻接边，默认 both", () => {
     const root = makeRoot();
     writeDocs(root, ALPHA_TREE);
     reindexBaseline(root);
@@ -1287,26 +1290,26 @@ describe("queries", () => {
     const view = combinedView(root);
     const target = "[FSD]-alpha:beta";
 
-    const from = queryDeps(view, target, "from");
-    expect(from.found).toBe(true);
-    expect(from.target).toBe(target);
-    expect(from.direction).toBe("from");
-    expect(from.edges).toHaveLength(1);
-    expect(from.edges[0]).toMatchObject({
+    const outgoing = queryDeps(view, target, "out");
+    expect(outgoing.found).toBe(true);
+    expect(outgoing.target).toBe(target);
+    expect(outgoing.direction).toBe("out");
+    expect(outgoing.edges).toHaveLength(1);
+    expect(outgoing.edges[0]).toMatchObject({
       src: target,
       dst: "[FSD]-alpha-beta",
       rel: "decomposes",
     });
 
-    // to：id 结构通道不在单跳里（只沿已存边），显式建反向边
+    // in：id 结构通道不在单跳里（只沿已存边），显式建反向边
     store.addEdge("baseline", "[FSD]-alpha", target, "decomposes", "manual");
     const view2 = combinedView(root);
 
-    const to = queryDeps(view2, target, "to");
-    expect(to.found).toBe(true);
-    expect(to.direction).toBe("to");
-    expect(to.edges).toHaveLength(1);
-    expect(to.edges[0]).toMatchObject({
+    const incoming = queryDeps(view2, target, "in");
+    expect(incoming.found).toBe(true);
+    expect(incoming.direction).toBe("in");
+    expect(incoming.edges).toHaveLength(1);
+    expect(incoming.edges[0]).toMatchObject({
       src: "[FSD]-alpha",
       dst: target,
       rel: "decomposes",
@@ -1314,12 +1317,198 @@ describe("queries", () => {
 
     const both = queryDeps(view2, target, "both");
     expect(both.found).toBe(true);
+    expect(both.direction).toBe("both");
     expect(both.edges).toHaveLength(2);
 
     // 默认 direction 为 both
     const dflt = queryDeps(view2, target);
-    expect(dflt.direction).toBe("both");
-    expect(dflt.edges).toHaveLength(2);
+    expect(dflt).toEqual(both);
+  });
+
+  const relations: EdgeRel[] = ["derives", "decomposes", "details", "depends_on"];
+  const directions: Direction[] = ["in", "out", "both"];
+
+  /** 直接读取存量边；查询不承担新模型关系合法性校验或关系迁移。 */
+  function relationFixture() {
+    const root = makeRoot();
+    const docs = { ...ALPHA_TREE, ...ISOLATED_TDD_PAIR };
+    writeDocs(root, docs);
+    reindexBaseline(root);
+    const store = new SpecGraphStore(root);
+    const graph = store.sync();
+    const target = "[FSD]-alpha:beta";
+    const incoming: ViewEdge[] = relations.map((rel) => ({
+      src: "[PRD]-alpha", dst: target, rel, metadata: { source: "manual", note: `入边 ${rel}` },
+    }));
+    const outgoing: ViewEdge[] = relations.map((rel) => ({
+      src: target, dst: "[TDD]-gamma", rel, metadata: { source: "manual", note: `出边 ${rel}` },
+    }));
+    const legacyIncoming: ViewEdge = {
+      src: "[TDD]-m", dst: target, rel: "implements", metadata: { source: "manual", historical: true },
+    };
+    const legacyOutgoing: ViewEdge = {
+      src: target, dst: "[TDD]-n", rel: "implements", metadata: { source: "manual", historical: true },
+    };
+    const edges: ViewEdge[] = [
+      ...incoming, ...outgoing, legacyIncoming, legacyOutgoing,
+      // 第二跳与不相邻边不得出现在任何关系过滤结果中。
+      { src: "[TDD]-gamma", dst: "[TDD]-m", rel: "details", metadata: { source: "manual" } },
+      { src: "[TDD]-m", dst: "[TDD]-n", rel: "depends_on", metadata: { source: "manual" } },
+    ];
+    store.save("baseline", {
+      ...graph,
+      edges: edges.map((edge) => ({
+        ...edge,
+        src: nodeById(graph, edge.src)!.uri,
+        dst: nodeById(graph, edge.dst)!.uri,
+        weight: 1,
+      })),
+    });
+    const files = fs.readdirSync(root.meta).sort();
+    const before = snapshotFiles([
+      ...files.map((file) => path.join(root.meta, file)),
+      ...Object.keys(docs).map((file) => path.join(root.docs, file)),
+    ]);
+    return {
+      root, target, incoming, outgoing, legacyIncoming, legacyOutgoing,
+      view: combinedView(root),
+      expectUnchanged() {
+        expectFilesUnchanged(before);
+        expect(fs.readdirSync(root.meta).sort()).toEqual(files);
+      },
+    };
+  }
+
+  it.each(relations)("单关系 %s 与 in/out/both 相交，关系选择不改变默认 both", (rel) => {
+    const fixture = relationFixture();
+    const { view, target, incoming, outgoing } = fixture;
+    const expectedIncoming = incoming.filter((edge) => edge.rel === rel);
+    const expectedOutgoing = outgoing.filter((edge) => edge.rel === rel);
+    const both = queryDeps(view, target, undefined, [rel]);
+    expect(both).toEqual({
+      found: true, target, direction: "both",
+      edges: expect.arrayContaining([...expectedIncoming, ...expectedOutgoing]),
+    });
+    expect(both.edges).toHaveLength(2);
+    expect(queryDeps(view, target, "both", [rel])).toEqual(both);
+    expect(queryDeps(view, target, "in", [rel])).toEqual({
+      found: true, target, direction: "in", edges: expectedIncoming,
+    });
+    expect(queryDeps(view, target, "out", [rel])).toEqual({
+      found: true, target, direction: "out", edges: expectedOutgoing,
+    });
+    fixture.expectUnchanged();
+  });
+
+  it.each(directions)("多关系并集再与 %s 相交，不递归、不同关系同端点不合并", (direction) => {
+    const fixture = relationFixture();
+    const { view, target, incoming, outgoing } = fixture;
+    const selected: EdgeRel[] = ["details", "depends_on"];
+    const expected = [
+      ...(direction === "out" ? [] : incoming),
+      ...(direction === "in" ? [] : outgoing),
+    ].filter((edge) => selected.includes(edge.rel as EdgeRel));
+    const result = queryDeps(view, target, direction, selected);
+    expect(result).toEqual({ found: true, target, direction, edges: expect.arrayContaining(expected) });
+    expect(result.edges).toHaveLength(expected.length);
+    expect(triplesOf(result.edges)).toEqual(triplesOf(expected));
+    // 重复关系既不增加边，也不改变查询顺序或调用方参数。
+    const repeated: EdgeRel[] = ["details", "depends_on", "details", "depends_on"];
+    const original = [...repeated];
+    expect(queryDeps(view, target, direction, repeated)).toEqual(result);
+    expect(repeated).toEqual(original);
+    fixture.expectUnchanged();
+  });
+
+  it.each(directions)("%s 的缺省关系保留历史边，全选四关系排除历史边，空数组只清空结果", (direction) => {
+    const fixture = relationFixture();
+    const { view, target, incoming, outgoing, legacyIncoming, legacyOutgoing } = fixture;
+    const selected = [
+      ...(direction === "out" ? [] : incoming),
+      ...(direction === "in" ? [] : outgoing),
+    ];
+    const all = [
+      ...selected,
+      ...(direction === "out" ? [] : [legacyIncoming]),
+      ...(direction === "in" ? [] : [legacyOutgoing]),
+    ];
+    const unfiltered = queryDeps(view, target, direction);
+    expect(unfiltered).toEqual({ found: true, target, direction, edges: expect.arrayContaining(all) });
+    expect(unfiltered.edges).toHaveLength(all.length);
+    expect(queryDeps(view, target, direction, undefined)).toEqual(unfiltered);
+    const filtered = queryDeps(view, target, direction, relations);
+    expect(filtered.edges).toHaveLength(selected.length);
+    expect(triplesOf(filtered.edges)).toEqual(triplesOf(selected));
+    expect(queryDeps(view, target, direction, [])).toEqual({ found: true, target, direction, edges: [] });
+    // 空过滤不修改视图；随后不过滤仍取得同一组边及原 metadata。
+    expect(queryDeps(view, target, direction)).toEqual(unfiltered);
+    fixture.expectUnchanged();
+  });
+
+  it("自环经 both 的出入两路只返回一次，重复 rels 不增殖", () => {
+    const root = makeRoot();
+    writeDocs(root, ISOLATED_TDD_PAIR);
+    reindexBaseline(root);
+    const store = new SpecGraphStore(root);
+    store.sync();
+    const target = "[TDD]-m";
+    store.addEdge("baseline", target, target, "depends_on", "manual");
+    const before = snapshotFiles([graphPathOf(root), path.join(root.meta, "chunks-index.yaml")]);
+    const view = combinedView(root);
+    for (const direction of directions) {
+      const expected = {
+        found: true, target, direction,
+        edges: [{ src: target, dst: target, rel: "depends_on", metadata: { source: "manual" } }],
+      };
+      expect(queryDeps(view, target, direction)).toEqual(expected);
+      expect(queryDeps(view, target, direction, ["depends_on", "depends_on"])).toEqual(expected);
+    }
+    expectFilesUnchanged(before);
+  });
+
+  it.each(["from", "to", "IN", "", null, 42])("非法方向 %j 明确拒绝 USAGE_ERROR，已有或未知目标均零写入", (direction) => {
+    const fixture = relationFixture();
+    for (const target of [fixture.target, "[TDD]-nope"]) {
+      expect(() => queryDeps(fixture.view, target, direction as Direction)).toThrowError(
+        expect.objectContaining({ code: "USAGE_ERROR", message: expect.stringContaining("direction") }),
+      );
+    }
+    fixture.expectUnchanged();
+  });
+
+  it.each([
+    { label: "历史关系只能读、不能作为筛选值", rels: ["implements"] },
+    { label: "未知关系不能被忽略", rels: ["details", "unknown"] },
+    { label: "CLI 拼写不是领域关系名", rels: ["depends-on"] },
+    { label: "关系须为字符串", rels: [42] },
+    { label: "关系项不能为 null", rels: [null] },
+    { label: "关系项不能缺失", rels: new Array(1) },
+    { label: "关系须为数组", rels: "details" },
+    { label: "null 不等于缺省", rels: null },
+    { label: "对象不是关系数组", rels: { details: true } },
+  ])("$label：USAGE_ERROR 且零写入", ({ rels }) => {
+    const fixture = relationFixture();
+    for (const target of [fixture.target, "[TDD]-nope"]) {
+      expect(() => queryDeps(fixture.view, target, "both", rels as EdgeRel[])).toThrowError(
+        expect.objectContaining({ code: "USAGE_ERROR", message: expect.stringContaining("rels") }),
+      );
+    }
+    fixture.expectUnchanged();
+  });
+
+  it.each(directions)("%s 查询未知或孤立目标时保留 found 区别及方向，不推导结构边", (direction) => {
+    const fixture = relationFixture();
+    const { view } = fixture;
+    for (const rels of [undefined, [], ["details"]] as Array<EdgeRel[] | undefined>) {
+      expect(queryDeps(view, "[TDD]-nope", direction, rels)).toEqual({
+        found: false, target: "[TDD]-nope", direction, edges: [],
+      });
+      // 根存在带冒号的子 split，但无存储边；邻接查询不生成结构边。
+      expect(queryDeps(view, "[FSD]-alpha", direction, rels)).toEqual({
+        found: true, target: "[FSD]-alpha", direction, edges: [],
+      });
+    }
+    fixture.expectUnchanged();
   });
 
   it("不存在目标返回 found=false（不抛错）", () => {
@@ -1655,11 +1844,14 @@ describe("真实语料", () => {
 
       // deps / impact 对若干 chunk 成功（不抛错；found 与视图节点齐平）
       const ids = [...view.nodes.keys()];
-      for (const dir of ["from", "to", "both"] as const) {
+      for (const dir of ["in", "out", "both"] as const) {
         for (const id of ids.slice(0, 10)) {
           const res = queryDeps(view, id, dir);
           expect(res.found).toBe(true);
+          expect(res.direction).toBe(dir);
           expect(res.edges.every((e) => e.src === id || e.dst === id)).toBe(true);
+          if (dir === "in") expect(res.edges.every((e) => e.dst === id)).toBe(true);
+          if (dir === "out") expect(res.edges.every((e) => e.src === id)).toBe(true);
         }
       }
       for (const id of ids.slice(0, 10)) {

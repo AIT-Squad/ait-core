@@ -1,28 +1,36 @@
 /**
- * [TDD]-cli_dispatcher — cli 域命令分发器：argv 解析、命令表路由、CoreResult
- * 信封、双入口（dispatch 库函数 + runCli bin 薄壳）。
+ * [TDD]-cli_dispatcher — argv 解析、公共 API 适配与 CLI 输出。
  *
- * 边界（反向要求）：本文件只做解析/路由/封装，不含任何业务规则；各域按命令
- * 动态 import 并惰性构造（import 本模块零副作用、零 IO）；不吞异常——域抛
- * 带 code 的错误原样透传 {ok:false,error,code}，无 code 异常统一包装
- * {ok:false,error:message,code:"INTERNAL_ERROR"} 并保留原始 message。
+ * 业务只调用 createCoreApi 的分组接口；正文文件读取是输入转换。
+ * dispatch 返回事实信封及可选展示描述，runCli 序列化并返回退出码，不终止宿主。
  */
 
 import fs from "node:fs";
-import path from "node:path";
-import { resolveProjectRoot, type ProjectRoot } from "../foundation/root.js";
-import type { CoreResult, NextAction } from "../doc-model/schemas.js";
-import type { CreateOpts, DocLayer } from "../new-model/model-manager.js";
+import { stringify } from "yaml";
+import { createCoreApi } from "../api/core.js";
+import type {
+  ApiResult,
+  CliDispatchResult,
+  CliPresentation,
+  CoreApi,
+  CoreApiOptions,
+  CoreResult,
+  Direction,
+  DocumentInput,
+  EdgeRel,
+  GraphQueryInput,
+} from "../api/types.js";
 
 // ---------------------------------------------------------------------------
 // 内部类型与辅助（不导出）
 // ---------------------------------------------------------------------------
 
 type FlagKind = "value" | "boolean";
+type DocLayer = "prd" | "fsd" | "tdd";
+type DocumentOptions = Omit<DocumentInput, "id">;
 
 interface CommandContext {
-  /** 项目根（needsRoot 命令已惰性解析；init 豁免，为 null）。 */
-  root: ProjectRoot | null;
+  core: CoreApi;
   /** 位置参数（个数已在 parseArgs 按命令规格校验）。 */
   args: string[];
   flags: Record<string, string | boolean>;
@@ -32,11 +40,11 @@ interface CommandSpec {
   positionals: readonly string[];
   flags: Record<string, FlagKind>;
   enums?: Record<string, readonly string[]>;
-  /** init 豁免项目根解析（白板入口），其余命令一律惰性解析。 */
-  needsRoot: boolean;
-  /** 解析层校验（先于项目根解析与一切域调用）：抛 UsageError → USAGE_ERROR 零副作用。 */
+  requiredFlags?: readonly string[];
+  /** 解析及正文输入转换先于 API 调用；不在这里解析项目或选择版本。 */
   validate?(args: string[], flags: Record<string, string | boolean>): void;
-  run(ctx: CommandContext): Promise<Record<string, unknown>>;
+  presentation?(flags: Record<string, string | boolean>): CliPresentation;
+  run(ctx: CommandContext): Promise<ApiResult<object>>;
 }
 
 /** 用法错误：解析/匹配阶段抛出，dispatch 统一转 USAGE_ERROR，不进业务逻辑。 */
@@ -49,11 +57,6 @@ class UsageError extends Error {
 
 function usageError(message: string): CoreResult {
   return { ok: false, error: message, code: "USAGE_ERROR" };
-}
-
-/** 域返回对象进入统一信封组装，已有 next_action 保留。 */
-function asData(value: unknown): Record<string, unknown> {
-  return value as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +75,7 @@ function parseArgs(
     if (tok.startsWith("--")) {
       const eq = tok.indexOf("=");
       const name = eq === -1 ? tok.slice(2) : tok.slice(2, eq);
-      const kind = spec.flags[name];
+      const kind = Object.hasOwn(spec.flags, name) ? spec.flags[name] : undefined;
       if (kind === undefined) {
         throw new UsageError(`未知 flag：--${name}`);
       }
@@ -92,7 +95,8 @@ function parseArgs(
           }
           value = tokens[i]!;
         }
-        if (value.length === 0) {
+        // 显式空正文仍是写入请求，由 API 校验正文；其它 flag 不接受空值。
+        if (value.length === 0 && name !== "content") {
           throw new UsageError(`缺参数：flag --${name} 参数值为空`);
         }
         flags[name] = value;
@@ -120,11 +124,16 @@ function parseArgs(
       );
     }
   }
+  for (const name of spec.requiredFlags ?? []) {
+    if (flags[name] === undefined) {
+      throw new UsageError(`缺参数：--${name}`);
+    }
+  }
   return { positionals, flags };
 }
 
 // ---------------------------------------------------------------------------
-// COMMANDS：一张命令→域调用的映射表（精确匹配；未匹配 → USAGE_ERROR）
+// COMMANDS：命令直接映射公共 API（精确匹配；未匹配 → USAGE_ERROR）
 // ---------------------------------------------------------------------------
 
 const CREATE_FLAGS: Record<string, FlagKind> = {
@@ -149,10 +158,10 @@ const DECOMPOSE_FLAGS: Record<string, FlagKind> = {
 };
 
 const ACTION_ENUM = { action: ["add", "modify"] as const };
-const DIRECTION_ENUM = { direction: ["from", "to", "both"] as const };
+const DIRECTION_ENUM = { direction: ["in", "out", "both"] as const };
 
-function createOptsFrom(flags: Record<string, string | boolean>): CreateOpts {
-  const opts: CreateOpts = {};
+function createOptsFrom(flags: Record<string, string | boolean>): DocumentOptions {
+  const opts: DocumentOptions = {};
   if (typeof flags.parent === "string") opts.parent = flags.parent;
   if (typeof flags.content === "string") opts.content = flags.content;
   if (typeof flags.action === "string") {
@@ -193,26 +202,14 @@ function assertContentSourceExclusive(
   }
 }
 
-/** create/decompose 的参数装配：互斥与文件读取先于域调用。 */
-function createOptsFor(
+/** 每次调用只读取一次正文，结果保存在本次解析的 flags 中供 API 输入装配。 */
+function resolveContentSource(
   flags: Record<string, string | boolean>,
-): CreateOpts {
+): void {
   assertContentSourceExclusive(flags);
-  const opts = createOptsFrom(flags);
   const file = flags["content-file"];
   if (typeof file === "string") {
-    opts.content = readContentFileOrThrow(file);
-  }
-  return opts;
-}
-
-/** 正则检索预校验：与检索域一致的 `i` 标志；非法 → USAGE_ERROR（零副作用）。 */
-function compileRegexpOrThrow(pattern: string): void {
-  try {
-    new RegExp(pattern, "i");
-  } catch (err) {
-    const reason = err instanceof Error ? err.message : String(err);
-    throw new UsageError(`参数非法：--regexp 正则非法（${pattern}）：${reason}`);
+    flags.content = readContentFileOrThrow(file);
   }
 }
 
@@ -221,21 +218,11 @@ function docCreate(layer: DocLayer): CommandSpec {
     positionals: ["id"],
     flags: CREATE_FLAGS,
     enums: ACTION_ENUM,
-    needsRoot: true,
-    // 正文来源检查先于项目根解析：互斥/不可读一律 USAGE_ERROR 零落盘。
     validate: (_args, flags) => {
-      createOptsFor(flags);
+      resolveContentSource(flags);
     },
-    run: async ({ root, args, flags }) => {
-      const { NewModelManager } = await import("../new-model/model-manager.js");
-      return asData(
-        await new NewModelManager(root!).createDocument(
-          layer,
-          args[0]!,
-          createOptsFor(flags),
-        ),
-      );
-    },
+    // parent 保持原样送入；PRD 不支持父锚点，由公共 API 返回 USAGE_ERROR。
+    run: ({ core, args, flags }) => core[layer].create({ id: args[0]!, ...createOptsFrom(flags) }),
   };
 }
 
@@ -243,11 +230,7 @@ function docConfirm(layer: DocLayer): CommandSpec {
   return {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { NewModelManager } = await import("../new-model/model-manager.js");
-      return asData(new NewModelManager(root!).confirmLayer(layer));
-    },
+    run: ({ core }) => core[layer].confirm(),
   };
 }
 
@@ -255,34 +238,46 @@ function docRevert(layer: DocLayer): CommandSpec {
   return {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { NewModelManager } = await import("../new-model/model-manager.js");
-      return asData(new NewModelManager(root!).revertLayer(layer));
-    },
+    run: ({ core }) => core[layer].revert(),
   };
 }
 
-/** deps 与 specgraph query 同构：组合视图上的邻边查询。 */
-function depsLike(): CommandSpec {
+/** 两种命令共用图查询，只有 specgraph query 暴露关系与版本选项。 */
+function depsLike(withFilters = false): CommandSpec {
   return {
     positionals: ["target"],
-    flags: { direction: "value" },
+    flags: {
+      direction: "value",
+      ...(withFilters ? {
+        derives: "boolean",
+        decomposes: "boolean",
+        details: "boolean",
+        "depends-on": "boolean",
+        version: "value",
+      } as const : {}),
+    },
     enums: DIRECTION_ENUM,
-    needsRoot: true,
-    run: async ({ root, args, flags }) => {
-      const { combinedView } = await import("../specgraph/graph-model.js");
-      const { queryDeps } = await import("../specgraph/queries.js");
-      const direction = typeof flags.direction === "string"
-        ? (flags.direction as "from" | "to" | "both")
-        : "both";
-      return asData(queryDeps(combinedView(root!), args[0]!, direction));
+    run: ({ core, args, flags }) => {
+      const input: GraphQueryInput = {
+        target: args[0]!,
+        direction: typeof flags.direction === "string" ? flags.direction as Direction : "both",
+      };
+      if (withFilters) {
+        const rels: EdgeRel[] = [];
+        if (flags.derives === true) rels.push("derives");
+        if (flags.decomposes === true) rels.push("decomposes");
+        if (flags.details === true) rels.push("details");
+        if (flags["depends-on"] === true) rels.push("depends_on");
+        if (rels.length > 0) input.rels = rels;
+        if (typeof flags.version === "string") input.version = flags.version;
+      }
+      return core.graph.query(input);
     },
   };
 }
 
 const COMMANDS: Record<string, CommandSpec> = {
-  // init 域：白板入口，豁免项目根解析
+  // 项目初始化的分支优先级由公共 API 保持。
   init: {
     positionals: [],
     flags: {
@@ -292,105 +287,52 @@ const COMMANDS: Record<string, CommandSpec> = {
       // 已废弃空操作：仅为使既有调用不因未知参数报 USAGE_ERROR，指定与否行为相同。
       "new-model": "boolean",
     },
-    needsRoot: false,
-    // 分支顺序即优先级：--check（只读）优先于 --refresh-wrapper，同给时零写入。
-    run: async ({ flags }) => {
-      if (flags.check === true) {
-        const { checkProject } = await import("../init/init-manager.js");
-        return asData(checkProject(process.cwd()));
-      }
-      if (flags["refresh-wrapper"] === true) {
-        const { refreshWrapper } = await import("../init/init-manager.js");
-        return asData(refreshWrapper(process.cwd()));
-      }
-      const { initProject } = await import("../init/init-manager.js");
-      const name = flags.name;
-      return asData(
-        initProject(process.cwd(), typeof name === "string" ? { name } : { name: "" }),
-      );
-    },
+    run: ({ core, flags }) => core.project.init({
+      ...(typeof flags.name === "string" ? { name: flags.name } : {}),
+      ...(flags.check === true ? { check: true } : {}),
+      ...(flags["refresh-wrapper"] === true ? { refreshWrapper: true } : {}),
+    }),
   },
 
   // versioning 域：version_manager / merge_engine / publish 三 split
   "version create": {
     positionals: ["id"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(new VersionManager(root!).versionCreate(args[0]!));
-    },
+    run: ({ core, args }) => core.version.create({ version: args[0]! }),
   },
   "version commit": {
     positionals: ["id"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(new VersionManager(root!).versionCommit(args[0]!));
-    },
+    run: ({ core, args }) => core.version.commit({ version: args[0]! }),
   },
   "version status": {
     positionals: ["id"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(new VersionManager(root!).versionStatus(args[0]!));
-    },
+    run: ({ core, args }) => core.version.status({ version: args[0]! }),
   },
   "version confirm": {
     positionals: ["id"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(await new VersionManager(root!).versionConfirm(args[0]!));
-    },
+    run: ({ core, args }) => core.version.confirm({ version: args[0]! }),
   },
   "version merge": {
     positionals: ["id"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { versionMerge } = await import("../versioning/merge-engine.js");
-      return asData(await versionMerge(root!, args[0]!));
-    },
+    run: ({ core, args }) => core.version.merge({ version: args[0]! }),
   },
   "version revert": {
     positionals: ["id"],
     flags: { confirm: "boolean" },
-    needsRoot: true,
-    run: async ({ root, args, flags }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(
-        await new VersionManager(root!).versionRevert(args[0]!, {
-          confirm: flags.confirm === true,
-        }),
-      );
-    },
+    run: ({ core, args, flags }) => core.version.revert({
+      version: args[0]!,
+      confirm: flags.confirm === true,
+    }),
   },
   // 幂等补齐已合入版本的 `ait/<v>` 锚点标签；无参数（遍历全部已合入版本）。
   "version backfill-tags": {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { VersionManager } = await import(
-        "../versioning/version-manager.js"
-      );
-      return asData(new VersionManager(root!).backfillRevertTags());
-    },
+    run: ({ core }) => core.version.backfillTags(),
   },
 
   // new_model 域：三层 create/confirm/revert 与 fsd decompose、codegen prepare
@@ -407,32 +349,37 @@ const COMMANDS: Record<string, CommandSpec> = {
     positionals: ["parentSplit", "childRootId"],
     flags: DECOMPOSE_FLAGS,
     enums: ACTION_ENUM,
-    needsRoot: true,
     validate: (_args, flags) => {
-      createOptsFor(flags);
+      resolveContentSource(flags);
     },
-    run: async ({ root, args, flags }) => {
-      const { NewModelManager } = await import("../new-model/model-manager.js");
-      return asData(
-        await new NewModelManager(root!).decompose(
-          args[0]!,
-          args[1]!,
-          createOptsFor(flags),
-        ),
-      );
-    },
+    run: ({ core, args, flags }) => core.fsd.decompose({
+      parentSplit: args[0]!,
+      childRootId: args[1]!,
+      ...createOptsFrom(flags),
+    }),
   },
   "codegen prepare": {
     positionals: ["tddRootId"],
     flags: { version: "value" },
-    needsRoot: true,
-    run: async ({ root, args, flags }) => {
-      const { prepareDelivery } = await import("../orchestration/context-delivery.js");
-      return asData(prepareDelivery(root!, {
-        tddRoot: args[0]!,
-        ...(typeof flags.version === "string" ? { version: flags.version } : {}),
-      }));
-    },
+    run: ({ core, args, flags }) => core.delivery.prepare({
+      tddRootId: args[0]!,
+      ...(typeof flags.version === "string" ? { version: flags.version } : {}),
+      output: "file",
+    }),
+  },
+  "codegen receipt": {
+    positionals: [],
+    flags: { "generation-token": "value" },
+    requiredFlags: ["generation-token"],
+    run: ({ core, flags }) => core.generation.registerReceipt({
+      generationToken: flags["generation-token"] as string,
+    }),
+  },
+  "codegen verify": {
+    positionals: [],
+    flags: { version: "value" },
+    requiredFlags: ["version"],
+    run: ({ core, flags }) => core.generation.verifyReceipts({ version: flags.version as string }),
   },
 
   // specgraph 域：deps/impact/query/sync/export/validate-new-model
@@ -440,85 +387,28 @@ const COMMANDS: Record<string, CommandSpec> = {
   impact: {
     positionals: ["target"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { combinedView } = await import("../specgraph/graph-model.js");
-      const { analyzeImpact } = await import("../specgraph/queries.js");
-      return asData(analyzeImpact(combinedView(root!), args[0]!));
-    },
+    run: ({ core, args }) => core.graph.impact({ target: args[0]! }),
   },
-  "specgraph query": depsLike(),
+  "specgraph query": depsLike(true),
   "specgraph sync": {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { SpecGraphStore } = await import("../specgraph/graph-model.js");
-      return asData(new SpecGraphStore(root!).sync());
-    },
+    run: ({ core }) => core.graph.sync(),
   },
   "specgraph export": {
     positionals: [],
     flags: { version: "value" },
-    needsRoot: true,
-    run: async ({ root, flags }) => {
-      const { SpecGraphStore } = await import("../specgraph/graph-model.js");
-      const store = new SpecGraphStore(root!);
-      return asData(
-        typeof flags.version === "string"
-          ? store.load(flags.version)
-          : store.load(),
-      );
-    },
+    run: ({ core, flags }) => core.graph.export(
+      typeof flags.version === "string" ? { version: flags.version } : undefined,
+    ),
   },
   // 校验类：违规 → {ok:true,data:{passed:false,violations}}，退出码 0
   "specgraph validate-new-model": {
     positionals: [],
     flags: { version: "value" },
-    needsRoot: true,
-    run: async ({ root, flags }) => {
-      const { combinedView } = await import("../specgraph/graph-model.js");
-      const { validateInvariants } = await import("../new-model/validator.js");
-      const { evaluateGovernance } = await import("../new-model/governance.js");
-      const { IndexManager } = await import("../indexing/index-manager.js");
-      const { VersionMetaSchema } = await import("../doc-model/schemas.js");
-      const { loadModel } = await import("../foundation/yaml.js");
-      const { ensureWithin } = await import("../foundation/io.js");
-      const versions = typeof flags.version === "string"
-        ? [flags.version]
-        : new IndexManager(root!).listVersions();
-      const active = versions.filter((version) => {
-        const metaPath = ensureWithin(path.join(root!.meta, "versions"), `${version}.yaml`);
-        try {
-          const meta = loadModel(metaPath, VersionMetaSchema);
-          return meta.merged_at === null && meta.phase !== "merged";
-        } catch (err) {
-          if ((err as { code?: unknown } | null)?.code === "ENOENT") {
-            throw Object.assign(new Error(`版本元数据不存在：${version}（${metaPath}）`), {
-              code: "VERSION_NOT_FOUND",
-            });
-          }
-          throw err;
-        }
-      });
-      if (active.length > 1) {
-        throw Object.assign(new Error(`存在多个活动版本：${active.join(", ")}`), {
-          code: "ACTIVE_VERSION_CONFLICT",
-        });
-      }
-      const effectiveVersion = active[0];
-      const violations = validateInvariants(combinedView(root!, effectiveVersion));
-      const report = evaluateGovernance(root!, effectiveVersion);
-      return {
-        version: effectiveVersion ?? "baseline",
-        passed: violations.length === 0,
-        violations,
-        policy_violations: report.violations,
-        warnings: report.warnings,
-        target_file_missing: report.target_file_missing,
-        derives_residue: report.derives_residue,
-      };
-    },
+    run: ({ core, flags }) => core.graph.validateNewModel(
+      typeof flags.version === "string" ? { version: flags.version } : undefined,
+    ),
   },
 
   // search 域
@@ -526,247 +416,151 @@ const COMMANDS: Record<string, CommandSpec> = {
     positionals: ["query"],
     flags: { scope: "value", regexp: "boolean" },
     enums: { scope: ["baseline", "all"] as const },
-    needsRoot: true,
-    // 非法正则先于项目根解析与检索 → USAGE_ERROR 零副作用。
-    validate: (args, flags) => {
-      if (flags.regexp === true) {
-        compileRegexpOrThrow(args[0]!);
-      }
-    },
-    run: async ({ root, args, flags }) => {
-      const { searchChunks } = await import("../search/keyword-search.js");
-      const query = args[0]!;
-      const scope = flags.scope;
-      const regexp = flags.regexp === true;
-      const hits = searchChunks(root!, query, {
-        ...(typeof scope === "string"
-          ? { scope: scope as "baseline" | "all" }
-          : {}),
-        ...(regexp ? { regexp: true } : {}),
-      });
-      return { query, count: hits.length, hits };
-    },
+    run: ({ core, args, flags }) => core.search.query({
+      query: args[0]!,
+      ...(typeof flags.scope === "string" ? { scope: flags.scope as "baseline" | "all" } : {}),
+      ...(flags.regexp === true ? { regexp: true } : {}),
+    }),
   },
   "baseline-summary": {
     positionals: [],
-    flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { baselineSummary } = await import(
-        "../search/baseline-summary.js"
-      );
-      return asData(baselineSummary(root!));
-    },
+    flags: { scope: "value", format: "value" },
+    enums: { scope: ["prd", "all"] as const, format: ["yaml", "json"] as const },
+    presentation: (flags) => ({
+      format: typeof flags.format === "string" ? flags.format as "yaml" | "json" : "yaml",
+      projection: "baseline-items",
+    }),
+    run: ({ core, flags }) => flags.scope === "prd"
+      ? core.search.baselineSummary({ scope: "prd" })
+      : core.search.baselineSummary(),
   },
 
-  // 状态域（state 面板归 src/cli/state.ts）：markdown 人读通道，json 才是契约
+  // 状态输出归 core.state；CLI 只选择读模型及展示格式。
   state: {
     positionals: [],
     flags: { version: "value", save: "boolean", format: "value" },
     enums: { format: ["markdown", "json"] as const },
-    needsRoot: true,
-    run: async ({ root, flags }) => {
-      const { renderState, saveState } = await import("./state.js");
-      const version = typeof flags.version === "string" ? flags.version : null;
-      const fmt = (typeof flags.format === "string" ? flags.format : "markdown") as
-        | "markdown"
-        | "json";
-      const rendered = renderState(root!, version, fmt);
-      if (flags.save !== true) {
-        return asData(rendered);
-      }
-      // --save 只写 versions/<v>/state.md，其余文件不触碰。
-      const savedTo = saveState(root!, version);
-      return { ...asData(rendered), saved_to: savedTo };
+    run: ({ core, flags }) => {
+      const version = typeof flags.version === "string" ? { version: flags.version } : {};
+      const fmt = typeof flags.format === "string" ? flags.format as "markdown" | "json" : "markdown";
+      if (flags.save === true) return core.state.save({ ...version, format: fmt });
+      if (fmt === "json") return core.state.get(version);
+      return core.state.render(version);
     },
   },
 
-  // indexing 域
   reindex: {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { IndexManager } = await import("../indexing/index-manager.js");
-      return asData(new IndexManager(root!).rebuildBaseline());
-    },
+    run: ({ core }) => core.index.rebuild(),
   },
 
-  // versioning 域 publish split：acceptance 与 push
   "acceptance set": {
     positionals: ["command"],
     flags: {},
-    needsRoot: true,
-    run: async ({ root, args }) => {
-      const { acceptanceSet } = await import("../versioning/publish.js");
-      const command = args[0]!;
-      acceptanceSet(root!, command);
-      return { command };
-    },
+    run: ({ core, args }) => core.acceptance.set({ command: args[0]! }),
   },
   "acceptance run": {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { runAcceptance } = await import("../versioning/publish.js");
-      return asData(runAcceptance(root!));
-    },
+    run: ({ core }) => core.acceptance.run(),
   },
   "acceptance show": {
     positionals: [],
     flags: {},
-    needsRoot: true,
-    run: async ({ root }) => {
-      const { acceptanceShow } = await import("../versioning/publish.js");
-      return { command: acceptanceShow(root!) };
-    },
+    run: ({ core }) => core.acceptance.show(),
   },
   push: {
     positionals: [],
     flags: { "dry-run": "boolean" },
-    needsRoot: true,
-    run: async ({ root, flags }) => {
-      const { push } = await import("../versioning/publish.js");
-      return asData(
-        await push(
-          root!,
-          flags["dry-run"] === true ? { dryRun: true } : undefined,
-        ),
-      );
-    },
+    run: ({ core, flags }) => core.publish.push(
+      flags["dry-run"] === true ? { dryRun: true } : undefined,
+    ),
   },
 };
 
-/** 命令匹配：先两词（version create / specgraph sync …）后单词；未匹配 → USAGE_ERROR。 */
+/** 两词命令优先；未匹配命令统一为 USAGE_ERROR。 */
 function matchCommand(argv: string[]): string {
   const t0 = argv[0]!;
-  if (t0.startsWith("--")) {
-    throw new UsageError(`未知命令：${t0}`);
-  }
+  if (t0.startsWith("--")) throw new UsageError(`未知命令：${t0}`);
   const t1 = argv[1];
   if (t1 !== undefined && !t1.startsWith("--")) {
     const two = `${t0} ${t1}`;
-    if (two in COMMANDS) {
-      return two;
-    }
-    if (!(t0 in COMMANDS)) {
-      throw new UsageError(`未知命令：${two}`);
-    }
+    if (Object.hasOwn(COMMANDS, two)) return two;
+    if (!Object.hasOwn(COMMANDS, t0)) throw new UsageError(`未知命令：${two}`);
     return t0;
   }
-  if (t0 in COMMANDS) {
-    return t0;
-  }
+  if (Object.hasOwn(COMMANDS, t0)) return t0;
   throw new UsageError(`未知命令：${t0}`);
 }
 
-// ---------------------------------------------------------------------------
-// latestDocVersion：读 .meta/versions/v*.yaml 数值最大者；只读
-// ---------------------------------------------------------------------------
+/** 具体 DTO 的字段保持原样，只把类型收敛到 argv 通用信封。 */
+function cliResult(result: ApiResult<object>): CliDispatchResult {
+  if (!result.ok) return result;
+  return { ok: true, data: { ...result.data } };
+}
 
-function compareVersionsDesc(a: string, b: string): number {
-  const pa = a.slice(1).split(".").map(Number);
-  const pb = b.slice(1).split(".").map(Number);
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
-    if (diff !== 0) {
-      return diff;
-    }
+function emit(result: CliDispatchResult): void {
+  if (!result.ok) {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
   }
-  return 0;
-}
-
-/** 无版本记录或非项目根 → "unversioned"；任何读取失败同样回落，保证只读零副作用。 */
-function latestDocVersion(cwd: string): string {
-  try {
-    const root = resolveProjectRoot(cwd);
-    const names = fs
-      .readdirSync(path.join(root.meta, "versions"))
-      .filter((n) => /^v\d+(?:\.\d+)*\.yaml$/.test(n));
-    if (names.length === 0) {
-      return "unversioned";
+  if (result.presentation?.projection === "baseline-items") {
+    const items = result.data.items;
+    if (result.presentation.format === "json") {
+      process.stdout.write(`${JSON.stringify({ ok: true, data: items })}\n`);
+    } else {
+      process.stdout.write(stringify(items, { lineWidth: 0 }));
     }
-    const versions = names.map((n) => n.slice(0, -".yaml".length));
-    versions.sort(compareVersionsDesc);
-    return versions[0]!;
-  } catch {
-    return "unversioned";
+    return;
   }
+  process.stdout.write(`${JSON.stringify({ ok: true, data: result.data })}\n`);
 }
 
-// ---------------------------------------------------------------------------
-// emit：单 JSON 保证——信封序列化一次、单行写出一次，此后无第二段输出
-// ---------------------------------------------------------------------------
-
-function emit(result: CoreResult): void {
-  process.stdout.write(`${JSON.stringify(result)}\n`);
-}
-
-// ---------------------------------------------------------------------------
-// 双入口
-// ---------------------------------------------------------------------------
-
-export async function dispatch(argv: string[]): Promise<CoreResult> {
+export async function dispatch(
+  argv: string[],
+  options?: CoreApiOptions,
+): Promise<CliDispatchResult> {
   try {
     if (argv.length === 0) {
       throw new UsageError(
-        "缺命令：init / version <sub> / prd|fsd|tdd <sub> / fsd decompose / codegen prepare / deps / impact / state / search / specgraph <sub> / reindex / baseline-summary / acceptance <sub> / push / --version",
+        "缺命令：init / version <sub> / prd|fsd|tdd <sub> / fsd decompose / codegen prepare|receipt|verify / deps / impact / state / search / specgraph <sub> / reindex / baseline-summary / acceptance <sub> / push / --version",
       );
     }
-    // --version：只读反映项目当前文档版本（非项目根/无记录 → unversioned）
     if (argv[0] === "--version") {
-      if (argv.length !== 1) {
-        throw new UsageError("参数非法：--version 不接受额外参数");
-      }
-      return {
-        ok: true,
-        data: { version: latestDocVersion(process.cwd()), next_action: null },
-      };
+      if (argv.length !== 1) throw new UsageError("参数非法：--version 不接受额外参数");
+      return cliResult(await createCoreApi(options).project.documentVersion());
     }
-
     const key = matchCommand(argv);
     const spec = COMMANDS[key]!;
     const { positionals, flags } = parseArgs(argv.slice(key.split(" ").length), spec);
-    // 解析层校验先于项目根解析：参数形态错误不因"非项目根"被掩盖，且零副作用
     spec.validate?.(positionals, flags);
-    // 惰性解析项目根（init 豁免）；ProjectRootError 自带 code 透传
-    const root = spec.needsRoot ? resolveProjectRoot() : null;
-    const data = await spec.run({ root, args: positionals, flags });
-    const { buildNextAction } = await import("../orchestration/next-action.js");
-    // 接续使用实际解析的写入意图；context_token 保留领域本次返回的值。
-    const intent: Record<string, unknown> = {};
-    for (const name of ["action", "parent", "file", "overrides"] as const) {
-      if (typeof flags[name] === "string") intent[name] = flags[name];
+    const core = createCoreApi(options);
+    const result = cliResult(await spec.run({ core, args: positionals, flags }));
+    if (result.ok && spec.presentation !== undefined) {
+      return { ...result, presentation: spec.presentation(flags) };
     }
-    if (key === "fsd decompose") intent.parent = positionals[0]!;
-    return {
-      ok: true,
-      data: {
-        ...data,
-        next_action: (data.next_action as NextAction | null | undefined)
-          ?? buildNextAction(key, { ...data, ...intent }),
-      },
-    };
+    return result;
   } catch (err) {
-    if (err instanceof UsageError) {
-      return usageError(err.message);
-    }
+    if (err instanceof UsageError) return usageError(err.message);
     const message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: unknown } | null)?.code;
-    if (typeof code === "string" && code.length > 0) {
-      // 域抛带 code 的错误：原样透传（含 USAGE_ERROR/NOT_AT_PROJECT_ROOT 等稳定码）
-      return { ok: false, error: message, code };
-    }
-    // 无 code 异常：统一包装 INTERNAL_ERROR，保留原始 message
+    if (typeof code === "string" && code.length > 0) return { ok: false, error: message, code };
     return { ok: false, error: message, code: "INTERNAL_ERROR" };
   }
 }
 
-/** bin 薄壳：dispatch → stdout 单行 JSON → exit code 镜像 ok 字段。 */
+/** 进度只写 stderr；stdout 为选定的业务展示，退出码只镜像外层 ok。 */
 export async function runCli(argv: string[]): Promise<number> {
-  const result = await dispatch(argv);
+  const result = await dispatch(argv, {
+    onProgress(event) {
+      try {
+        process.stderr.write(`${JSON.stringify(event)}\n`);
+      } catch {
+        // 进度展示失败不能改变 API 的业务结果。
+      }
+    },
+  });
   emit(result);
   return result.ok ? 0 : 1;
 }

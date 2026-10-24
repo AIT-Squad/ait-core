@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 
+import type { CoreProgressEvent } from "../src/api/types.js";
 import {
   initProject,
   refreshWrapper,
@@ -395,8 +396,32 @@ function otherWrapperPath(base: string): string {
   return IS_WINDOWS ? wrapperPathsOf(base).sh : wrapperPathsOf(base).cmd;
 }
 
+/** stderr 仅允许公共 API 进度事件，不能混入业务结果、日志或异常栈。 */
+function parseWrapperProgress(stderr: string): CoreProgressEvent[] {
+  return stderr.split(/\r?\n/).filter((line) => line.trim() !== "").map((line) => {
+    const value: unknown = JSON.parse(line);
+    expect(value).toBeTypeOf("object");
+    expect(value).not.toBeNull();
+    expect(Array.isArray(value)).toBe(false);
+    const event = value as CoreProgressEvent;
+    expect(Object.keys(event).sort()).toEqual([
+      "operation", "operationId", "stage", "status",
+    ]);
+    for (const field of ["operationId", "operation"] as const) {
+      expect(event[field]).toBeTypeOf("string");
+      expect(event[field].trim()).not.toBe("");
+    }
+    expect([
+      "read", "validate", "assemble", "write_bundle", "register_delivery",
+      "acceptance", "git", "persist",
+    ]).toContain(event.stage);
+    expect(["started", "completed", "failed"]).toContain(event.status);
+    return event;
+  });
+}
+
 /** 实际执行生成入口；Windows 必须经 cmd，POSIX 直接运行可执行 wrapper。 */
-function runWrapper(base: string, args: string[]) {
+function runWrapper(base: string, args: string[], operation: string | null) {
   const wrapper = currentWrapperPath(base);
   const options = {
     cwd: base,
@@ -416,13 +441,28 @@ function runWrapper(base: string, args: string[]) {
     : spawnSync(wrapper, args, options);
   expect(result.error).toBeUndefined();
   expect(result.signal).toBeNull();
-  expect(result.stderr).toBe("");
+  const progress = parseWrapperProgress(result.stderr);
+  if (operation !== null) {
+    expect(progress.length).toBeGreaterThan(0);
+    expect(new Set(progress.map((event) => event.operation))).toEqual(new Set([operation]));
+    expect(new Set(progress.map((event) => event.operationId)).size).toBe(1);
+    expect(progress.some((event) => event.status === "failed")).toBe(false);
+    const started = progress.findIndex((event) =>
+      event.stage === "validate" && event.status === "started",
+    );
+    const completed = progress.findIndex((event) =>
+      event.stage === "validate" && event.status === "completed",
+    );
+    expect(started).toBeGreaterThanOrEqual(0);
+    expect(completed).toBeGreaterThan(started);
+  }
   const lines = result.stdout.trim().split(/\r?\n/);
   expect(lines).toHaveLength(1);
   expect(lines[0]).not.toBe("");
   return {
     status: result.status,
     payload: JSON.parse(lines[0]!) as Record<string, unknown>,
+    progress,
   };
 }
 
@@ -633,17 +673,24 @@ describe("wrapper", () => {
     new VersionManager(resolveProjectRoot(base)).versionCreate("v0.17");
     const before = snapshotTree(base);
 
-    expect(runWrapper(base, ["--version"])).toMatchObject({
+    expect(runWrapper(base, ["--version"], "project.documentVersion")).toMatchObject({
       status: 0,
       payload: { ok: true, data: { version: "v0.17" } },
     });
-    const invalid = runWrapper(base, ["init", "--未知 参数"]);
+    expect(runWrapper(base, ["init", "--check"], "project.init")).toMatchObject({
+      status: 0,
+      payload: { ok: true, data: { ok: true, missing: [] } },
+    });
+    const invalid = runWrapper(base, ["init", "--未知 参数"], null);
     expect(invalid.status).toBeGreaterThan(0);
+    expect(invalid.status).toBe(1);
     expect(invalid.payload).toMatchObject({
       ok: false,
       code: "USAGE_ERROR",
       error: "未知 flag：--未知 参数",
     });
+    // 参数解析在调用公共 API 之前拒绝，没有虚构的阶段进度。
+    expect(invalid.progress).toEqual([]);
     expect(snapshotTree(base)).toEqual(before);
   });
 
@@ -687,7 +734,7 @@ describe("wrapper", () => {
       expect(Object.keys(refreshed.files)).toEqual([CURRENT_REL]);
       expect(fs.readFileSync(current)).toEqual(original);
       expect(checkProject(base)).toEqual({ ok: true, missing: [] });
-      expect(runWrapper(base, ["--version"])).toMatchObject({
+      expect(runWrapper(base, ["--version"], "project.documentVersion")).toMatchObject({
         status: 0, payload: { ok: true },
       });
       const after = hashTree(base);
@@ -767,7 +814,7 @@ describe("wrapper", () => {
     refreshWrapper(base);
     expect(fs.statSync(wrapper).mode & 0o111).not.toBe(0);
     expect(checkProject(base)).toEqual({ ok: true, missing: [] });
-    expect(runWrapper(base, ["--version"])).toMatchObject({
+    expect(runWrapper(base, ["--version"], "project.documentVersion")).toMatchObject({
         status: 0, payload: { ok: true },
       });
   });

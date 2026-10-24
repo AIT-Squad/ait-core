@@ -1,6 +1,6 @@
 {
   "name": "ait-core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AIT — chunk-level spec version control and AI implementation orchestration (TypeScript)",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -17,13 +17,16 @@
   },
   "files": [
     "dist/src",
-    "README.md"
+    "README.md",
+    "docs/node-api.md",
+    "docs/cli.md"
   ],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "prepack": "npm run build"

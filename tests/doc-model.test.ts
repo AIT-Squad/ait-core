@@ -9,6 +9,7 @@
 //   缺省为 ait-core 自身 project-docs/.meta；目录不存在时该组 skip 并打印原因；
 // - 每个用例独立，零共享状态（临时目录用毕即删，语料只读）。
 
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -22,6 +23,7 @@ import {
   parseText,
 } from "../src/doc-model/chunk-parser.js";
 import type { Chunk, ParsedFile } from "../src/doc-model/chunk-parser.js";
+import * as docModelSchemas from "../src/doc-model/schemas.js";
 import {
   ActionSchema,
   ArtifactScopeSchema,
@@ -34,11 +36,11 @@ import {
   DiscussionUsageSchema,
   EdgeSchema,
   GenerationArtifactStateSchema,
+  GenerationDeliveryInputSchema,
   GenerationDeliveryRecordSchema,
   GenerationStateSchema,
   HistoricalAnchorRepairSchema,
   LocalConfigSchema,
-  NextActionSchema,
   ProjectConfigSchema,
   ReconciliationOperationSchema,
   ReconciliationPlanSchema,
@@ -67,7 +69,6 @@ import type {
   GenerationState,
   GenerationVerification,
   LocalConfig,
-  NextAction,
   ProjectConfig,
   SpecGraph,
   State,
@@ -389,11 +390,14 @@ const MIN_GENERATION_VERSION_META = {
   generation: MIN_GENERATION_STATE,
 } as const;
 
-const VALID_NEXT_ACTIONS = [
-  { type: "present_and_collect", instruction: "展示并收集", required_next_call: "ait prd confirm" },
-  { type: "report", message: "校验完成" },
-  { type: "continue", instruction: "继续确认", next_call: "ait tdd confirm" },
-] as const;
+const GENERATION_CONTENT = "<!-- @id:[TDD]-doc_model_tests -->\n## 内存交付\n保留中文与完整正文。\n";
+const MIN_GENERATION_INPUT = {
+  version: MIN_GENERATION_DELIVERY.version,
+  tdd_root: MIN_GENERATION_DELIVERY.tdd_root,
+  target_file: MIN_GENERATION_DELIVERY.target_file,
+  bundle_sha256: createHash("sha256").update(GENERATION_CONTENT, "utf8").digest("hex"),
+  bytes: Buffer.byteLength(GENERATION_CONTENT, "utf8"),
+} as const;
 
 /** 当前形态样本矩阵：合法通过 / 加未知字段拒绝（报路径）/ 非法值拒绝。 */
 interface CurrentShapeCase {
@@ -1714,6 +1718,7 @@ describe("schemas 约束", () => {
       EdgeSchema,
       SpecGraphSchema,
       GenerationArtifactStateSchema,
+      GenerationDeliveryInputSchema,
       StoredGenerationReceiptSchema,
       GenerationDeliveryRecordSchema,
       GenerationStateSchema,
@@ -1724,7 +1729,6 @@ describe("schemas 约束", () => {
       HistoricalAnchorRepairSchema,
       VersionMetaSchema,
       ChangeRecordSchema,
-      NextActionSchema,
       CoreResultSchema,
     };
     for (const [name, schema] of Object.entries(schemas)) {
@@ -1746,7 +1750,6 @@ describe("schemas 约束", () => {
       ProjectConfig?,
       LocalConfig?,
       CoreResult?,
-      NextAction?,
       GenerationArtifactState?,
       StoredGenerationReceipt?,
       GenerationReceipt?,
@@ -2047,44 +2050,119 @@ describe("schemas 配置", () => {
 });
 
 // ---------------------------------------------------------------------------
+// schemas 生成交付输入
+// ---------------------------------------------------------------------------
+
+describe("schemas 生成交付输入", () => {
+  it.each(["v0.10", null])("内存交付 version=%s 保留正文、UTF-8 字节数与 hash，不添加文件来源", (version) => {
+    const input: GenerationDeliveryInput = { ...MIN_GENERATION_INPUT, version, content: GENERATION_CONTENT };
+    const parsed = GenerationDeliveryInputSchema.parse(input);
+    expect(parsed).toEqual(input);
+    expect(parsed).not.toHaveProperty("bundle_path");
+    expect(parsed.content).toBe(GENERATION_CONTENT);
+    expect(parsed.bytes).toBe(Buffer.byteLength(GENERATION_CONTENT, "utf8"));
+    expect(parsed.bytes).toBeGreaterThan(GENERATION_CONTENT.length);
+    expect(parsed.bundle_sha256).toBe(createHash("sha256").update(GENERATION_CONTENT, "utf8").digest("hex"));
+  });
+
+  it.each(["v0.10", null])("内部文件交付 version=%s 继续支持 bundle_path，且不添加 content", (version) => {
+    // schema 只校验输入形态；路径存在性与完整内容核验由内部签发负责。
+    const input: GenerationDeliveryInput = {
+      ...MIN_GENERATION_INPUT, version, bundle_path: join(tmpdir(), "ait-schema-input-only.md"),
+    };
+    expect(GenerationDeliveryInputSchema.parse(input)).toEqual(input);
+    expect(GenerationDeliveryInputSchema.parse(input)).not.toHaveProperty("content");
+  });
+
+  it("两种来源必须恰选一种，编译期和运行期都拒绝同时给出或全部缺失", () => {
+    // @ts-expect-error 内存正文与文件路径不能同时作为同一交付的来源。
+    const both: GenerationDeliveryInput = { ...MIN_GENERATION_INPUT, content: GENERATION_CONTENT, bundle_path: "bundle.md" };
+    // @ts-expect-error 交付必须提供 content 或 bundle_path。
+    const neither: GenerationDeliveryInput = { ...MIN_GENERATION_INPUT };
+    for (const input of [both, neither]) {
+      const result = GenerationDeliveryInputSchema.safeParse(input);
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(unknownFieldPaths(result.error)).toEqual(expect.arrayContaining(["content", "bundle_path"]));
+      }
+    }
+  });
+
+  it.each([
+    { source: { content: null }, field: "content" },
+    { source: { content: 42 }, field: "content" },
+    { source: { content: [GENERATION_CONTENT] }, field: "content" },
+    { source: { bundle_path: null }, field: "bundle_path" },
+    { source: { bundle_path: 42 }, field: "bundle_path" },
+  ])("来源 $source 的非法类型拒绝并定位 $field", ({ source, field }) => {
+    const result = GenerationDeliveryInputSchema.safeParse({ ...MIN_GENERATION_INPUT, ...source });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(unknownFieldPaths(result.error)).toContain(field);
+  });
+
+  it.each([
+    { field: "version", value: undefined },
+    { field: "version", value: 13 },
+    { field: "tdd_root", value: undefined },
+    { field: "tdd_root", value: null },
+    { field: "target_file", value: undefined },
+    { field: "target_file", value: false },
+    { field: "bundle_sha256", value: "a".repeat(63) },
+    { field: "bundle_sha256", value: "a".repeat(65) },
+    { field: "bundle_sha256", value: "A".repeat(64) },
+    { field: "bundle_sha256", value: "g".repeat(64) },
+    { field: "bundle_sha256", value: DIGEST },
+    { field: "bundle_sha256", value: undefined },
+    { field: "bytes", value: -1 },
+    { field: "bytes", value: 1.5 },
+    { field: "bytes", value: "123" },
+    { field: "bytes", value: undefined },
+  ])("两种交付来源均拒绝非法 $field=$value 并报告字段", ({ field, value }) => {
+    for (const source of [{ content: GENERATION_CONTENT }, { bundle_path: "bundle.md" }]) {
+      const result = GenerationDeliveryInputSchema.safeParse({ ...MIN_GENERATION_INPUT, ...source, [field]: value });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(unknownFieldPaths(result.error)).toContain(field);
+    }
+  });
+
+  it.each([{ content: GENERATION_CONTENT }, { bundle_path: "bundle.md" }])("交付来源 %j 的未知字段保持严格拒绝", (source) => {
+    const result = GenerationDeliveryInputSchema.safeParse({ ...MIN_GENERATION_INPUT, ...source, __drift: true });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(unknownFieldPaths(result.error)).toContain("__drift");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // schemas CoreResult
 // ---------------------------------------------------------------------------
 
 describe("schemas CoreResult", () => {
-  // [:TEST 5] 成功/失败/带 next_action 三形态判别联合通过；失败缺 error.code 拒绝
-  it("成功形态 {ok:true,data} 通过", () => {
-    expect(CoreResultSchema.safeParse({ ok: true, data: { next_action: null } }).success).toBe(true);
-    const input = { ok: true, data: { value: 1, nested: { items: ["item"] }, next_action: null } };
-    expect(CoreResultSchema.parse(input)).toEqual(input);
-  });
-
-  it("失败形态 {ok:false,error,code} 通过", () => {
-    const input = { ok: false, error: "出错了", code: "SOME_ERROR" };
-    expect(CoreResultSchema.parse(input)).toEqual(input);
-  });
-
-  it.each(VALID_NEXT_ACTIONS)("成功信封接受 $type 动作并保留业务数据", (action) => {
-    const input = { ok: true, data: { next_action: action, passed: false, violations: ["待处理"] } };
-    expect(CoreResultSchema.parse(input)).toEqual(input);
-  });
-
-  it.each([{}, { value: 1 }])("成功结果完全缺失 next_action 拒绝：%j", (data) => {
-    const result = CoreResultSchema.safeParse({ ok: true, data });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(unknownFieldPaths(result.error)).toContain("data.next_action");
-  });
-
   it.each([
-    { action: { type: "unknown", message: "m" }, field: "type" },
-    { action: { type: "present_and_collect", required_next_call: "c" }, field: "instruction" },
-    { action: { type: "present_and_collect", instruction: "i" }, field: "required_next_call" },
-    { action: { type: "report" }, field: "message" },
-    { action: { type: "continue", next_call: "n" }, field: "instruction" },
-    { action: { type: "continue", instruction: "i" }, field: "next_call" },
-  ])("成功结果非法或不完整动作 $action 定位到 $field", ({ action, field }) => {
-    const result = CoreResultSchema.safeParse({ ok: true, data: { next_action: action } });
-    expect(result.success).toBe(false);
-    if (!result.success) expect(unknownFieldPaths(result.error)).toContain("data.next_action." + field);
+    {},
+    { value: 1, nested: { items: ["item"] } },
+    { ran: true, passed: false, exitCode: 1, violations: ["待处理"] },
+  ])("成功形态 {ok:true,data} 保留开放业务数据，无下一步建议字段：%j", (data) => {
+    const input: CoreResult = { ok: true, data };
+    const parsed = CoreResultSchema.parse(input);
+    expect(parsed).toEqual(input);
+    if (!parsed.ok) throw new Error("成功信封被解析成失败结果");
+    for (const field of ["next_action", "next_call", "required_next_call"]) {
+      expect(parsed).not.toHaveProperty(field);
+      expect(parsed.data).not.toHaveProperty(field);
+    }
+  });
+
+  it("失败形态 {ok:false,error,code} 保留错误事实，不添加业务数据或建议", () => {
+    const input: CoreResult = { ok: false, error: "出错了", code: "SOME_ERROR" };
+    const parsed = CoreResultSchema.parse(input);
+    expect(parsed).toEqual(input);
+    for (const field of ["data", "next_action", "next_call", "required_next_call"]) {
+      expect(parsed).not.toHaveProperty(field);
+    }
+  });
+
+  it("NextAction 运行期 schema 已退役", () => {
+    expect(Object.keys(docModelSchemas).filter((name) => name.includes("NextAction"))).toEqual([]);
   });
 
   it("失败缺 code 拒绝，issue path 指向 code", () => {
@@ -2095,27 +2173,37 @@ describe("schemas CoreResult", () => {
     }
   });
 
-  it("next_action 三形态通过、未知 type 拒绝", () => {
-    expect(
-      NextActionSchema.safeParse({
-        type: "present_and_collect",
-        instruction: "i",
-        required_next_call: "c",
-      }).success,
-    ).toBe(true);
-    expect(NextActionSchema.safeParse({ type: "report", message: "m" }).success).toBe(true);
-    expect(
-      NextActionSchema.safeParse({ type: "continue", instruction: "i", next_call: "n" }).success,
-    ).toBe(true);
-    expect(NextActionSchema.safeParse({ type: "unknown", message: "m" }).success).toBe(false);
-    // 形态内必填字段缺失
-    expect(NextActionSchema.safeParse({ type: "report" }).success).toBe(false);
-    expect(NextActionSchema.safeParse({ type: "present_and_collect", instruction: "i" }).success).toBe(false);
+  it.each([
+    { input: { ok: false, code: "SOME_ERROR" }, field: "error" },
+    { input: { ok: false, error: { message: "出错了" }, code: "SOME_ERROR" }, field: "error" },
+    { input: { ok: false, error: "出错了", code: 42 }, field: "code" },
+    { input: { ok: true, data: {}, error: "出错了" }, field: "error" },
+    { input: { ok: true, data: {}, code: "SOME_ERROR" }, field: "code" },
+    { input: { ok: false, error: "出错了", code: "SOME_ERROR", data: {} }, field: "data" },
+  ])("成功与错误字段互斥，错误结构违例定位到 $field", ({ input, field }) => {
+    const result = CoreResultSchema.safeParse(input);
+    expect(result.success).toBe(false);
+    if (!result.success) expect(unknownFieldPaths(result.error)).toContain(field);
+  });
+
+  it.each(["next_action", "next_call", "required_next_call", "__drift"])("信封顶层未知字段 %s 拒绝而非静默丢弃", (field) => {
+    for (const input of [{ ok: true, data: {} }, { ok: false, error: "出错了", code: "SOME_ERROR" }]) {
+      const result = CoreResultSchema.safeParse({ ...input, [field]: null });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(unknownFieldPaths(result.error)).toContain(field);
+    }
+  });
+
+  it.each([null, undefined, [], "data", 42, false])("成功 data 必须为对象，非法值 %j 拒绝", (data) => {
+    const result = CoreResultSchema.safeParse({ ok: true, data });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(unknownFieldPaths(result.error)).toContain("data");
   });
 
   it("判别联合的非法判别值被拒", () => {
-    expect(CoreResultSchema.safeParse({ ok: "yes", data: { next_action: null } }).success).toBe(false);
+    expect(CoreResultSchema.safeParse({ ok: "yes", data: {} }).success).toBe(false);
     expect(CoreResultSchema.safeParse({ ok: true }).success).toBe(false);
+    expect(CoreResultSchema.safeParse({ data: {} }).success).toBe(false);
   });
 });
 

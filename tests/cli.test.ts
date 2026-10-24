@@ -15,7 +15,7 @@
 //
 // 约束：每个用例在 os.tmpdir() 下自建最小 project-docs 骨架，用例间零共享。
 // bin 入口使用实际构建的 dist/src/bin.js；运行本文件前先 npm run build。
-// v0.10：成功信封显式 next_action，讨论保留写入意图，codegen 交付文件可校验，
+// v0.13：成功信封不含编排建议，讨论通过 context_token 保留写入意图，交付文件可校验，
 // dispatch/runCli 返回后调用者继续运行；安装与包根导入由 dogfood/system tests 覆盖。
 // v0.11：共享治理诊断、有效版本选择、confirm/merge 定位一致和 init 未就绪透传。
 
@@ -26,9 +26,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parse as parseYaml } from "yaml";
 
 import { dispatch } from "../src/cli/dispatcher.js";
-import { CoreResultSchema, VersionIndexSchema, type CoreResult, type VersionIndex } from "../src/doc-model/schemas.js";
+import { createCoreApi } from "../src/index.js";
+import type { ApiResult, CliDispatchResult, CoreApi, CoreProgressEvent, CoreResult, Direction, EdgeRel } from "../src/index.js";
+import { CoreResultSchema, VersionIndexSchema, type VersionIndex } from "../src/doc-model/schemas.js";
 import { loadModel } from "../src/foundation/yaml.js";
 
 // ---------------------------------------------------------------------------
@@ -71,6 +74,19 @@ beforeAll(() => {
 	for (const file of [BIN_PATH, DISPATCHER_JS]) {
 		expect(fs.existsSync(file), "缺少构建产物，请先运行 npm run build").toBe(true);
 	}
+	const sourceRoot = path.resolve(HERE, "../src");
+	const checkFresh = (dir: string): void => {
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const source = path.join(dir, entry.name);
+			if (entry.isDirectory()) checkFresh(source);
+			else if (entry.name.endsWith(".ts")) {
+				const compiled = path.resolve(HERE, "../dist/src", path.relative(sourceRoot, source).replace(/\.ts$/, ".js"));
+				expect(fs.existsSync(compiled), "缺少构建产物：" + compiled).toBe(true);
+				expect(fs.statSync(compiled).mtimeMs, "源码已更新，请先重新构建：" + source).toBeGreaterThanOrEqual(fs.statSync(source).mtimeMs);
+			}
+		}
+	};
+	checkFresh(sourceRoot);
 });
 
 interface BinRun {
@@ -101,6 +117,12 @@ function runBin(cwd: string, argv: string[]): Promise<BinRun> {
 /** 校验原始信封，不用 schema 输出或删字段掩盖遗漏。 */
 function expectEnvelope(result: unknown): asserts result is CoreResult {
 	expect(CoreResultSchema.safeParse(result).success).toBe(true);
+	expect(result).not.toHaveProperty("next_action");
+	if ((result as CoreResult).ok) {
+		for (const field of ["next_action", "next_call", "required_next_call"]) {
+			expect((result as Extract<CoreResult, { ok: true }>).data).not.toHaveProperty(field);
+		}
+	}
 	if ((result as CoreResult).ok === false) {
 		expect(Object.keys(result as object).sort()).toEqual(["code", "error", "ok"]);
 	}
@@ -122,17 +144,54 @@ function parseSingleJson(stdout: string): CoreResult {
 }
 
 /** 进程内 dispatch：dispatcher 以 process.cwd() 解析项目根，调用期间临时 chdir。 */
-async function dispatchIn(cwd: string, argv: string[]): Promise<CoreResult> {
+async function dispatchIn(cwd: string, argv: string[]): Promise<CliDispatchResult> {
 	const prev = process.cwd();
 	process.chdir(cwd);
 	try {
 		const result = await dispatch(argv);
-	expect(process.cwd()).toBe(cwd);
-	expectEnvelope(result);
-	return result;
+		expect(process.cwd()).toBe(cwd);
+		if (result.ok && result.presentation !== undefined) {
+			expect(Object.keys(result).sort()).toEqual(["data", "ok", "presentation"]);
+			expect(result.presentation).toEqual({ format: expect.stringMatching(/^(json|yaml)$/), projection: "baseline-items" });
+			expectEnvelope({ ok: true, data: result.data });
+		} else expectEnvelope(result);
+		return result;
 	} finally {
 		process.chdir(prev);
 	}
+}
+
+async function apiIn<T extends object>(cwd: string, work: (core: CoreApi) => Promise<ApiResult<T>>): Promise<ApiResult<T>> {
+	const previous = process.cwd();
+	process.chdir(cwd);
+	const core = createCoreApi();
+	process.chdir(previous);
+	const result = await work(core);
+	expectEnvelope(result);
+	return result;
+}
+
+function apiData<T extends object>(result: ApiResult<T>): T {
+	expect(result.ok, result.ok ? undefined : result.code + ": " + result.error).toBe(true);
+	if (!result.ok) throw new Error(result.error);
+	return result.data;
+}
+
+type EdgeView = { src: string; dst: string; rel: string; metadata: Record<string, unknown> };
+type DepsView = { found: boolean; target: string; direction: Direction; edges: EdgeView[] };
+function depsData(result: CliDispatchResult): DepsView {
+	return successData(result) as unknown as DepsView;
+}
+
+function parseProgress(stderr: string): CoreProgressEvent[] {
+	const events = stderr.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as CoreProgressEvent);
+	for (const event of events) {
+		expect(Object.keys(event).sort()).toEqual(["operation", "operationId", "stage", "status"]);
+		expect(event.operationId).toEqual(expect.any(String));
+		expect(["read", "validate", "assemble", "write_bundle", "register_delivery", "acceptance", "git", "persist"]).toContain(event.stage);
+		expect(["started", "completed", "failed"]).toContain(event.status);
+	}
+	return events;
 }
 
 
@@ -419,6 +478,55 @@ function makeBaselineSkeleton(tddBody?: string): string {
 	return dir;
 }
 
+function makeQuerySkeleton(): string {
+	const dir = makeBaselineSkeleton();
+	const baseFile = path.join(dir, "project-docs/.meta/specgraph.yaml");
+	const graph = JSON.parse(fs.readFileSync(baseFile, "utf8")) as {
+		specs: Array<Record<string, unknown>>;
+		edges: Array<Record<string, unknown>>;
+	};
+	const addNode = (id: string, type: string, version: string): string => {
+		const uri = `spec:${type}:${version}:${id}`;
+		graph.specs.push({ uri, title: id, type, version, chunk_id: id, file: `${type}/${id}`, metadata: { source: version } });
+		return uri;
+	};
+	const root = graph.specs.find((spec) => spec.chunk_id === "[PRD]-demo")!.uri as string;
+	const target = graph.specs.find((spec) => spec.chunk_id === "[FSD]-demo:feature")!.uri as string;
+	const tdd = graph.specs.find((spec) => spec.chunk_id === "[TDD]-demo")!.uri as string;
+	const other = addNode("[FSD]-other:split", "fsd", "baseline");
+	const dependency = addNode("[FSD]-dependency:split", "fsd", "baseline");
+	const versionTdd = `spec:tdd:${VERSION}:[TDD]-current`;
+	graph.edges.push(
+		{ src: root, dst: target, rel: "derives", weight: 1, metadata: { source: "test" } },
+		{ src: other, dst: target, rel: "decomposes", weight: 1, metadata: { source: "test" } },
+		{ src: target, dst: dependency, rel: "depends_on", weight: 1, metadata: { source: "test" } },
+		{ src: target, dst: root, rel: "legacy_relation", weight: 1, metadata: { source: "history" } },
+		{ src: target, dst: tdd, rel: "details", weight: 1, metadata: { source: "test" } },
+	);
+	writeVersionMeta(dir, VERSION);
+	writeVersionIndex(dir, VERSION, []);
+	writeBaselineGraph(dir, graph);
+	const versionGraph = {
+		version: 1,
+		updated: "2026-01-01T00:00:00+00:00",
+		specs: [{ uri: versionTdd, title: "current", type: "tdd", version: VERSION, chunk_id: "[TDD]-current", file: "tdd/[TDD]-current", metadata: { source: "version" } }],
+		edges: [{ src: target, dst: versionTdd, rel: "details", weight: 1, metadata: { source: "test" } }],
+	};
+	fs.writeFileSync(path.join(dir, "project-docs/.meta/specgraph-" + VERSION + ".yaml"), JSON.stringify(versionGraph));
+	return dir;
+}
+
+function makeReceiptSkeleton(): string {
+	const dir = makeBaselineSkeleton();
+	writeVersionMeta(dir, VERSION, { phase: "tdd-confirm" });
+	writeVersionIndex(dir, VERSION, [{ ...idxEntry("[TDD]-demo", "committed", "modify"), file: "tdd/[TDD]-demo" }]);
+	writeDoc(dir, path.join("..", "versions", VERSION, "tdd/[TDD]-demo.md"), tddDoc());
+	const target = path.join(dir, "src/demo.ts");
+	fs.mkdirSync(path.dirname(target), { recursive: true });
+	fs.writeFileSync(target, "export const demo = true;\n");
+	return dir;
+}
+
 // ---------------------------------------------------------------------------
 // :TEST 1 — 双入口一致
 // ---------------------------------------------------------------------------
@@ -430,7 +538,7 @@ describe("双入口一致", () => {
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch).toEqual({
 			ok: true,
-			data: { query: "不存在的关键词-zqx", count: 0, hits: [], next_action: null },
+			data: { query: "不存在的关键词-zqx", count: 0, hits: [] },
 		});
 		const viaBin = await runBin(dir, argv);
 		expect(viaBin.status).toBe(0);
@@ -460,23 +568,23 @@ describe("双入口一致", () => {
 		const argv = ["specgraph", "export"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		const viaBin = await runBin(dir, argv);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
 	});
 	for (const argv of [
-		["version", "status", VERSION], ["baseline-summary"],
+		["version", "status", VERSION],
 		["deps", "[FSD]-demo:feature"], ["impact", "[PRD]-demo"],
 		["specgraph", "query", "[FSD]-demo:feature"],
 		["acceptance", "show"], ["acceptance", "run"],
 	]) {
-		it(argv.join(" ") + "：确定性只读查询双入口一致且 next_action 为 null", async () => {
+		it(argv.join(" ") + "：确定性只读查询双入口一致且无 next_action", async () => {
 			const dir = makeBaselineSkeleton();
 			writeVersionMeta(dir, VERSION);
 			const before = digestTree(dir);
 			const viaDispatch = await dispatchIn(dir, argv);
-			expect(successData(viaDispatch).next_action).toBe(null);
+			expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 			const viaBin = await runBin(dir, argv);
 			expect(viaBin.status, viaBin.stderr || viaBin.stdout).toBe(0);
 			expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
@@ -486,12 +594,167 @@ describe("双入口一致", () => {
 
 });
 
+describe("specgraph query 的方向、关系与版本", () => {
+	const target = "[FSD]-demo:feature";
+	const relations: Array<[string, EdgeRel]> = [
+		["--derives", "derives"], ["--decomposes", "decomposes"],
+		["--details", "details"], ["--depends-on", "depends_on"],
+	];
+
+	it("四种关系过滤逐一对应 API，方向独立，默认读活动版本", async () => {
+		const dir = makeQuerySkeleton();
+		const before = digestTree(dir);
+		for (const [flag, rel] of relations) {
+			for (const direction of ["in", "out", "both"] as const satisfies readonly Direction[]) {
+				const argv = ["specgraph", "query", target, "--direction", direction, flag];
+				const cli = depsData(await readOnlyBoth(dir, argv));
+				const api = apiData(await apiIn(dir, (core) => core.graph.query({ target, direction, rels: [rel] })));
+				expect(cli).toEqual(api);
+				expect(cli.direction).toBe(direction);
+				const incoming = rel === "derives" || rel === "decomposes";
+				const expectedCount = (direction === "in" && !incoming) || (direction === "out" && incoming)
+					? 0 : rel === "details" ? 2 : 1;
+				expect(cli.edges).toHaveLength(expectedCount);
+				expect(cli.edges.every((edge) => edge.rel === rel)).toBe(true);
+			}
+		}
+		const combinedArgv = ["specgraph", "query", target, "--details", "--depends-on"];
+		const combined = depsData(await readOnlyBoth(dir, combinedArgv));
+		const combinedApi = apiData(await apiIn(dir, (core) => core.graph.query({ target, rels: ["details", "depends_on"] })));
+		expect(combined).toEqual(combinedApi);
+		expect(combined.direction).toBe("both");
+		expect(combined.edges).toHaveLength(3);
+		for (const direction of ["in", "out", "both"] as const) {
+			const cli = depsData(await readOnlyBoth(dir, [...combinedArgv, "--direction", direction]));
+			const api = apiData(await apiIn(dir, (core) => core.graph.query({ target, direction, rels: ["details", "depends_on", "details"] })));
+			expect(cli).toEqual(api);
+			expect(cli.edges).toHaveLength(direction === "in" ? 0 : 3);
+		}
+		const all = depsData(await readOnlyBoth(dir, ["deps", target]));
+		expect(all).toEqual(apiData(await apiIn(dir, (core) => core.graph.query({ target }))));
+		expect(depsData(await readOnlyBoth(dir, ["specgraph", "query", target]))).toEqual(all);
+		expect(all.edges.some((edge) => edge.rel === "legacy_relation")).toBe(true);
+		const selected = depsData(await readOnlyBoth(dir, ["specgraph", "query", target, "--derives", "--decomposes", "--details", "--depends-on"]));
+		expect(selected.edges.every((edge) => ["derives", "decomposes", "details", "depends_on"].includes(String(edge.rel)))).toBe(true);
+		expect(selected.edges.some((edge) => edge.rel === "legacy_relation")).toBe(false);
+		const empty = apiData(await apiIn(dir, (core) => core.graph.query({ target, rels: [] })));
+		expect(empty.edges).toEqual([]);
+		const missing = depsData(await readOnlyBoth(dir, ["specgraph", "query", "[FSD]-unknown"]));
+		expect(missing).toMatchObject({ found: false, target: "[FSD]-unknown", edges: [] });
+		expect(digestTree(dir)).toEqual(before);
+	}, 45_000);
+
+	it("--version overlay、baseline、未知版本及活动版本冲突保持只读", async () => {
+		const dir = makeQuerySkeleton();
+		const before = digestTree(dir);
+		const baselineArgv = ["specgraph", "query", target, "--direction", "out", "--version", "baseline"];
+		const baseline = depsData(await readOnlyBoth(dir, baselineArgv));
+		expect(baseline.edges.some((edge) => edge.dst === "[TDD]-current")).toBe(false);
+		const versionArgv = ["specgraph", "query", target, "--direction", "out", "--details", "--version", VERSION];
+		const cli = depsData(await readOnlyBoth(dir, versionArgv));
+		const api = apiData(await apiIn(dir, (core) => core.graph.query({ target, direction: "out", rels: ["details"], version: VERSION })));
+		expect(cli).toEqual(api);
+		expect(cli.edges.some((edge) => edge.dst === "[TDD]-current")).toBe(true);
+		const implicit = depsData(await readOnlyBoth(dir, ["specgraph", "query", target, "--direction", "out", "--details"]));
+		expect(implicit).toEqual(cli);
+		const missing = await readOnlyBoth(dir, ["specgraph", "query", target, "--version", "v9.9"], 1);
+		expect(missing).toMatchObject({ ok: false, code: "VERSION_NOT_FOUND" });
+		expect(digestTree(dir)).toEqual(before);
+		writeVersionMeta(dir, "v0.5");
+		const beforeConflict = digestTree(dir);
+		const ambiguous = await readOnlyBoth(dir, ["specgraph", "query", target], 1);
+		expect(ambiguous).toMatchObject({ ok: false, code: "ACTIVE_VERSION_CONFLICT" });
+		expect(digestTree(dir)).toEqual(beforeConflict);
+	}, 20_000);
+
+	for (const argv of [
+		["deps", target, "--direction", "from"],
+		["deps", target, "--direction", "to"],
+		["deps", target, "--details"],
+		["deps", target, "--version", VERSION],
+		["specgraph", "query", target, "--direction", "from"],
+		["specgraph", "query", target, "--direction", "to"],
+		["specgraph", "query", target, "--deps"],
+		["specgraph", "query", target, "--implements"],
+		["specgraph", "query", target, "--version"],
+		["specgraph", "query", target, "--details=true"],
+	]) {
+		it(`${argv.slice(3).join(" ")}：USAGE_ERROR 且零写入`, async () => {
+			const dir = makeQuerySkeleton();
+			const before = digestTree(dir);
+			const result = await readOnlyBoth(dir, argv, 1);
+			expect(result).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+			expect(digestTree(dir)).toEqual(before);
+		});
+	}
+});
+
+describe("baseline-summary 摘要展示", () => {
+	it("默认/all/yaml 输出 YAML items；json 投影与 API summary 一致，stats 保持独立", async () => {
+		const dir = makeBaselineSkeleton();
+		const indexFile = path.join(dir, "project-docs/.meta/chunks-index.yaml");
+		const index = JSON.parse(fs.readFileSync(indexFile, "utf8")) as { chunks: Array<Record<string, unknown>> };
+		index.chunks.splice(1, 0, { id: "[PRD]-demo:behavior", file: "prd/[PRD]-demo", heading: "行为", level: 3, summary: "业务总结", metadata: {} });
+		fs.writeFileSync(indexFile, JSON.stringify(index));
+		writeVersionMeta(dir, VERSION);
+		writeVersionIndex(dir, VERSION, [{ ...idxEntry("[PRD]-version_only", "working"), file: "prd/[PRD]-version_only", summary: "不属于基线" }]);
+		const before = digestTree(dir);
+		const apiAll = apiData(await apiIn(dir, (core) => core.search.baselineSummary()));
+		expect(apiAll.scope).toBe("all");
+		expect(apiAll.items.some((item) => item.id === "[PRD]-demo:behavior")).toBe(true);
+		expect(apiAll.items.find((item) => item.id === "[PRD]-demo")?.summary).toBeNull();
+		expect(apiAll.items.map((item) => item.id)).not.toContain("[PRD]-version_only");
+		for (const argv of [["baseline-summary"], ["baseline-summary", "--scope", "all"], ["baseline-summary", "--format", "yaml"]]) {
+			const dispatched = await dispatchIn(dir, argv);
+			expect(dispatched.ok).toBe(true);
+			if (!dispatched.ok) throw new Error(dispatched.error);
+			expect(dispatched.data).toEqual(apiAll);
+			expect(dispatched.presentation?.format).toBe("yaml");
+			const viaBin = await runBin(dir, argv);
+			expect(viaBin.status, viaBin.stderr).toBe(0);
+			expect(parseYaml(viaBin.stdout)).toEqual(apiAll.items);
+		}
+		const prd = apiData(await apiIn(dir, (core) => core.search.baselineSummary({ scope: "prd" })));
+		const prdArgv = ["baseline-summary", "--scope", "prd", "--format", "json"];
+		const dispatchResult = await dispatchIn(dir, prdArgv);
+		expect(dispatchResult.ok && dispatchResult.presentation).toEqual({ format: "json", projection: "baseline-items" });
+		const viaBin = await runBin(dir, prdArgv);
+		expect(viaBin.status, viaBin.stderr).toBe(0);
+		expect(JSON.parse(viaBin.stdout)).toEqual({ ok: true, data: prd.items });
+		expect(prd.items.every((item) => item.id.startsWith("[PRD]-"))).toBe(true);
+		expect(prd.items).toEqual(apiAll.items.filter((item) => item.id.startsWith("[PRD]-")));
+		const stats = apiData(await apiIn(dir, (core) => core.search.baselineStats()));
+		expect(stats).toEqual({ docs: { prd: 1, fsd: 1, tdd: 1 }, chunks: 4, edges: { derives: 1, decomposes: 0, details: 1, depends_on: 0 }, versions: [VERSION] });
+		expect(dispatchResult).not.toMatchObject({ data: stats });
+		const bad = await readOnlyBoth(dir, ["baseline-summary", "--format", "csv"], 1);
+		expect(bad).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+		expect(digestTree(dir)).toEqual(before);
+	}, 20_000);
+
+	it("空摘要正常输出空列表，损坏索引仍输出单 JSON 错误且 exit 1", async () => {
+		const dir = makeSkeleton();
+		for (const argv of [["baseline-summary"], ["baseline-summary", "--scope", "prd", "--format", "json"]]) {
+			const before = digestTree(dir);
+			const child = await runBin(dir, argv);
+			expect(child.status, child.stderr).toBe(0);
+			expect(parseYaml(child.stdout)).toEqual(argv.includes("json") ? { ok: true, data: [] } : []);
+			expect(digestTree(dir)).toEqual(before);
+		}
+		fs.writeFileSync(path.join(dir, "project-docs/.meta/chunks-index.yaml"), "chunks: [\n");
+		for (const argv of [["baseline-summary"], ["baseline-summary", "--format", "json"]]) {
+			const result = await readOnlyBoth(dir, argv, 1);
+			expect(result).toMatchObject({ ok: false, code: "INDEX_UNREADABLE" });
+			expect(result).not.toHaveProperty("presentation");
+		}
+	}, 10_000);
+});
+
 
 // ---------------------------------------------------------------------------
-// v0.10 — 接续动作按实际写入意图生成，成功/失败信封覆盖两入口
+// v0.13 — 无编排建议，业务数据与门禁继续覆盖两入口
 // ---------------------------------------------------------------------------
 
-describe("讨论 next_action", () => {
+describe("讨论事实与写入意图", () => {
 	const cases: Array<{ name: string; phase: string; argv: string[] }> = [
 		{ name: "PRD", phase: "empty", argv: ["prd", "create", "[PRD]-renamed", "--action", "modify", "--file", "prd/renamed", "--overrides", "[PRD]-demo"] },
 		{ name: "FSD", phase: "prd-confirm", argv: ["fsd", "create", "[FSD]-renamed", "--parent", "[PRD]-demo", "--action", "modify", "--file", "fsd/renamed", "--overrides", "[FSD]-demo"] },
@@ -500,7 +763,7 @@ describe("讨论 next_action", () => {
 	];
 
 	for (const { name, phase, argv } of cases) {
-		it(name + "：接续调用保留 parent/action/file/overrides/context_token 且零写入", async () => {
+		it(name + "：返回讨论背景与 token，绑定 parent/action/file/overrides 且零写入", async () => {
 			const dir = makeBaselineSkeleton();
 			writeVersionMeta(dir, VERSION, { phase });
 			const before = digestTree(dir);
@@ -512,19 +775,17 @@ describe("讨论 next_action", () => {
 				expect(data.mode).toBe("discussion-context");
 				expect(data.version).toBe(VERSION);
 				expect(data.context_token).toEqual(expect.any(String));
-				const action = data.next_action;
-				expect(action?.type).toBe("present_and_collect");
-				if (action?.type !== "present_and_collect") throw new Error("缺少讨论接续动作");
-				expect(action.instruction.length).toBeGreaterThan(0);
-				expect(action.required_next_call).toContain(VERSION);
-				const match = /await dispatch\((\[[\s\S]*\])\)$/.exec(action.required_next_call);
-				expect(match).not.toBeNull();
-				const nextArgv: unknown = JSON.parse(match![1]!);
-				expect(nextArgv).toEqual([
-					...argv, "--context-token", data.context_token,
-					"--content", "<讨论后确定的完整正文>",
-				]);
+				expect(data.id).toBe(name === "FSD decompose" ? "[FSD]-child" : argv[2]);
+				expect(data.parent).toBe(name === "FSD decompose" ? argv[2] : argv.includes("--parent") ? argv[argv.indexOf("--parent") + 1] : null);
+				expect(typeof data.background).toBe("string");
+				expect(String(data.background).length).toBeGreaterThan(0);
+				expect(data).not.toHaveProperty("next_action");
 			}
+			expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
+			const changedIntent = [...argv];
+			changedIntent[changedIntent.indexOf("--file") + 1] += "_other";
+			const changed = successData(await dispatchIn(dir, changedIntent));
+			expect(changed.context_token).not.toBe(successData(viaDispatch).context_token);
 			expect(digestTree(dir)).toEqual(before);
 		});
 	}
@@ -532,7 +793,7 @@ describe("讨论 next_action", () => {
 
 describe("写入、confirm/revert 的成功信封", () => {
 	for (const entry of ["dispatch", "bin"] as const) {
-		it(entry + "：版本与三层规格的接续动作和落盘状态一致", async () => {
+		it(entry + "：版本与三层规格返回业务事实且落盘状态一致", async () => {
 			const dir = makeSkeleton();
 			const run = async (argv: string[]): Promise<CoreResult> => {
 				if (entry === "dispatch") return dispatchIn(dir, argv);
@@ -542,7 +803,7 @@ describe("写入、confirm/revert 的成功信封", () => {
 			};
 			const created = successData(await run(["version", "create", VERSION]));
 			expect(created.version).toBe(VERSION);
-			expect(created.next_action).toEqual({ type: "report", message: '已创建版本 "' + VERSION + '"。' });
+			expect(created).not.toHaveProperty("next_action");
 			const layers = [
 				{ layer: "prd", id: "[PRD]-demo", body: prdDoc("[PRD]-demo"), parent: [], chunks: ["[PRD]-demo"] },
 				{ layer: "fsd", id: "[FSD]-demo", body: FSD_BODY, parent: ["--parent", "[PRD]-demo"], chunks: ["[FSD]-demo", "[FSD]-demo:feature"] },
@@ -550,22 +811,22 @@ describe("写入、confirm/revert 的成功信封", () => {
 			];
 			for (const { layer, id, body, parent, chunks } of layers) {
 				const written = successData(await run([layer, "create", id, ...parent, "--content", body, "--skip-context"]));
-				expect(written).toMatchObject({ mode: "written", id, phase: layer + "-creating", next_action: null });
+				expect(written).toMatchObject({ mode: "written", id, phase: layer + "-creating" });
 				expect(readNorm(path.join(dir, "project-docs", "versions", VERSION, layer, id + ".md"))).toContain(body.trim());
 				const confirmed = successData(await run([layer, "confirm"]));
 				expect(confirmed).toEqual({
 					version: VERSION, confirmed: chunks, phase: layer + "-confirm",
-					next_action: { type: "report", message: '版本 "' + VERSION + '" 的 ' + layer.toUpperCase() + ' 层已确认，包含 ' + chunks.length + ' 个 chunk；当前阶段为 "' + layer + '-confirm"。' },
 				});
 				const reverted = successData(await run([layer, "revert"]));
-				expect(reverted).toEqual({ version: VERSION, reverted: chunks, phase: layer + "-creating", next_action: null });
+				expect(reverted).toEqual({ version: VERSION, reverted: chunks, phase: layer + "-creating" });
 				expect(readVersionIndex(dir, VERSION).chunks.filter((chunk) => chunks.includes(chunk.id)).every((chunk) => chunk.state === "working")).toBe(true);
-				expect(successData(await run([layer, "confirm"])).next_action?.type).toBe("report");
+				expect(successData(await run([layer, "confirm"]))).toEqual({ version: VERSION, confirmed: chunks, phase: layer + "-confirm" });
 			}
 			const confirmedVersion = successData(await run(["version", "confirm", VERSION]));
-			expect(confirmedVersion).toMatchObject({ version: VERSION, passed: true, next_action: { type: "report", message: '版本 "' + VERSION + '" 的确认检查已通过。' } });
+			expect(confirmedVersion).toMatchObject({ version: VERSION, passed: true });
+			expect(confirmedVersion).not.toHaveProperty("next_action");
 			const revertedVersion = successData(await run(["version", "revert", VERSION, "--confirm"]));
-			expect(revertedVersion).toMatchObject({ version: VERSION, next_action: null });
+			expect(revertedVersion).toMatchObject({ version: VERSION });
 			expect(fs.existsSync(path.join(dir, "project-docs", "versions", VERSION))).toBe(false);
 		}, 20_000);
 	}
@@ -592,7 +853,7 @@ describe("codegen 文件交付", () => {
 			for (const result of results) {
 				const data = successData(result);
 				expect(Object.keys(data).sort()).toEqual([
-					"bundle_path", "bytes", "generation_token", "next_action", "sha256",
+					"bundle_path", "bytes", "generation_token", "sha256",
 					"source_file", "target_file", "tdd_root", "version",
 				]);
 				expect(data).toMatchObject({
@@ -618,14 +879,9 @@ describe("codegen 文件交付", () => {
 				for (const content of [marker, "target-source-sentinel", "[TDD]-demo", "[FSD]-demo:feature", "[PRD]-demo"]) {
 					expect(text).toContain(content);
 				}
-				const action = data.next_action;
-				expect(action?.type).toBe("continue");
-				if (action?.type !== "continue") throw new Error("缺少生成接续动作");
-				for (const key of ["bundle_path", "sha256", "bytes", "target_file", "tdd_root", "source_file"] as const) {
-					const value = data[key];
-					expect(action.instruction).toContain(typeof value === "string" ? JSON.stringify(value) : String(value));
-				}
-				expect(action.next_call).toBe("registerGenerationReceipt(root, { generation_token: " + JSON.stringify(data.generation_token) + " })");
+				expect(data).not.toHaveProperty("next_action");
+				expect(data).not.toHaveProperty("content");
+				expect(text).not.toContain("registerGenerationReceipt(root");
 				const envelope = JSON.stringify(result);
 				expect(Buffer.byteLength(envelope)).toBeLessThan(bytes.length);
 				expect(envelope).not.toContain("CODEGEN_完整规格正文_");
@@ -635,6 +891,113 @@ describe("codegen 文件交付", () => {
 			expect(readNorm(target)).toBe('export const existingArtifact = "target-source-sentinel";\n');
 		});
 	}
+
+	it("Node API 缺省内存交付不创建 bundle 文件，字节 hash 与元数据一致", async () => {
+		const dir = makeBaselineSkeleton("MEMORY_DELIVERY_COMPLETE_SPEC");
+		const temporaryRoot = mkTmp();
+		const variables = ["TMP", "TEMP", "TMPDIR"];
+		const previous = variables.map((key) => process.env[key]);
+		try {
+			for (const key of variables) process.env[key] = temporaryRoot;
+			const result = apiData(await apiIn(dir, (core) => core.delivery.prepare({ tddRootId: "[TDD]-demo" })));
+			expect(result).toMatchObject({ target_file: "src/demo.ts", tdd_root: "[TDD]-demo", target_state: "absent" });
+			expect(result.content).toContain("MEMORY_DELIVERY_COMPLETE_SPEC");
+			expect(result).not.toHaveProperty("bundle_path");
+			expect(result).not.toHaveProperty("next_action");
+			expect(Buffer.byteLength(result.content, "utf8")).toBe(result.bytes);
+			expect(createHash("sha256").update(result.content, "utf8").digest("hex")).toBe(result.sha256);
+			expect(fs.readdirSync(temporaryRoot)).toEqual([]);
+			const file = apiData(await apiIn(dir, (core) => core.delivery.prepare({ tddRootId: "[TDD]-demo", output: "file" })));
+			expect(fs.readFileSync(file.bundle_path, "utf8")).toBe(result.content);
+			for (const key of ["sha256", "bytes", "target_file", "tdd_root", "source_file", "version"] as const) expect(file[key]).toBe(result[key]);
+		} finally {
+			variables.forEach((key, index) => {
+				const value = previous[index];
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			});
+		}
+	});
+});
+
+describe("codegen receipt 与 verify CLI", () => {
+	it("真实 CLI prepare → receipt → verify 闭环，API 结果一致且制品 hash 由 core 读取", async () => {
+		const dir = makeReceiptSkeleton();
+		const before = digestTree(dir);
+		const missing = successData(await readOnlyBoth(dir, ["codegen", "verify", "--version", VERSION]));
+		expect(missing.enforcement).toBe("report");
+		expect(missing.passed).toBe(true);
+		expect(missing.findings).toEqual([expect.objectContaining({ code: "GENERATION_RECEIPT_MISSING", tdd_root: "[TDD]-demo", target_file: "src/demo.ts" })]);
+		const prepareBin = await runBin(dir, ["codegen", "prepare", "[TDD]-demo", "--version", VERSION]);
+		expect(prepareBin.status, prepareBin.stderr || prepareBin.stdout).toBe(0);
+		const prepared = successData(parseSingleJson(prepareBin.stdout));
+		tmpDirs.push(path.dirname(String(prepared.bundle_path)));
+		const token = prepared.generation_token;
+		expect(typeof token).toBe("string");
+		const receiptArgv = ["codegen", "receipt", "--generation-token", String(token)];
+		const viaBin = await runBin(dir, receiptArgv);
+		expect(viaBin.status, viaBin.stderr || viaBin.stdout).toBe(0);
+		const cliReceipt = parseSingleJson(viaBin.stdout);
+		expect(cliReceipt.ok).toBe(true);
+		if (!cliReceipt.ok) throw new Error(cliReceipt.error);
+		const apiReceipt = apiData(await apiIn(dir, (core) => core.generation.registerReceipt({ generationToken: String(token) })));
+		expect(cliReceipt.data).toEqual(apiReceipt);
+		expect(apiReceipt).toMatchObject({ version: VERSION, tdd_root: "[TDD]-demo", target_file: "src/demo.ts", bundle_sha256: prepared.sha256 });
+		expect(apiReceipt.artifact_sha256).toBe(createHash("sha256").update(fs.readFileSync(path.join(dir, "src/demo.ts"))).digest("hex"));
+		const verifyArgv = ["codegen", "verify", "--version", VERSION];
+		const dispatched = await dispatchIn(dir, verifyArgv);
+		const apiVerification = apiData(await apiIn(dir, (core) => core.generation.verifyReceipts({ version: VERSION })));
+		expect(dispatched.ok && dispatched.data).toEqual(apiVerification);
+		expect(apiVerification).toMatchObject({ enforcement: "report", passed: true, findings: [] });
+		const verifyBin = await runBin(dir, verifyArgv);
+		expect(verifyBin.status, verifyBin.stderr || verifyBin.stdout).toBe(0);
+		expect(parseSingleJson(verifyBin.stdout)).toEqual(dispatched);
+		expect(digestTree(dir)).not.toEqual(before); // prepare 和 receipt 持久化生成记录。
+	}, 20_000);
+
+	it("receipt 缺少 token/多余位置参数与 verify 缺少版本均为 USAGE_ERROR", async () => {
+		const dir = makeReceiptSkeleton();
+		for (const argv of [
+			["codegen", "receipt"], ["codegen", "receipt", "extra", "--generation-token", "invalid"],
+			["codegen", "verify"], ["codegen", "verify", "--version"],
+		]) {
+			const before = digestTree(dir);
+			const result = await readOnlyBoth(dir, argv, 1);
+			expect(result).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+			expect(digestTree(dir)).toEqual(before);
+		}
+	});
+
+	it("伪造/过期令牌拒绝，CLI 与 API envelope 同形且零写入", async () => {
+		const dir = makeReceiptSkeleton();
+		const argv = ["codegen", "receipt", "--generation-token", "invalid"];
+		const before = digestTree(dir);
+		const cli = await readOnlyBoth(dir, argv, 1);
+		expect(cli).toMatchObject({ ok: false, code: "GENERATION_TOKEN_INVALID" });
+		const api = await apiIn(dir, (core) => core.generation.registerReceipt({ generationToken: "invalid" }));
+		expect(api).toEqual(cli);
+		expect(digestTree(dir)).toEqual(before);
+		const first = apiData(await apiIn(dir, (core) => core.delivery.prepare({ tddRootId: "[TDD]-demo" })));
+		apiData(await apiIn(dir, (core) => core.delivery.prepare({ tddRootId: "[TDD]-demo" })));
+		const stale = await readOnlyBoth(dir, ["codegen", "receipt", "--generation-token", first.generation_token], 1);
+		expect(stale).toMatchObject({ ok: false, code: "GENERATION_TOKEN_STALE" });
+	});
+
+	it("制品变化在 report/block 均可诊断，block passed=false 仍 exit 0", async () => {
+		const dir = makeReceiptSkeleton();
+		const prepared = apiData(await apiIn(dir, (core) => core.delivery.prepare({ tddRootId: "[TDD]-demo" })));
+		const receipt = await runBin(dir, ["codegen", "receipt", "--generation-token", prepared.generation_token]);
+		expect(receipt.status, receipt.stderr || receipt.stdout).toBe(0);
+		expectEnvelope(parseSingleJson(receipt.stdout));
+		fs.writeFileSync(path.join(dir, "src/demo.ts"), "export const demo = false;\n");
+		for (const enforcement of ["report", "block"] as const) {
+			fs.writeFileSync(path.join(dir, "project-docs/.meta/config.yaml"), JSON.stringify({ generation_receipts: { enforcement } }));
+			const verified = successData(await readOnlyBoth(dir, ["codegen", "verify", "--version", VERSION]));
+			expect(verified).toEqual({ enforcement, passed: enforcement === "report", findings: [expect.objectContaining({ code: "GENERATION_ARTIFACT_CHANGED", tdd_root: "[TDD]-demo", target_file: "src/demo.ts" })] });
+		}
+		const rejected = await readOnlyBoth(dir, ["codegen", "receipt", "--generation-token", prepared.generation_token], 1);
+		expect(rejected).toMatchObject({ ok: false, code: "GENERATION_ARTIFACT_CHANGED" });
+	}, 20_000);
 });
 
 describe("库调用存活与零导入副作用", () => {
@@ -662,7 +1025,7 @@ describe("库调用存活与零导入副作用", () => {
 		expect(child.stderr).toBe("");
 		expect(child.stdout.trim().split(/\r?\n/)).toHaveLength(1);
 		const result = JSON.parse(child.stdout) as { first: CoreResult; second: CoreResult; continued: boolean; sameCwd: boolean };
-		expect(result.first).toEqual({ ok: true, data: { version: "unversioned", next_action: null } });
+		expect(result.first).toEqual({ ok: true, data: { version: "unversioned" } });
 		expectEnvelope(result.second);
 		expect(result.second).toMatchObject({ ok: false, code: "USAGE_ERROR" });
 		expect(result.continued).toBe(true);
@@ -680,7 +1043,9 @@ describe("库调用存活与零导入副作用", () => {
 			].join("\n");
 			const child = await runNode(dir, ["--input-type=module", "--eval", script]);
 			expect(child.status, child.stderr).toBe(0);
-			expect(child.stderr).toBe("");
+			const events = parseProgress(child.stderr);
+			if (expectedCode === 0) expect(events).toEqual(expect.arrayContaining([expect.objectContaining({ operation: "project.documentVersion", stage: "validate", status: "completed" })]));
+			else expect(events).toEqual([]);
 			const lines = child.stdout.trim().split(/\r?\n/);
 			expect(lines).toHaveLength(2);
 			const envelope = parseSingleJson(lines[0]!);
@@ -689,6 +1054,43 @@ describe("库调用存活与零导入副作用", () => {
 			expect(fs.readdirSync(dir)).toEqual([]);
 		});
 	}
+
+	it("dispatch 透传真实验收进度且回调异常不改变结果，CLI stdout 不混入子进程输出", async () => {
+		const dir = makeSkeleton();
+		const script = path.join(dir, "acceptance script.cjs");
+		fs.writeFileSync(script, "process.stdout.write('child-output'); process.stderr.write('child-error'); setTimeout(() => process.exit(2), 200);\n");
+		successData(await dispatchIn(dir, ["acceptance", "set", `"${NODE_EXE}" "${script}"`]));
+		const previous = process.cwd();
+		const events: CoreProgressEvent[] = [];
+		let ticks = 0;
+		const ticker = setInterval(() => { ticks += 1; }, 10);
+		let result: CliDispatchResult;
+		try {
+			process.chdir(dir);
+			result = await dispatch(["acceptance", "run"], {
+				onProgress(event) { events.push(event); throw new Error("display failure"); },
+			});
+		} finally {
+			process.chdir(previous);
+			clearInterval(ticker);
+		}
+		expectEnvelope(result);
+		expect(result).toEqual({ ok: true, data: { ran: true, passed: false, exitCode: 2 } });
+		expect(ticks).toBeGreaterThan(0);
+		const acceptanceEvents = events.filter((event) => event.stage === "acceptance");
+		expect(acceptanceEvents).toHaveLength(2);
+		expect(acceptanceEvents[0]?.status).toBe("started");
+		expect(["completed", "failed"]).toContain(acceptanceEvents[1]?.status);
+		expect(new Set(events.map((event) => event.operationId)).size).toBe(1);
+		expect(events.every((event) => event.operation === "acceptance.run")).toBe(true);
+		const bin = await runBin(dir, ["acceptance", "run"]);
+		expect(bin.status, bin.stderr || bin.stdout).toBe(0);
+		expect(parseSingleJson(bin.stdout)).toEqual(result);
+		const binAcceptance = parseProgress(bin.stderr).filter((event) => event.stage === "acceptance");
+		expect(binAcceptance.map((event) => event.status)).toEqual(acceptanceEvents.map((event) => event.status));
+		expect(bin.stdout + bin.stderr).not.toContain("child-output");
+		expect(bin.stdout + bin.stderr).not.toContain("child-error");
+	}, 10_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -698,7 +1100,7 @@ describe("库调用存活与零导入副作用", () => {
 describe("USAGE_ERROR", () => {
 	const matrix: Array<[string, string[]]> = [
 		["未知命令", ["frobnicate"]],
-		["回执登记不提供 CLI", ["registerGenerationReceipt", "token"]],
+		["内部函数名不是 CLI 命令", ["registerGenerationReceipt", "token"]],
 		["缺参数", ["search"]],
 		["非法 flag 值（enum 外）", ["search", "x", "--scope", "bogus"]],
 		["未知 flag", ["search", "x", "--bogus"]],
@@ -754,7 +1156,7 @@ describe("校验类语义", () => {
 		const argv = ["specgraph", "validate-new-model"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const data = viaDispatch.data as SuccessData & {
 				passed: unknown;
@@ -786,7 +1188,7 @@ describe("校验类语义", () => {
 			ok: true,
 			data: {
 				version: "baseline", passed: true, violations: [], policy_violations: [],
-				warnings: [], target_file_missing: [], derives_residue: [], next_action: null,
+				warnings: [], target_file_missing: [], derives_residue: [],
 			},
 		});
 		const viaBin = await runBin(dir, argv);
@@ -835,7 +1237,7 @@ describe("共享治理诊断", () => {
 			version: VERSION, passed: true, violations: [], policy_violations: [],
 			warnings: confirmed.warnings,
 			target_file_missing: [{ ...missingTarget, enforcement: "warn" }],
-			derives_residue: [{ ...residue, enforcement: "warn" }], next_action: null,
+			derives_residue: [{ ...residue, enforcement: "warn" }],
 		});
 	});
 
@@ -858,7 +1260,7 @@ describe("共享治理诊断", () => {
 				warnings: [{ ...warned, enforcement: "warn" }],
 				target_file_missing: [{ ...missingTarget, enforcement: policy === "target_file_existence" ? "block" : "warn" }],
 				derives_residue: [{ ...residue, enforcement: policy === "derives_residue" ? "block" : "warn" }],
-				next_action: null,
+
 			});
 		});
 	}
@@ -936,7 +1338,7 @@ describe("诊断有效版本", () => {
 		};
 		expect(implicit).toEqual({
 			version: VERSION, passed: true, violations: [], policy_violations: [],
-			warnings: [finding], target_file_missing: [finding], derives_residue: [], next_action: null,
+			warnings: [finding], target_file_missing: [finding], derives_residue: [],
 		});
 	});
 
@@ -953,7 +1355,7 @@ describe("诊断有效版本", () => {
 			};
 			expect(data).toEqual({
 				version: "baseline", passed: true, violations: [], policy_violations: [],
-				warnings: [finding], target_file_missing: [finding], derives_residue: [], next_action: null,
+				warnings: [finding], target_file_missing: [finding], derives_residue: [],
 			});
 		});
 	}
@@ -1007,7 +1409,7 @@ describe("--version", () => {
 		const before = treeSnapshot(dir);
 
 		const viaDispatch = await dispatchIn(dir, ["--version"]);
-		expect(viaDispatch).toEqual({ ok: true, data: { version: "v0.10", next_action: null } });
+		expect(viaDispatch).toEqual({ ok: true, data: { version: "v0.10" } });
 		const viaBin = await runBin(dir, ["--version"]);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
@@ -1018,7 +1420,7 @@ describe("--version", () => {
 	it("无版本记录：unversioned", async () => {
 		const dir = makeSkeleton();
 		const viaDispatch = await dispatchIn(dir, ["--version"]);
-		expect(viaDispatch).toEqual({ ok: true, data: { version: "unversioned", next_action: null } });
+		expect(viaDispatch).toEqual({ ok: true, data: { version: "unversioned" } });
 		const viaBin = await runBin(dir, ["--version"]);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
@@ -1027,7 +1429,7 @@ describe("--version", () => {
 	it("非项目根：unversioned 且目录保持为空", async () => {
 		const dir = mkTmp(); // 无 project-docs
 		const viaDispatch = await dispatchIn(dir, ["--version"]);
-		expect(viaDispatch).toEqual({ ok: true, data: { version: "unversioned", next_action: null } });
+		expect(viaDispatch).toEqual({ ok: true, data: { version: "unversioned" } });
 		const viaBin = await runBin(dir, ["--version"]);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
@@ -1170,7 +1572,7 @@ describe("参数形态", () => {
 			"--skip-context",
 		]);
 		expect(viaContent.ok).toBe(true);
-		expect(successData(viaContent).next_action).toBe(null);
+		expect(successData(viaContent)).not.toHaveProperty("next_action");
 
 		// 骨架 B：--content-file 指向同字节文件
 		const dirB = makeVersionSkeleton();
@@ -1185,7 +1587,7 @@ describe("参数形态", () => {
 			"--skip-context",
 		]);
 		expect(viaFile.ok).toBe(true);
-		expect(successData(viaFile).next_action).toBe(null);
+		expect(successData(viaFile)).not.toHaveProperty("next_action");
 
 		// 结果信封同形（skip-context 审计的时间戳是唯一非确定字段，比较前归一）
 		expect(stripAuditTimestamp(viaFile)).toEqual(stripAuditTimestamp(viaContent));
@@ -1286,7 +1688,7 @@ describe("参数形态", () => {
 		];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 
 		const index = readVersionIndex(dir, VERSION);
 		const entry = index.chunks.find((c) => c.id === "[PRD]-renamed");
@@ -1326,7 +1728,7 @@ describe("参数形态", () => {
 		const viaDispatch = await dispatchIn(dir, argv);
 		// create 不拦截冲突：原样写入工作区，冲突留给 version confirm 门禁。
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 
 		const index = readVersionIndex(dir, VERSION);
 		const entry = index.chunks.find((c) => c.id === "[PRD]-new");
@@ -1434,7 +1836,7 @@ describe("fsd decompose --content-file", () => {
 					...argv, source, source === "--content" ? body : contentFile,
 					"--context-token", context.context_token as string,
 				]);
-				expect(successData(result).next_action).toBe(null);
+				expect(successData(result)).not.toHaveProperty("next_action");
 				const childFile = path.join(dir, "project-docs", "versions", VERSION, "fsd", CHILD + ".md");
 				const bytes = fs.readFileSync(childFile);
 				expect(bytes.toString("utf8").replace(/\r\n/g, "\n")).toContain(body.trim());
@@ -1507,7 +1909,7 @@ describe("state", () => {
 		const argv = ["state", "--format", "json"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const panel = viaDispatch.data as Record<string, unknown>;
 			expect(panel.version).toBe(VERSION);
@@ -1556,7 +1958,7 @@ describe("state", () => {
 		});
 		const viaDispatch = await dispatchIn(dir, ["state"]);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const data = viaDispatch.data as SuccessData & { version: string; format: string; content: string };
 			expect(data.version).toBe(VERSION);
@@ -1594,7 +1996,7 @@ describe("state", () => {
 
 		const viaDispatch = await dispatchIn(dir, ["state", "--save"]);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const data = viaDispatch.data as SuccessData & { saved_to?: string };
 			expect(data.saved_to).toBe(stateFile);
@@ -1643,13 +2045,13 @@ describe("state", () => {
 		expect(viaBin.status).toBe(1);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
 	});
-	it("显式指定已 merged 版本：json 保持只读且显式 next_action 为 null", async () => {
+	it("显式指定已 merged 版本：json 保持只读且无 next_action", async () => {
 		const dir = makeStateSkeleton();
 		writeVersionMeta(dir, VERSION, { phase: "merged", merged_at: "2026-01-02T00:00:00+00:00" });
 		const before = digestTree(dir);
 		const argv = ["state", "--version", VERSION, "--format", "json"];
 		const viaDispatch = await dispatchIn(dir, argv);
-		expect(viaDispatch).toMatchObject({ ok: true, data: { version: VERSION, merged: true, next_action: null } });
+		expect(viaDispatch).toMatchObject({ ok: true, data: { version: VERSION, merged: true } });
 		const viaBin = await runBin(dir, argv);
 		expect(viaBin.status).toBe(0);
 		expect(parseSingleJson(viaBin.stdout)).toEqual(viaDispatch);
@@ -1706,7 +2108,7 @@ describe("backfill-tags", () => {
 		const first = await dispatchIn(dir, argv);
 		expect(first).toEqual({
 			ok: true,
-			data: { backfilled: [MERGED], skipped: [], git: "committed", next_action: null },
+			data: { backfilled: [MERGED], skipped: [], git: "committed" },
 		});
 		// 标签确实指向 docs_commit
 		expect(
@@ -1723,7 +2125,7 @@ describe("backfill-tags", () => {
 				backfilled: [],
 				skipped: [{ version: MERGED, reason: "tag_present" }],
 				git: "committed",
-				next_action: null,
+
 			},
 		});
 
@@ -1740,7 +2142,7 @@ describe("backfill-tags", () => {
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch).toEqual({
 			ok: true,
-			data: { backfilled: [], skipped: [], git: "unavailable", next_action: null },
+			data: { backfilled: [], skipped: [], git: "unavailable" },
 		});
 		expect(digestTree(dir)).toEqual(before);
 
@@ -1785,7 +2187,7 @@ describe("search --regexp", () => {
 		const argv = ["search", "a.c"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const data = viaDispatch.data as SuccessData & { count: number; hits: Array<{ chunkId: string }> };
 			expect(data.count).toBe(1);
@@ -1802,7 +2204,7 @@ describe("search --regexp", () => {
 		const argv = ["search", "a.c", "--regexp"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true && literal.ok === true) {
 			const regexpData = viaDispatch.data as SuccessData & {
 				count: number;
@@ -1864,7 +2266,7 @@ describe("init 参数", () => {
 		const dir = mkTmp();
 		const viaDispatch = await dispatchIn(dir, ["init", "--name", "demo"]);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		for (const rel of [
 			PLATFORM_WRAPPER_REL,
 			"project-docs/.meta/chunks-index.yaml",
@@ -1889,7 +2291,7 @@ describe("init 参数", () => {
 		const argv = ["init", "--check"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			// --check 路由到 init 域 checkProject：{ok, missing}，zero-write
 			const data = viaDispatch.data as SuccessData & { ok: boolean; missing: string[] };
@@ -1921,7 +2323,7 @@ describe("init 参数", () => {
 		const argv = ["init", "--check", "--refresh-wrapper"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			// --check 优先：仍是只读的 checkProject 形态（不出现 createdFiles 重建结果）
 			const data = viaDispatch.data as SuccessData & { ok: boolean; missing: string[] };
@@ -1947,7 +2349,7 @@ describe("init 参数", () => {
 				"init", "--check", ...(refresh ? ["--refresh-wrapper"] : []),
 			]);
 			expect(result).toEqual({
-				ok: true, data: { ok: false, missing: [PLATFORM_WRAPPER_REL], next_action: null },
+				ok: true, data: { ok: false, missing: [PLATFORM_WRAPPER_REL] },
 			});
 			expect(fs.existsSync(wrapper)).toBe(true);
 			expect(fs.readFileSync(wrapper, "utf8")).toBe(invalid);
@@ -1965,7 +2367,7 @@ describe("init 参数", () => {
 		const argv = ["init", "--refresh-wrapper"];
 		const viaDispatch = await dispatchIn(dir, argv);
 		expect(viaDispatch.ok).toBe(true);
-		expect(successData(viaDispatch).next_action).toBe(null);
+		expect(successData(viaDispatch)).not.toHaveProperty("next_action");
 		if (viaDispatch.ok === true) {
 			const data = viaDispatch.data as SuccessData & { createdFiles: string[] };
 			const written = data.createdFiles.map((p) => p.split(path.sep).join("/"));
@@ -2021,7 +2423,7 @@ describe("init 参数", () => {
 		};
 		expect(docsOf(dirB)).toEqual(docsOf(dirA));
 		// 幂等重跑本身也不新增/改写任何文件
-		expect(plain).toMatchObject({ ok: true, data: { status: "existing", next_action: null } });
+		expect(plain).toMatchObject({ ok: true, data: { status: "existing" } });
 		expect(plain.ok === true && (plain.data as SuccessData & { createdFiles: string[] }).createdFiles).toEqual(
 			[],
 		);

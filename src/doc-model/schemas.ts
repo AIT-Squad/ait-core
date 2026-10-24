@@ -321,14 +321,26 @@ export const GenerationStateSchema = strictObj({
 });
 export type GenerationState = z.infer<typeof GenerationStateSchema>;
 
-export const GenerationDeliveryInputSchema = strictObj({
+const generationDeliveryInputFields = {
   version: z.string().nullable(),
   tdd_root: z.string(),
   target_file: z.string(),
-  bundle_path: z.string(),
   bundle_sha256: sha256Schema,
   bytes: intSchema.nonnegative(),
-});
+};
+
+export const GenerationDeliveryInputSchema = z.union([
+  strictObj({
+    ...generationDeliveryInputFields,
+    content: z.string(),
+    bundle_path: z.never().optional(),
+  }),
+  strictObj({
+    ...generationDeliveryInputFields,
+    bundle_path: z.string(),
+    content: z.never().optional(),
+  }),
+]);
 export type GenerationDeliveryInput = z.infer<typeof GenerationDeliveryInputSchema>;
 
 export const GenerationVerificationSchema = strictObj({
@@ -465,35 +477,10 @@ export type ChangeRecord = z.infer<typeof ChangeRecordSchema>;
 // 输出契约
 // ─────────────────────────────────────────────────────────────
 
-// next_action 三形态
-const PresentAndCollectSchema = strictObj({
-  type: z.literal("present_and_collect"),
-  instruction: z.string(),
-  required_next_call: z.string(),
-});
-const ReportSchema = strictObj({
-  type: z.literal("report"),
-  message: z.string(),
-});
-const ContinueSchema = strictObj({
-  type: z.literal("continue"),
-  instruction: z.string(),
-  next_call: z.string(),
-});
-
-export const NextActionSchema = z.discriminatedUnion("type", [
-  PresentAndCollectSchema,
-  ReportSchema,
-  ContinueSchema,
-]);
-export type NextAction = z.infer<typeof NextActionSchema>;
-
 // CoreResult 输出契约：{ok:true,data} / {ok:false,error,code}
 const OkResult = strictObj({
   ok: z.literal(true),
-  data: z.object({
-    next_action: NextActionSchema.nullable(),
-  }).passthrough(),
+  data: z.object({}).passthrough(),
 });
 const ErrResult = strictObj({
   ok: z.literal(false),

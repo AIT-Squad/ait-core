@@ -195,31 +195,42 @@ function isWithin(directory: string, file: string): boolean {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-function validateDeliveryFile(root: ProjectRoot, delivery: GenerationDeliveryInput, bundle: CodegenBundle): void {
-  if (!path.isAbsolute(delivery.bundle_path)) {
+function readDeliveryFile(root: ProjectRoot, bundlePath: string): Buffer {
+  if (!path.isAbsolute(bundlePath)) {
     throw new GenerationError("GENERATION_TOKEN_INVALID", "交付文件必须使用仓外绝对路径");
   }
-  let bytes: Buffer;
   try {
-    const realFile = fs.realpathSync(delivery.bundle_path);
+    const realFile = fs.realpathSync(bundlePath);
     for (const directory of [root.cwd, root.root]) {
-      if (isWithin(path.resolve(directory), path.resolve(delivery.bundle_path)) ||
+      if (isWithin(path.resolve(directory), path.resolve(bundlePath)) ||
           isWithin(fs.realpathSync(directory), realFile)) {
         throw new GenerationError("GENERATION_TOKEN_INVALID", "交付文件不能位于项目仓库内");
       }
     }
-    bytes = fs.readFileSync(realFile);
+    return fs.readFileSync(realFile);
   } catch (error) {
     if (error instanceof GenerationError) throw error;
-    throw new GenerationError("GENERATION_TOKEN_INVALID", `交付文件不存在或不可读：${delivery.bundle_path}`);
+    throw new GenerationError("GENERATION_TOKEN_INVALID", `交付文件不存在或不可读：${bundlePath}`);
   }
+}
+
+function validateDelivery(root: ProjectRoot, delivery: GenerationDeliveryInput, bundle: CodegenBundle): void {
+  let bytes: Buffer;
+  if ("content" in delivery && typeof delivery.content === "string") {
+    bytes = Buffer.from(delivery.content, "utf8");
+  } else if ("bundle_path" in delivery && typeof delivery.bundle_path === "string") {
+    bytes = readDeliveryFile(root, delivery.bundle_path);
+  } else {
+    throw new GenerationError("GENERATION_TOKEN_INVALID", "交付必须提供完整内存内容或仓外文件");
+  }
+  // Both carriers must prove their actual bytes and current specification before replacing a delivery.
   if (bytes.length !== delivery.bytes || digest(bytes) !== delivery.bundle_sha256) {
-    throw new GenerationError("GENERATION_TOKEN_INVALID", "交付文件的实际字节数或 SHA-256 与声明不一致");
+    throw new GenerationError("GENERATION_TOKEN_INVALID", "交付内容的实际字节数或 SHA-256 与声明不一致");
   }
   const text = bytes.toString("utf8");
   for (const item of [...bundle.upstream, ...bundle.dependencies]) {
     if (!text.includes(item.content) || !text.includes(item.id) || !text.includes(item.file)) {
-      throw new GenerationError("GENERATION_SPEC_CHANGED", `交付文件未包含当前规格的完整正文与来源：${item.id}`);
+      throw new GenerationError("GENERATION_SPEC_CHANGED", `交付内容未包含当前规格的完整正文与来源：${item.id}`);
     }
   }
 }
@@ -233,7 +244,7 @@ export function issueGenerationToken(root: ProjectRoot, delivery: GenerationDeli
   }
   const store = loadStore(root, bundle.version);
   if (store.version?.merged) throw new GenerationError("GENERATION_TOKEN_STALE", "已合入版本不能签发生成令牌");
-  validateDeliveryFile(root, delivery, bundle);
+  validateDelivery(root, delivery, bundle);
   const epoch = store.state?.epoch ?? crypto.randomUUID();
   const record: GenerationDeliveryRecord = {
     delivery_id: crypto.randomUUID(),

@@ -2390,7 +2390,7 @@ describe("v0.10 codegen 权威来源", () => {
     const active = await createVersionTdd(root, "modify");
     fs.mkdirSync(path.join(root.cwd, "src"));
     fs.writeFileSync(path.join(root.cwd, active.target), "export const generated = true;\n");
-    const delivery = prepareDelivery(root, { tddRoot: active.id });
+    const delivery = prepareDelivery(root, { tddRoot: active.id, output: "file" });
     tmpDirs.push(path.dirname(delivery.bundle_path));
     expect(() => registerGenerationReceipt(root, { generation_token: delivery.generation_token })).not.toThrow();
     const metaFile = path.join(root.meta, "versions", VERSION + ".yaml");

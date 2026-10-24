@@ -8,16 +8,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse, stringify } from "yaml";
+import { resolveProjectRoot } from "../src/foundation/root.js";
+import { issueGenerationToken } from "../src/orchestration/generation-receipts.js";
 
 type Data = Record<string, any>;
 type Entry = "dispatch" | "bin" | "wrapper";
 type Snapshot = Map<string, Buffer>;
 interface Run { status: number; stdout: string; stderr: string }
-interface Envelope { ok: boolean; data?: Data; code?: string; error?: string }
+interface Envelope { ok: boolean; data?: Data; code?: string; error?: string; presentation?: Data }
 interface Delivery {
   bundle_path: string; sha256: string; bytes: number; version: string;
   target_file: string; tdd_root: string; source_file: string; generation_token: string;
-  next_action: Data;
 }
 interface Feature { cwd: string; version: string; prd: string; fsd: string; entry?: Entry }
 interface GitState { head: string; status: string; refs: string; tracked: string[] }
@@ -28,10 +29,7 @@ const TIMEOUT = 3_600_000;
 const TARGET = "system-contract-output.cjs";
 const TDD = "[TDD]-system-contract";
 const CHILD_FSD = "[FSD]-system-contract";
-const PUBLIC_FUNCTIONS = [
-  "dispatch", "evaluateWriteGuard", "getSessionContext", "issueGenerationToken",
-  "registerGenerationReceipt", "verifyGenerationReceipts",
-].sort();
+const PUBLIC_FUNCTIONS = ["createCoreApi", "dispatch"];
 const CORPORA = (process.env.AIT_CORPUS_DIRS ?? "").split(";").map((item) => item.trim()).filter(Boolean);
 let suiteDir: string;
 let consumer: string;
@@ -47,6 +45,33 @@ const originalAcceptance = new Map<string, string | null>();
 function write(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content, "utf8");
+}
+function requireCurrentProductionBuild(repo: string): void {
+  const sourceRoot = path.join(repo, "src");
+  const sources: string[] = [];
+  function visit(directory: string): void {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else if (entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) sources.push(file);
+    }
+  }
+  visit(sourceRoot);
+  if (sources.length === 0) throw new Error("No TypeScript production sources found; run npm run build before the installed contract suite.");
+  for (const source of sources) {
+    const sourceStat = fs.statSync(source);
+    const stem = path.relative(sourceRoot, source).slice(0, -3);
+    for (const extension of [".js", ".d.ts"]) {
+      const output = path.join(repo, "dist", "src", stem + extension);
+      const built = fs.statSync(output, { throwIfNoEntry: false });
+      const reason = built === undefined || !built.isFile() ? "missing"
+        : built.size === 0 ? "empty"
+          : built.mtimeMs < sourceStat.mtimeMs ? "older than its source" : null;
+      if (reason !== null) {
+        throw new Error(`Production build output is ${reason}: ${output} (source: ${source}). Run npm run build before the installed contract suite.`);
+      }
+    }
+  }
 }
 function yaml(file: string): Data { return parse(fs.readFileSync(file, "utf8")) as Data; }
 function hash(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
@@ -326,7 +351,7 @@ async function refreshInstalledWrapper(cwd: string): Promise<void> {
   await ok(cwd, ["init", "--refresh-wrapper"], "wrapper");
   expect(fs.readFileSync(wrapperPath(cwd)).equals(wrapper)).toBe(true);
   expectSame(before, managed(cwd));
-  console.info(`[system-contracts] actual project wrapper: ${wrapperPath(cwd)}; installed bin=${bin}; single JSON and nonzero error verified; receipt registration uses the public Node API`);
+  console.info(`[system-contracts] actual project wrapper: ${wrapperPath(cwd)}; installed bin=${bin}; single JSON and nonzero error verified; receipt registration uses codegen receipt`);
 }
 
 function run(executable: string, args: string[], cwd: string, timeout = TIMEOUT, verbatim = false): Promise<Run> {
@@ -366,40 +391,41 @@ async function npm(args: string[], cwd: string): Promise<Run> {
   if (process.platform === "win32") throw new Error("Run this suite through npm test so npm-cli.js can be located.");
   return run("npm", args, cwd);
 }
-function oneJson(result: Run): Data {
-  expect(result.stderr, result.stdout).toBe("");
+function progressOnly(stderr: string): void {
+  for (const line of stderr.trim().split(/\r?\n/).filter(Boolean)) {
+    const event = JSON.parse(line) as Data;
+    expect(Object.keys(event).sort()).toEqual(["operation", "operationId", "stage", "status"]);
+    expect(event.operation).toBeTypeOf("string");
+    expect(event.operationId).toBeTypeOf("string");
+    expect(["read", "validate", "assemble", "write_bundle", "register_delivery", "acceptance", "git", "persist"]).toContain(event.stage);
+    expect(["started", "completed", "failed"]).toContain(event.status);
+    noAdvice(event);
+  }
+}
+function oneJson(result: Run, allowProgress = false): Data {
+  if (allowProgress) progressOnly(result.stderr);
+  else expect(result.stderr, result.stdout).toBe("");
   const lines = result.stdout.trim().split(/\r?\n/);
   expect(lines, result.stdout).toHaveLength(1);
   return JSON.parse(lines[0]!) as Data;
 }
-function nextAction(action: unknown): void {
-  if (action === null) return;
-  expect(action).toBeTypeOf("object");
-  const value = action as Data;
-  if (value.type === "present_and_collect") {
-    expect(Object.keys(value).sort()).toEqual(["instruction", "required_next_call", "type"]);
-    expect(value.instruction).toBeTypeOf("string");
-    expect(value.required_next_call).toContain("dispatch(");
-  } else if (value.type === "continue") {
-    expect(Object.keys(value).sort()).toEqual(["instruction", "next_call", "type"]);
-    expect(value.instruction).toBeTypeOf("string");
-    expect(value.next_call).toContain("registerGenerationReceipt");
-  } else {
-    expect(value.type).toBe("report");
-    expect(Object.keys(value).sort()).toEqual(["message", "type"]);
-    expect(value.message).toBeTypeOf("string");
+function noAdvice(value: unknown): void {
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    expect(["next_action", "next_call", "required_next_call"], `Unexpected orchestration field: ${key}`).not.toContain(key);
+    noAdvice(child);
   }
 }
 async function command(cwd: string, argv: string[], entry: Entry = "dispatch"): Promise<Envelope> {
   const result = entry === "wrapper" ? await runWrapper(cwd, argv) : entry === "bin"
     ? await run(process.execPath, [bin, ...argv], cwd)
     : await run(process.execPath, [apiRunner, "dispatch", JSON.stringify(argv)], cwd);
-  const value = oneJson(result) as unknown as Envelope;
+  const value = oneJson(result, entry !== "dispatch") as unknown as Envelope;
+  if (entry === "dispatch") expect(result.stderr).toBe("");
+  noAdvice(value);
   expect(result.status, `${argv.join(" ")}\n${result.stdout}`).toBe(value.ok ? 0 : 1);
   if (value.ok) {
-    expect(Object.keys(value).sort()).toEqual(["data", "ok"]);
-    expect(value.data).toHaveProperty("next_action");
-    nextAction(value.data!.next_action);
+    expect(Object.keys(value).sort()).toEqual(value.presentation === undefined ? ["data", "ok"] : ["data", "ok", "presentation"]);
   } else {
     expect(Object.keys(value).sort()).toEqual(["code", "error", "ok"]);
     expect(value.code).toBeTypeOf("string");
@@ -412,16 +438,19 @@ async function ok(cwd: string, argv: string[], entry: Entry = "dispatch"): Promi
   expect(result.ok, `${argv.join(" ")}: ${JSON.stringify(result)}`).toBe(true);
   return result.data!;
 }
-async function named(cwd: string, name: string, input: unknown = null): Promise<Data> {
+async function coreCall(cwd: string, name: string, input: unknown = null): Promise<Data> {
   const result = await run(process.execPath, [apiRunner, name, JSON.stringify(input)], cwd);
-  expect(result.status, result.stderr).toBe(0);
-  return oneJson(result);
+  const value = oneJson(result);
+  expect(result.stderr, result.stdout).toBe("");
+  expect(result.status, result.stdout).toBe(value.ok ? 0 : 1);
+  expect(Object.keys(value).sort()).toEqual(value.ok ? ["data", "ok"] : ["code", "error", "ok"]);
+  noAdvice(value);
+  return value;
 }
-async function namedOk(cwd: string, name: string, input: unknown = null): Promise<any> {
-  const result = await named(cwd, name, input);
-  expect(result.thrown, `${name}: ${JSON.stringify(result)}`).toBeUndefined();
-  expect(result).toHaveProperty("value");
-  return result.value;
+async function coreOk(cwd: string, name: string, input: unknown = null): Promise<Data> {
+  const result = await coreCall(cwd, name, input);
+  expect(result.ok, `${name}: ${JSON.stringify(result)}`).toBe(true);
+  return result.data as Data;
 }
 async function rejectWithoutWrites(cwd: string, argv: string[], code: string, entry: Entry): Promise<void> {
   const before = managed(cwd);
@@ -433,8 +462,8 @@ async function create(cwd: string, argv: string[], content: string, entry: Entry
   const discussion = await ok(cwd, argv, entry);
   expect(discussion.mode).toBe("discussion-context");
   expect(discussion.context_token).toMatch(/^ctx-v1\./);
-  expect(discussion.next_action.type).toBe("present_and_collect");
-  expect(discussion.next_action.required_next_call).toContain(discussion.context_token);
+  expect(discussion.background).toBeTypeOf("string");
+  noAdvice(discussion);
   expectSame(before, managed(cwd));
   // File input keeps multiline content out of cmd.exe argument parsing.
   const contentFile = path.join(caseDir(), "content.md");
@@ -442,7 +471,7 @@ async function create(cwd: string, argv: string[], content: string, entry: Entry
   const written = await ok(cwd, [...argv, entry === "wrapper" ? "--content-file" : "--content",
     entry === "wrapper" ? contentFile : content, "--context-token", discussion.context_token], entry);
   expect(written.mode).toBe("written");
-  expect(written.next_action).toBeNull();
+  noAdvice(written);
   return written;
 }
 function chunk(id: string, body: string): string { return `<!-- @id:${id} -->\n## ${id}\n\n${body}\n`; }
@@ -470,7 +499,8 @@ async function startFeature(cwd: string, entry?: Entry): Promise<Feature> {
   const major = Math.max(0, ...versions.map((name) => Number(/^v(\d+)\./.exec(name)?.[1] ?? 0))) + 1;
   const version = `v${major}.0`;
   const created = await ok(cwd, ["version", "create", version], entry ?? "bin");
-  expect(created.next_action.type).toBe("report");
+  expect(created.version).toBe(version);
+  noAdvice(created);
   const feature: Feature = { cwd, version, prd: prd.chunk_id as string, fsd: fsd.chunk_id as string,
     ...(entry === undefined ? {} : { entry }) };
   await create(cwd, ["prd", "create", `${feature.prd}:system_contract`], requirement(`${feature.prd}:system_contract`), entry);
@@ -495,7 +525,8 @@ async function deliver(feature: Feature, entry: Entry = feature.entry ?? "dispat
   const pointer = await ok(feature.cwd, ["codegen", "prepare", id], entry) as unknown as Delivery;
   expect(pointer.version).toBe(feature.version);
   expect(pointer.tdd_root).toBe(id);
-  expect(pointer.next_action.type).toBe("continue");
+  noAdvice(pointer);
+  expect(pointer).not.toHaveProperty("content");
   expect(path.isAbsolute(pointer.bundle_path)).toBe(true);
   const relative = path.relative(feature.cwd, pointer.bundle_path);
   expect(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)).toBe(true);
@@ -505,8 +536,6 @@ async function deliver(feature: Feature, entry: Entry = feature.entry ?? "dispat
   expect(hash(bytes)).toBe(pointer.sha256);
   expect(bytes.toString("utf8")).toContain(tddContent(id, pointer.target_file).trim());
   expect(pointer.generation_token).toMatch(/^gen-v1\./);
-  expect(pointer.next_action.instruction).toContain(JSON.stringify(pointer.bundle_path));
-  expect(pointer.next_action.next_call).toContain(pointer.generation_token);
   return pointer;
 }
 function generate(cwd: string, delivery: Delivery): void {
@@ -518,8 +547,10 @@ function generate(cwd: string, delivery: Delivery): void {
   // The host consumes the delivered requirement and writes an executable artifact.
   write(path.join(cwd, delivery.target_file), `module.exports = ${JSON.stringify({ value: Number(match![1]), source: delivery.tdd_root })};\n`);
 }
-async function receipt(cwd: string, delivery: Delivery): Promise<Data> {
-  const value = await namedOk(cwd, "registerGenerationReceipt", { generation_token: delivery.generation_token }) as Data;
+async function receipt(cwd: string, delivery: Delivery, entry?: Entry): Promise<Data> {
+  const value = entry === undefined
+    ? await coreOk(cwd, "generation.registerReceipt", { generationToken: delivery.generation_token })
+    : await ok(cwd, ["codegen", "receipt", "--generation-token", delivery.generation_token], entry);
   expect(value).toMatchObject({ version: delivery.version, tdd_root: delivery.tdd_root,
     target_file: delivery.target_file, bundle_sha256: delivery.sha256,
     artifact_sha256: hash(fs.readFileSync(path.join(cwd, delivery.target_file))) });
@@ -634,30 +665,139 @@ function pythonFixture(cwd: string): void {
   })));
 }
 
+const TYPES_PROBE = String.raw`
+import { createCoreApi, dispatch } from "ait-core";
+import type * as T from "ait-core";
+// @ts-expect-error Retired orchestration types are not public.
+import type { NextAction } from "ait-core";
+// @ts-expect-error Public clients do not require an internal project-root shape.
+import type { ProjectRoot } from "ait-core";
+// @ts-expect-error Callers cannot issue their own generation deliveries.
+import type { GenerationDeliveryInput } from "ait-core";
+type PublicContracts = [
+  T.CoreApi, T.CoreApiOptions, T.CoreProgressEvent, T.ProgressStage, T.ProgressStatus,
+  T.CliDispatchResult, T.CliPresentation, T.Direction, T.EdgeRel, T.LayerScope,
+  T.SearchScope, T.StateFormat, T.GitAvailability, T.VersionPhase,
+  T.InitInput, T.VersionInput, T.OptionalVersionInput, T.VersionRevertInput,
+  T.DocumentInput, T.PrdInput, T.DecomposeInput, T.DeliveryPrepareInput,
+  T.GraphQueryInput, T.GraphImpactInput, T.SearchInput, T.BaselineSummaryInput,
+  T.StateSaveInput, T.AcceptanceSetInput, T.PushInput, T.GenerationReceiptInput,
+  T.GenerationStatusInput, T.GuardEvaluateInput, T.DocumentVersionResult,
+  T.InitResult, T.ProjectCheckResult, T.InitResponse, T.VersionCreateResult,
+  T.VersionCommitResult, T.VersionStatus, T.VersionConfirmResult, T.VersionMergeResult,
+  T.VersionRevertResult, T.BackfillTagsResult, T.DiscussionResult, T.DocumentWrittenResult,
+  T.DocumentResult, T.DecomposeWrittenResult, T.DecomposeResult, T.LayerConfirmResult,
+  T.LayerRevertResult, T.DeliveryMetadata, T.MemoryDelivery, T.DeliveryPointer,
+  T.DepsResult, T.ViewEdge, T.ImpactResult, T.SpecGraph, T.BaselineIndex,
+  T.ValidationReport, T.GovernanceFinding, T.EdgeRef, T.SearchHit, T.SearchResult,
+  T.BaselineSummaryItem, T.BaselineSummary, T.BaselineStats, T.StatePanel,
+  T.MarkdownState, T.StateSaveResult, T.AcceptanceConfigResult, T.AcceptanceResult,
+  T.PushReport, T.PushResult, T.SessionContext, T.LayerCounts, T.VersionSummary,
+  T.VersionListResult, T.VersionInspection, T.GenerationItemStatus, T.GenerationStatus,
+  T.EffectiveGovernancePolicy, T.GuardDecision, T.GenerationReceipt, T.GenerationVerification,
+  T.ProjectApi, T.VersionApi, T.PrdApi, T.FsdApi, T.TddApi, T.DeliveryApi, T.GraphApi,
+  T.SearchApi, T.StateApi, T.IndexApi, T.AcceptanceApi, T.PublishApi, T.SessionApi,
+  T.GenerationApi, T.GovernanceApi, T.GuardApi
+];
+const options: T.CoreApiOptions = { onProgress(event: T.CoreProgressEvent) { void event.operationId; } };
+const core: T.CoreApi = createCoreApi(options);
+const argvResult: Promise<T.CoreResult> = dispatch([]);
+const cliResult: Promise<T.CliDispatchResult> = dispatch([], options);
+const check = <U extends object>(result: T.R<U>): void => { void result; };
+check<T.DocumentVersionResult>(core.project.documentVersion());
+check<T.InitResponse>(core.project.init());
+check<T.VersionCreateResult>(core.version.create({ version: "v2.0" }));
+check<T.VersionCommitResult>(core.version.commit({ version: "v2.0" }));
+check<T.VersionStatus>(core.version.status({ version: "v2.0" }));
+check<T.VersionConfirmResult>(core.version.confirm({ version: "v2.0" }));
+check<T.VersionMergeResult>(core.version.merge({ version: "v2.0" }));
+check<T.VersionRevertResult>(core.version.revert({ version: "v2.0", confirm: true }));
+check<T.BackfillTagsResult>(core.version.backfillTags());
+check<T.VersionListResult>(core.version.list());
+check<T.VersionInspection>(core.version.inspect({ version: "v2.0" }));
+check<T.DocumentResult>(core.prd.create({ id: "[PRD]-demo", contextToken: "token" }));
+check<T.LayerConfirmResult>(core.prd.confirm());
+check<T.LayerRevertResult>(core.prd.revert());
+check<T.DocumentResult>(core.fsd.create({ id: "[FSD]-demo", parent: "[PRD]-demo" }));
+check<T.LayerConfirmResult>(core.fsd.confirm());
+check<T.LayerRevertResult>(core.fsd.revert());
+check<T.DecomposeResult>(core.fsd.decompose({ parentSplit: "[FSD]-demo:feature", childRootId: "[FSD]-demo-feature" }));
+check<T.DocumentResult>(core.tdd.create({ id: "[TDD]-demo", parent: "[FSD]-demo:feature" }));
+check<T.LayerConfirmResult>(core.tdd.confirm());
+check<T.LayerRevertResult>(core.tdd.revert());
+check<T.MemoryDelivery>(core.delivery.prepare({ tddRootId: "[TDD]-demo" }));
+check<T.MemoryDelivery>(core.delivery.prepare({ tddRootId: "[TDD]-demo", output: "memory" }));
+check<T.DeliveryPointer>(core.delivery.prepare({ tddRootId: "[TDD]-demo", output: "file" }));
+declare const deliveryInput: T.DeliveryPrepareInput;
+check<T.MemoryDelivery | T.DeliveryPointer>(core.delivery.prepare(deliveryInput));
+check<T.DepsResult>(core.graph.query({ target: "[FSD]-demo", direction: "out", rels: ["details", "depends_on"], version: "baseline" }));
+check<T.ImpactResult>(core.graph.impact({ target: "[FSD]-demo" }));
+check<T.SpecGraph>(core.graph.sync());
+check<T.SpecGraph>(core.graph.export());
+check<T.ValidationReport>(core.graph.validateNewModel());
+check<T.SearchResult>(core.search.query({ query: "demo", regexp: false, scope: "all" }));
+check<T.BaselineSummary>(core.search.baselineSummary({ scope: "tdd" }));
+check<T.BaselineStats>(core.search.baselineStats());
+check<T.StatePanel>(core.state.get());
+check<T.MarkdownState>(core.state.render());
+check<T.StateSaveResult>(core.state.save({ format: "json" }));
+check<T.BaselineIndex>(core.index.rebuild());
+check<T.AcceptanceConfigResult>(core.acceptance.set({ command: "node acceptance.cjs" }));
+check<T.AcceptanceConfigResult>(core.acceptance.show());
+check<T.AcceptanceResult>(core.acceptance.run());
+check<T.PushReport>(core.publish.push({ dryRun: true }));
+check<T.SessionContext>(core.session.get());
+check<T.GenerationReceipt>(core.generation.registerReceipt({ generationToken: "token" }));
+check<T.GenerationVerification>(core.generation.verifyReceipts({ version: "v2.0" }));
+check<T.GenerationStatus>(core.generation.status({ version: "v2.0", tddRootId: "[TDD]-demo" }));
+check<T.EffectiveGovernancePolicy>(core.governance.getPolicy());
+const guard: T.ApiResult<T.GuardDecision> = core.guard.evaluate({ toolName: "write", input: { path: "source.ts" } });
+// @ts-expect-error Factory options do not expose cancellation.
+createCoreApi({ signal: new AbortController().signal });
+// @ts-expect-error A client is bound to its creation directory.
+createCoreApi({ cwd: "." });
+// @ts-expect-error I/O methods do not expose cancellation.
+core.version.confirm({ version: "v2.0", cancel: true });
+// @ts-expect-error Direction aliases have been removed.
+core.graph.query({ target: "x", direction: "from" });
+// @ts-expect-error CLI-only summary format is not a business input.
+core.search.baselineSummary({ format: "json" });
+// @ts-expect-error PRD input has no parent.
+core.prd.create({ id: "[PRD]-demo", parent: "[PRD]-other" });
+// @ts-expect-error Decompose identifies its child by childRootId.
+core.fsd.decompose({ id: "x", parentSplit: "x", childRootId: "y" });
+declare const memory: T.MemoryDelivery;
+// @ts-expect-error Memory delivery has no intermediate file.
+memory.bundle_path;
+declare const pointer: T.DeliveryPointer;
+// @ts-expect-error File delivery does not serialize content.
+pointer.content;
+declare const session: T.SessionContext;
+// @ts-expect-error Session provides facts without next-action advice.
+session.next_action;
+declare const contracts: PublicContracts;
+void [argvResult, cliResult, guard, contracts];
+`;
+
 const API_RUNNER = String.raw`
 import * as api from "ait-core";
-import path from "node:path";
 const [name, raw] = process.argv.slice(2);
 const input = JSON.parse(raw);
 const cwd = process.cwd();
-const root = { cwd, root: path.join(cwd, "project-docs"), docs: path.join(cwd, "project-docs", "docs"), meta: path.join(cwd, "project-docs", ".meta") };
 try {
   let result;
   if (name === "dispatch") {
     result = await api.dispatch(input);
-    if (process.cwd() !== cwd) throw new Error("dispatch changed cwd");
-    process.exitCode = result.ok ? 0 : 1;
   } else {
-    const value = name === "getSessionContext" ? api.getSessionContext(root)
-      : name === "evaluateWriteGuard" ? api.evaluateWriteGuard(input)
-      : name === "verifyGenerationReceipts" ? api.verifyGenerationReceipts(root, input)
-      : name === "issueGenerationToken" ? api.issueGenerationToken(root, input)
-      : name === "registerGenerationReceipt" ? api.registerGenerationReceipt(root, input)
-      : (() => { throw new Error("Unknown test operation: " + name); })();
-    result = { value: await value };
+    const core = api.createCoreApi();
+    const [group, method] = name.split(".");
+    if (typeof core[group]?.[method] !== "function") throw new Error("Unknown test operation: " + name);
+    result = input === null ? await core[group][method]() : await core[group][method](input);
   }
+  if (process.cwd() !== cwd) throw new Error("API changed cwd");
+  process.exitCode = result.ok ? 0 : 1;
   console.log(JSON.stringify(result));
-} catch (error) { console.log(JSON.stringify({ thrown: true, code: error.code, message: error.message })); }
+} catch (error) { console.log(JSON.stringify({ thrown: true, code: error.code, message: error.message })); process.exitCode = 2; }
 `;
 
 const IMPORT_PROBE = String.raw`
@@ -696,12 +836,146 @@ patch(globalThis, "fetch", () => fail("fetch"));
 patch(process.stdout, "write", () => fail("stdout"));
 patch(process.stderr, "write", () => fail("stderr"));
 syncBuiltinESMExports();
-let api;
-try { api = await import("ait-core"); }
+let api, core;
+try { api = await import("ait-core"); core = api.createCoreApi(); }
 finally { for (const restore of undo.reverse()) restore(); syncBuiltinESMExports(); }
-const first = await api.dispatch(["--version"]);
-const second = await api.dispatch(["--version"]);
+const first = await core.project.documentVersion();
+const second = await core.project.documentVersion();
 console.log(JSON.stringify({ exports: Object.keys(api).sort(), functions: Object.values(api).every((value) => typeof value === "function"), first, second, alive: true }));
+`;
+
+// This installed consumer imports only the object API. The test runner starts
+// its host process, but every AIT operation below is a direct Node method call.
+const NODE_ONLY_FLOW = String.raw`
+import { createCoreApi } from "ait-core";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { createHash } from "node:crypto";
+const cwd = process.cwd();
+const events = [];
+let inAcceptance = false;
+let acceptanceTicks = 0;
+const core = createCoreApi({ onProgress(event) {
+  events.push(event);
+  if (event.stage === "acceptance") inAcceptance = event.status === "started";
+  throw new Error("A display callback cannot alter the operation");
+} });
+function facts(value) {
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    assert(!["next_action", "next_call", "required_next_call"].includes(key));
+    facts(child);
+  }
+}
+async function ok(promise) {
+  const result = await promise;
+  facts(result);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual(Object.keys(result).sort(), ["data", "ok"]);
+  return result.data;
+}
+const chunk = (id, body) => "<!-- @id:" + id + " -->\n## " + id + "\n\n" + body + "\n";
+const fence = String.fromCharCode(96).repeat(3);
+const yamlBlock = (body) => fence + "yaml\n" + body + "\n" + fence;
+async function document(api, input, content) {
+  const discussion = await ok(api.create(input));
+  assert.equal(discussion.mode, "discussion-context");
+  assert.match(discussion.context_token, /^ctx-v1\./);
+  assert.equal((await ok(api.create({ ...input, content, contextToken: discussion.context_token }))).mode, "written");
+}
+// The same client continues to read its original project after the host moves.
+process.chdir(path.dirname(cwd));
+assert.equal((await ok(core.session.get())).project_root, cwd);
+assert.equal(process.cwd(), path.dirname(cwd));
+process.chdir(cwd);
+assert.equal((await core.state.get()).code, "NO_VERSION");
+const version = "v2.0", prd = "[PRD]-legacy:node_contract", fsd = "[FSD]-legacy:node_contract";
+const childFsd = "[FSD]-node-contract", leaf = childFsd + ":implementation";
+const tdd = "[TDD]-node-contract", target = "node-only-output.cjs";
+await ok(core.version.create({ version }));
+await document(core.prd, { id: prd }, chunk(prd,
+  "**用户故事:** 作为接管者，我希望直接使用 Node API 生成制品。\n\n### 验收标准\n1. WHEN 执行制品 THEN 系统 SHALL 输出 42。"));
+await ok(core.prd.confirm());
+await document(core.fsd, { id: fsd }, chunk(fsd, "实现值 42。\n\n" + yamlBlock("derives:\n  - '" + prd + "'")));
+const decomposition = { parentSplit: fsd, childRootId: childFsd };
+const background = await ok(core.fsd.decompose(decomposition));
+assert.equal(background.mode, "discussion-context");
+assert.match(background.context_token, /^ctx-v1\./);
+const childContent = chunk(childFsd, "Node 独立制品功能分区。") + "\n" +
+  chunk(leaf, "实现值 42。\n\n" + yamlBlock("derives:\n  - '" + prd + "'"));
+assert.equal((await ok(core.fsd.decompose({ ...decomposition, content: childContent, contextToken: background.context_token }))).mode, "written");
+await ok(core.fsd.confirm());
+const spec = chunk(tdd, yamlBlock("target_file: " + target) + "\n\nSYSTEM_CONTRACT_VALUE=42\n生成 CommonJS 模块，导出 value 与 source。");
+await document(core.tdd, { id: tdd, parent: leaf }, spec);
+await ok(core.tdd.confirm());
+// A file occupying every temporary directory path makes an accidental bundle
+// write fail. Metadata writes inside the copied project must still succeed.
+const blockedTemp = path.join(cwd, "unusable-bundle-temp");
+fs.writeFileSync(blockedTemp, "not a directory");
+const oldTemp = new Map(["TMP", "TEMP", "TMPDIR"].map((key) => [key, process.env[key]]));
+const deliveryStart = events.length;
+let delivery;
+try {
+  for (const key of oldTemp.keys()) process.env[key] = blockedTemp;
+  delivery = await ok(core.delivery.prepare({ tddRootId: tdd }));
+} finally {
+  for (const [key, value] of oldTemp) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+  fs.unlinkSync(blockedTemp);
+}
+assert.equal(Object.hasOwn(delivery, "bundle_path"), false);
+assert.equal(delivery.target_state, "absent");
+assert.equal(delivery.version, version);
+assert.equal(delivery.target_file, target);
+assert(delivery.content.includes(spec.trim()));
+const bytes = Buffer.from(delivery.content, "utf8");
+assert.equal(bytes.length, delivery.bytes);
+assert.equal(createHash("sha256").update(bytes).digest("hex"), delivery.sha256);
+assert.equal(events.slice(deliveryStart).some((event) => event.stage === "write_bundle"), false);
+// The deterministic host receives the complete in-memory context directly.
+const match = /SYSTEM_CONTRACT_VALUE=(\d+)/.exec(delivery.content);
+assert(match);
+fs.writeFileSync(path.join(cwd, target), "module.exports = " + JSON.stringify({ value: Number(match[1]), source: tdd }) + ";\n");
+const receipt = await ok(core.generation.registerReceipt({ generationToken: delivery.generation_token }));
+assert.equal(receipt.bundle_sha256, delivery.sha256);
+assert.equal(receipt.artifact_sha256, createHash("sha256").update(fs.readFileSync(path.join(cwd, target))).digest("hex"));
+assert.deepEqual(await ok(core.generation.registerReceipt({ generationToken: delivery.generation_token })), receipt);
+assert.deepEqual((await ok(core.generation.verifyReceipts({ version }))).findings, []);
+const status = await ok(core.generation.status({ version, tddRootId: tdd }));
+assert.equal(status.items[0].receipt_present, true);
+assert.equal(status.items[0].artifact_state, "loaded");
+assert.equal((await ok(core.version.inspect({ version }))).confirmation.state, "missing");
+const acceptanceFile = "node-only-acceptance.cjs";
+fs.writeFileSync(path.join(cwd, acceptanceFile),
+  "const a=require('node:assert/strict');const value=require('./" + target + "');a.equal(value.value,42);a.equal(value.source,'" + tdd + "');setTimeout(()=>{},180);\n");
+await ok(core.acceptance.set({ command: '"' + process.execPath + '" ' + acceptanceFile }));
+const ticks = {};
+for (const operation of ["acceptance.run", "version.confirm"]) {
+  acceptanceTicks = 0;
+  const start = events.length;
+  const timer = setInterval(() => { if (inAcceptance) acceptanceTicks++; }, 5);
+  let result;
+  try { result = await ok(operation === "acceptance.run" ? core.acceptance.run() : core.version.confirm({ version })); }
+  finally { clearInterval(timer); }
+  assert.equal(result.passed, true);
+  if (operation === "version.confirm") assert.equal(result.acceptance.passed, true);
+  assert(acceptanceTicks > 0, operation + " blocked the host during actual acceptance");
+  ticks[operation] = acceptanceTicks;
+  const progress = events.slice(start);
+  assert(progress.every((event) => event.operation === operation));
+  assert.equal(new Set(progress.map((event) => event.operationId)).size, 1);
+  const acceptance = progress.filter((event) => event.stage === "acceptance");
+  assert.deepEqual(acceptance.map((event) => event.status), ["started", "completed"]);
+}
+assert.equal((await ok(core.version.inspect({ version }))).confirmation.state, "valid");
+await ok(core.version.merge({ version }));
+assert.equal((await ok(core.version.inspect({ version }))).confirmation.state, "not_applicable");
+assert.equal((await ok(core.session.get())).active_version, null);
+assert.equal((await ok(core.version.list())).versions.at(-1).merged, true);
+assert.equal(process.cwd(), cwd);
+console.log(JSON.stringify({ completed: true, version, target, memoryBytes: delivery.bytes, ticks }));
 `;
 
 beforeAll(async () => {
@@ -709,8 +983,12 @@ beforeAll(async () => {
   consumer = path.join(suiteDir, "consumer");
   fs.mkdirSync(consumer);
   write(path.join(consumer, "package.json"), '{"private":true,"type":"module"}\n');
-  expect(fs.existsSync(path.join(REPO, "dist", "src", "index.js")), "Run npm run build before the installed contract suite").toBe(true);
-  const packed = await npm(["pack", "--json", "--pack-destination", suiteDir], REPO);
+  const distribution = JSON.parse(fs.readFileSync(path.join(REPO, "package.json"), "utf8")) as Data;
+  expect(distribution.scripts).toMatchObject({ prepack: "npm run build", pretest: "npm run build" });
+  requireCurrentProductionBuild(REPO);
+  // pretest builds once before workers start. Packing must only consume those
+  // validated files; rebuilding shared dist here races other suites' workers.
+  const packed = await npm(["pack", "--ignore-scripts", "--json", "--pack-destination", suiteDir], REPO);
   expect(packed.status, `npm pack failed:\n${packed.stderr}\n${packed.stdout}`).toBe(0);
   const packs = JSON.parse(packed.stdout) as Data[];
   expect(packs).toHaveLength(1);
@@ -721,7 +999,12 @@ beforeAll(async () => {
   expect(fs.lstatSync(packageRoot).isSymbolicLink()).toBe(false);
   const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as Data;
   expect(manifest.name).toBe("ait-core");
+  expect(manifest.version).toBe("0.2.0");
   expect(manifest.version).toBe(packs[0]!.version);
+  for (const file of ["README.md", "docs/node-api.md", "docs/cli.md", "dist/src/api/worker.js", "dist/src/index.d.ts"]) {
+    expect(fs.statSync(path.join(packageRoot, file)).isFile(), `Missing installed contract: ${file}`).toBe(true);
+    expect((packs[0]!.files as Data[]).some((item) => item.path === file), `Missing tarball entry: ${file}`).toBe(true);
+  }
   bin = path.resolve(packageRoot, manifest.bin.ait as string);
   expect(fs.statSync(bin).isFile()).toBe(true);
   expect(fs.existsSync(path.join(consumer, "node_modules", ".bin", process.platform === "win32" ? "ait.cmd" : "ait"))).toBe(true);
@@ -759,49 +1042,202 @@ describe("installed public contracts", () => {
     const data = oneJson(result);
     expect(data).toMatchObject({ exports: PUBLIC_FUNCTIONS, functions: true, alive: true });
     expect(data.first).toEqual(data.second);
-    expect(data.first).toMatchObject({ ok: true, data: { next_action: null } });
+    expect(result.stderr).toBe("");
+    expect(data.first).toMatchObject({ ok: true, data: { version: "unversioned" } });
+    noAdvice(data);
     expectSame(before, snapshot(consumer, true));
     const types = path.join(consumer, "public-types.mts");
-    write(types, `import { dispatch, getSessionContext, evaluateWriteGuard, issueGenerationToken, registerGenerationReceipt, verifyGenerationReceipts } from 'ait-core';\nimport type { CoreResult, NextAction, ProjectRoot, SessionContext, LayerCounts, GuardInput, GuardDecision, GenerationDeliveryInput, GenerationReceipt, GenerationVerification } from 'ait-core';\nconst actions: (NextAction | null)[] = [{ type: 'report', message: 'done' }, { type: 'present_and_collect', instruction: 'read', required_next_call: 'call' }, { type: 'continue', instruction: 'generate', next_call: 'receipt' }, null];\nconst result: Promise<CoreResult> = dispatch([]);\nconst session: (root: ProjectRoot) => SessionContext = getSessionContext;\nconst guard: (input: GuardInput) => GuardDecision = evaluateWriteGuard;\nconst token: (root: ProjectRoot, input: GenerationDeliveryInput) => string = issueGenerationToken;\nconst receipt: (root: ProjectRoot, input: { generation_token: string }) => GenerationReceipt = registerGenerationReceipt;\nconst verify: (root: ProjectRoot, version: string) => GenerationVerification = verifyGenerationReceipts;\nconst counts: LayerCounts = { working: 0, staged: 0, committed: 0 };\nvoid [actions, result, session, guard, token, receipt, verify, counts];\n`);
+    write(types, TYPES_PROBE);
     const checked = await run(process.execPath, [path.join(REPO, "node_modules", "typescript", "bin", "tsc"),
       "--noEmit", "--strict", "--exactOptionalPropertyTypes", "--noUncheckedIndexedAccess", "--target", "ES2022",
       "--module", "NodeNext", "--moduleResolution", "NodeNext", "--skipLibCheck", "--typeRoots", path.join(REPO, "node_modules", "@types"), types], consumer);
     expect(checked.status, checked.stdout + checked.stderr).toBe(0);
   }, TIMEOUT);
 
-  it("matches deterministic bin/dispatch semantics and returns stable named-function errors", async () => {
+  it("matches deterministic bin/dispatch semantics and returns stable API error envelopes", async () => {
     const cwd = cloneFixture();
     const before = managed(cwd);
     for (const argv of [["--version"], ["version", "status", "v1.0"], ["specgraph", "query", "[PRD]-legacy"], ["specgraph", "validate-new-model"]]) {
       expect(await command(cwd, argv, "bin")).toEqual(await command(cwd, argv));
     }
-    expect(await namedOk(cwd, "getSessionContext")).toMatchObject({ project_root: cwd, active_version: null, phase: null, baseline_empty: false });
+    expect(await coreOk(cwd, "session.get")).toMatchObject({ project_root: cwd, active_version: null, phase: null, baseline_empty: false });
     for (const entry of ["dispatch", "bin"] as const) await rejectWithoutWrites(cwd, ["unknown-command"], "USAGE_ERROR", entry);
-    expect(await named(cwd, "registerGenerationReceipt", { generation_token: "invalid" })).toMatchObject({ thrown: true, code: "GENERATION_TOKEN_INVALID" });
-    expect(await named(cwd, "registerGenerationReceipt", { generation_token: `gen-v1.00000000-0000-0000-0000-000000000000.${"0".repeat(64)}` })).toMatchObject({ thrown: true, code: "GENERATION_TOKEN_STALE" });
+    expect(await coreCall(cwd, "generation.registerReceipt", { generationToken: "invalid" })).toMatchObject({ ok: false, code: "GENERATION_TOKEN_INVALID" });
+    expect(await coreCall(cwd, "generation.registerReceipt", { generationToken: `gen-v1.00000000-0000-0000-0000-000000000000.${"0".repeat(64)}` })).toMatchObject({ ok: false, code: "GENERATION_TOKEN_STALE" });
     expectSame(before, managed(cwd));
   }, TIMEOUT);
 
-  it("validates each delivery's own pointer and token and locks all three NextAction forms plus null", async () => {
+  it("validates each delivery's own pointer and token without orchestration advice", async () => {
     const feature = await prepare(cloneFixture());
     const first = await deliver(feature);
     generate(feature.cwd, first);
     await receipt(feature.cwd, first);
     const second = await deliver(feature, "bin");
-    expect({ version: first.version, target: first.target_file, tdd: first.tdd_root, source: first.source_file, action: first.next_action.type })
-      .toEqual({ version: second.version, target: second.target_file, tdd: second.tdd_root, source: second.source_file, action: second.next_action.type });
+    expect({ version: first.version, target: first.target_file, tdd: first.tdd_root, source: first.source_file })
+      .toEqual({ version: second.version, target: second.target_file, tdd: second.tdd_root, source: second.source_file });
     expect(second.generation_token).not.toBe(first.generation_token);
     expect(second.bundle_path).not.toBe(first.bundle_path);
     const before = managed(feature.cwd);
-    expect(await named(feature.cwd, "registerGenerationReceipt", { generation_token: first.generation_token })).toMatchObject({ thrown: true, code: "GENERATION_TOKEN_STALE" });
-    expect(await named(feature.cwd, "issueGenerationToken", { version: second.version, tdd_root: second.tdd_root,
+    expect(await coreCall(feature.cwd, "generation.registerReceipt", { generationToken: first.generation_token })).toMatchObject({ ok: false, code: "GENERATION_TOKEN_STALE" });
+    // Preserve the domain's malformed-delivery negative case without a public issue-token export.
+    expect(() => issueGenerationToken(resolveProjectRoot(feature.cwd), { version: second.version, tdd_root: second.tdd_root,
       target_file: second.target_file, bundle_path: second.bundle_path, bundle_sha256: second.sha256, bytes: second.bytes + 1 }))
-      .toMatchObject({ thrown: true, code: "GENERATION_TOKEN_INVALID" });
+      .toThrowError(expect.objectContaining({ code: "GENERATION_TOKEN_INVALID" }));
     expectSame(before, managed(feature.cwd));
     generate(feature.cwd, second);
     const registered = await receipt(feature.cwd, second);
     expect(await receipt(feature.cwd, second)).toEqual(registered);
-    expect(await namedOk(feature.cwd, "verifyGenerationReceipts", feature.version)).toMatchObject({ enforcement: "report", passed: true, findings: [] });
+    expect(await coreOk(feature.cwd, "generation.verifyReceipts", { version: feature.version })).toMatchObject({ enforcement: "report", passed: true, findings: [] });
+  }, TIMEOUT);
+
+  it("completes the installed Node-only workflow with memory delivery and responsive acceptance workers", async () => {
+    const cwd = cloneFixture();
+    const history = new Map([...managed(cwd)].filter(([file]) => file.includes("v1.0") || file.startsWith(".meta/changes/")));
+    const script = path.join(consumer, "node-only-flow.mjs");
+    write(script, NODE_ONLY_FLOW);
+    const result = await run(process.execPath, [script], cwd);
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(oneJson(result)).toMatchObject({ completed: true, version: "v2.0", target: "node-only-output.cjs" });
+    expectPreserved(history, managed(cwd));
+  }, TIMEOUT);
+
+  it("completes the installed CLI-only workflow through file delivery, receipt, verification, and merge", async () => {
+    const cwd = cloneFixture();
+    const history = new Map([...managed(cwd)].filter(([file]) => file.includes("v1.0") || file.startsWith(".meta/changes/")));
+    await refreshInstalledWrapper(cwd);
+    const feature = await prepare(cwd, "wrapper");
+    policy(cwd, "block");
+    const delivery = await deliver(feature, "wrapper");
+    generate(cwd, delivery);
+    await receipt(cwd, delivery, "wrapper");
+    expect(await ok(cwd, ["codegen", "verify", "--version", feature.version], "wrapper"))
+      .toMatchObject({ enforcement: "block", passed: true, findings: [] });
+    await acceptance(cwd, "wrapper");
+    expectAccepted(cwd, await ok(cwd, ["version", "confirm", feature.version], "wrapper"));
+    expect(await ok(cwd, ["version", "merge", feature.version], "wrapper"))
+      .toMatchObject({ version: feature.version, merged_chunks: expect.arrayContaining([TDD]) });
+    expectPreserved(history, managed(cwd));
+  }, TIMEOUT);
+
+  it("returns identical complete memory and file contexts and invalidates the previous carrier's token", async () => {
+    const feature = await prepare(cloneFixture());
+    const memory = await coreOk(feature.cwd, "delivery.prepare", { tddRootId: TDD });
+    expect(memory).not.toHaveProperty("bundle_path");
+    expect(memory.target_state).toBe("absent");
+    expect(memory.content).toContain(tddContent().trim());
+    const pointer = await deliver(feature, "bin");
+    const bytes = fs.readFileSync(pointer.bundle_path);
+    expect(Buffer.from(memory.content, "utf8").equals(bytes)).toBe(true);
+    for (const field of ["sha256", "bytes", "version", "target_file", "tdd_root", "source_file"] as const) {
+      expect(memory[field]).toEqual(pointer[field]);
+    }
+    const before = managed(feature.cwd);
+    expect(await coreCall(feature.cwd, "generation.registerReceipt", { generationToken: memory.generation_token }))
+      .toMatchObject({ ok: false, code: "GENERATION_TOKEN_STALE" });
+    expectSame(before, managed(feature.cwd));
+    generate(feature.cwd, pointer);
+    await receipt(feature.cwd, pointer, "bin");
+    expect(await coreOk(feature.cwd, "generation.verifyReceipts", { version: feature.version })).toMatchObject({ passed: true, findings: [] });
+  }, TIMEOUT);
+
+  it("shares graph direction, relationship, and version selection across installed entry points without writes", async () => {
+    const feature = await prepare(cloneFixture());
+    const { cwd, version } = feature;
+    const graphFile = path.join(projectDocs(cwd), ".meta", "specgraph.yaml");
+    const graph = yaml(graphFile);
+    const target = "[FSD]-legacy:feature";
+    const uri = (id: string): string => (graph.specs as Data[]).find((item) => item.chunk_id === id)!.uri as string;
+    for (const [other, rel] of [["[TDD]-legacy", "details"], ["[FSD]-legacy-feature:implementation", "depends_on"], ["[PRD]-legacy", "historical_relation"]]) {
+      graph.edges.push({ src: uri(target), dst: uri(other!), rel, weight: 1, metadata: {} });
+    }
+    write(graphFile, stringify(graph));
+    const before = managed(cwd);
+    const selections = [["derives"], ["decomposes"], ["details"], ["depends_on"], ["details", "depends_on"],
+      ["derives", "decomposes", "details", "depends_on"]];
+    for (const direction of ["in", "out", "both"]) {
+      for (const rels of selections) {
+        const input = { target, direction, rels, version: "baseline" };
+        const expected = await coreOk(cwd, "graph.query", input);
+        const actual = await ok(cwd, ["specgraph", "query", target, "--direction", direction,
+          "--version", "baseline", ...rels.map((rel) => `--${rel.replace(/_/g, "-")}`)], "bin");
+        expect(actual).toEqual(expected);
+        expect(actual.direction).toBe(direction);
+        expect((actual.edges as Data[]).every((edge) => rels.includes(edge.rel as string))).toBe(true);
+        expect((actual.edges as Data[]).every((edge) => direction === "both" || edge[direction === "out" ? "src" : "dst"] === target)).toBe(true);
+      }
+    }
+    const all = await coreOk(cwd, "graph.query", { target, version: "baseline" });
+    expect(all.edges).toEqual(expect.arrayContaining([expect.objectContaining({ rel: "historical_relation" })]));
+    expect(await ok(cwd, ["specgraph", "query", target, "--version", "baseline"], "bin")).toEqual(all);
+    expect((await coreOk(cwd, "graph.query", { target, rels: [], version: "baseline" })).edges).toEqual([]);
+    expect(await coreOk(cwd, "graph.query", { target, rels: ["details", "details"], version: "baseline" }))
+      .toEqual(await coreOk(cwd, "graph.query", { target, rels: ["details"], version: "baseline" }));
+    const activeTarget = `${CHILD_FSD}:implementation`;
+    const active = await coreOk(cwd, "graph.query", { target: activeTarget });
+    expect(active.found).toBe(true);
+    expect(active.edges).toEqual(expect.arrayContaining([expect.objectContaining({ rel: "details", dst: TDD })]));
+    expect(await ok(cwd, ["deps", activeTarget], "bin")).toEqual(active);
+    expect(await ok(cwd, ["specgraph", "query", activeTarget, "--version", version], "bin"))
+      .toEqual(await coreOk(cwd, "graph.query", { target: activeTarget, version }));
+    expect(await coreOk(cwd, "graph.query", { target: activeTarget, version: "baseline" })).toMatchObject({ found: false, edges: [] });
+    expect(await coreOk(cwd, "graph.query", { target: "missing" })).toMatchObject({ found: false, edges: [] });
+    for (const direction of ["from", "to"]) {
+      expect(await coreCall(cwd, "graph.query", { target, direction })).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+      for (const prefix of [["deps"], ["specgraph", "query"]]) {
+        await rejectWithoutWrites(cwd, [...prefix, target, "--direction", direction], "USAGE_ERROR", "bin");
+      }
+    }
+    for (const flag of ["--deps", "--implements", "--unknown"]) {
+      await rejectWithoutWrites(cwd, ["specgraph", "query", target, flag], "USAGE_ERROR", "bin");
+    }
+    await rejectWithoutWrites(cwd, ["specgraph", "query", target, "--version"], "USAGE_ERROR", "bin");
+    await rejectWithoutWrites(cwd, ["specgraph", "query", target, "--version", "v9999.0"], "VERSION_NOT_FOUND", "bin");
+    expect(await coreCall(cwd, "graph.query", { target, rels: ["implements"] })).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+    expectSame(before, managed(cwd));
+  }, TIMEOUT);
+
+  it("projects baseline summary items to JSON/YAML while exposing statistics through their own API", async () => {
+    const cwd = cloneFixture();
+    const before = managed(cwd);
+    const all = await coreOk(cwd, "search.baselineSummary");
+    expect(all.scope).toBe("all");
+    expect(all.items).toHaveLength(7);
+    const stats = await coreOk(cwd, "search.baselineStats");
+    expect(stats).toMatchObject({ docs: { prd: 1, fsd: 2, tdd: 1 }, chunks: 7, versions: ["v1.0"] });
+    expect(stats).not.toHaveProperty("items");
+    for (const argv of [["baseline-summary"], ["baseline-summary", "--scope", "all"], ["baseline-summary", "--format", "yaml"]]) {
+      const result = await run(process.execPath, [bin, ...argv], cwd);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      progressOnly(result.stderr);
+      expect(parse(result.stdout)).toEqual(all.items);
+    }
+    for (const scope of ["prd", "fsd", "tdd"]) {
+      const summary = await coreOk(cwd, "search.baselineSummary", { scope });
+      expect(summary.scope).toBe(scope);
+      expect((summary.items as Data[]).every((item) => String(item.id).startsWith(`[${scope.toUpperCase()}]-`))).toBe(true);
+    }
+    const prd = await coreOk(cwd, "search.baselineSummary", { scope: "prd" });
+    expect(prd.items).toEqual([
+      { id: "[PRD]-legacy", heading: "[PRD]-legacy", summary: null },
+      { id: "[PRD]-legacy:behavior", heading: "[PRD]-legacy:behavior", summary: null },
+    ]);
+    expect((await command(cwd, ["baseline-summary", "--format", "json"], "bin")).data).toEqual(all.items);
+    expect((await command(cwd, ["baseline-summary", "--scope", "prd", "--format", "json"], "bin")).data).toEqual(prd.items);
+    const dispatched = await command(cwd, ["baseline-summary", "--scope", "prd", "--format", "json"]);
+    expect(dispatched).toEqual({ ok: true, data: prd, presentation: { format: "json", projection: "baseline-items" } });
+    expectSame(before, managed(cwd));
+    for (const [operation, input] of [["search.baselineSummary", { format: "json" }], ["session.get", { cancel: true }],
+      ["delivery.prepare", { tddRootId: TDD, signal: {} }], ["generation.registerReceipt", { generationToken: "invalid", artifact_sha256: "forged" }]] as const) {
+      expect(await coreCall(cwd, operation, input)).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+      expectSame(before, managed(cwd));
+    }
+    const index = path.join(projectDocs(cwd), ".meta", "chunks-index.yaml");
+    write(index, "chunks: [\n");
+    const damaged = managed(cwd);
+    expect(await coreCall(cwd, "search.baselineSummary")).toMatchObject({ ok: false, code: "INDEX_UNREADABLE" });
+    await rejectWithoutWrites(cwd, ["baseline-summary"], "INDEX_UNREADABLE", "bin");
+    expectSame(damaged, managed(cwd));
   }, TIMEOUT);
 });
 
@@ -845,8 +1281,8 @@ describe("cross-domain write and version gates", () => {
     const feature = await prepare(cloneFixture());
     const source = path.join(projectDocs(feature.cwd), "versions", feature.version, "tdd", `${TDD}.md`);
     const beforeGuard = managed(feature.cwd);
-    expect(await namedOk(feature.cwd, "evaluateWriteGuard", {
-      projectRoot: feature.cwd, cwd: feature.cwd, toolName: "write", input: { path: source },
+    expect(await coreOk(feature.cwd, "guard.evaluate", {
+      toolName: "write", input: { path: source },
     })).toMatchObject({ decision: "block" });
     expectSame(beforeGuard, managed(feature.cwd));
     fs.appendFileSync(source, "\n<!-- @ref:[PRD]-legacy -->\n");
@@ -858,19 +1294,19 @@ describe("cross-domain write and version gates", () => {
   it("reports missing receipts by default, blocks when configured, and fails closed on damaged policy", async () => {
     const feature = await prepare(cloneFixture());
     write(path.join(feature.cwd, TARGET), `module.exports = { value: 42, source: '${TDD}' };\n`);
-    const reported = await namedOk(feature.cwd, "verifyGenerationReceipts", feature.version) as Data;
+    const reported = await coreOk(feature.cwd, "generation.verifyReceipts", { version: feature.version });
     expect(reported).toMatchObject({ enforcement: "report", passed: true });
     expect(reported.findings).toEqual([expect.objectContaining({ code: "GENERATION_RECEIPT_MISSING", tdd_root: TDD, target_file: TARGET })]);
     const confirmed = await ok(feature.cwd, ["version", "confirm", feature.version]);
     expect(confirmed.generation_receipts).toEqual(reported);
     policy(feature.cwd, "block");
-    expect(await namedOk(feature.cwd, "verifyGenerationReceipts", feature.version)).toMatchObject({ enforcement: "block", passed: false });
+    expect(await coreOk(feature.cwd, "generation.verifyReceipts", { version: feature.version })).toMatchObject({ enforcement: "block", passed: false });
     for (const entry of ["dispatch", "bin"] as const) {
       await rejectWithoutWrites(feature.cwd, ["version", "confirm", feature.version], "GENERATION_RECEIPTS_FAILED", entry);
     }
     write(path.join(projectDocs(feature.cwd), ".meta", "config.local.yaml"), "generation_receipts: [\n");
     const before = managed(feature.cwd);
-    expect(await named(feature.cwd, "verifyGenerationReceipts", feature.version)).toMatchObject({ thrown: true, code: "CONFIG_UNREADABLE" });
+    expect(await coreCall(feature.cwd, "generation.verifyReceipts", { version: feature.version })).toMatchObject({ ok: false, code: "CONFIG_UNREADABLE" });
     await rejectWithoutWrites(feature.cwd, ["version", "confirm", feature.version], "CONFIG_UNREADABLE", "bin");
     expectSame(before, managed(feature.cwd));
   }, TIMEOUT);
@@ -1064,7 +1500,7 @@ async function secondIteration(first: Feature, history: Snapshot, real: boolean)
     await ok(cwd, ["tdd", "confirm"], "wrapper"); check();
     const pointer = await deliver(feature);
     generate(cwd, pointer);
-    await receipt(cwd, pointer);
+    await receipt(cwd, pointer, "wrapper");
     await acceptance(cwd, "wrapper", { executeCommand: false });
     expectAccepted(cwd, await ok(cwd, ["version", "confirm", version], "wrapper")); check();
     if (note === "Second iteration" && restoredTarget !== null) {
@@ -1190,7 +1626,7 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
     const statusArgs = ["version", "status", merged.at(-1)!.version as string];
     expect(await command(cwd, statusArgs)).toEqual(await command(cwd, statusArgs, "wrapper"));
     expect(await command(cwd, ["specgraph", "export"])).toEqual(await command(cwd, ["specgraph", "export"], "wrapper"));
-    const session = await namedOk(cwd, "getSessionContext") as Data;
+    const session = await coreOk(cwd, "session.get");
     expectSame(copied, managed(cwd));
     if (session.active_version !== null) {
       await ok(cwd, ["version", "revert", session.active_version as string, "--confirm"], "wrapper");
@@ -1206,7 +1642,7 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
     const pointer = await deliver(feature);
     expect(fs.existsSync(path.join(cwd, TARGET))).toBe(false);
     generate(cwd, pointer);
-    await receipt(cwd, pointer);
+    await receipt(cwd, pointer, "wrapper");
     await acceptance(cwd, "wrapper", { executeCommand: false });
     const confirmed = await ok(cwd, ["version", "confirm", feature.version], "wrapper");
     expectAccepted(cwd, confirmed);
@@ -1241,11 +1677,11 @@ async function takeover(sourceDocs: string, label: string, real = false): Promis
       [`.meta/versions/${feature.version}.yaml`, `.meta/chunks-index-${feature.version}.yaml`, `.meta/specgraph-${feature.version}.yaml`,
         ...(mergedMeta.changes as string[]).map((change) => `.meta/changes/${change}.yaml`)].includes(file)));
     await secondIteration(feature, firstHistory, real);
-    expect(await namedOk(cwd, "getSessionContext")).toMatchObject({ active_version: null, phase: null, baseline_empty: false });
+    expect(await coreOk(cwd, "session.get")).toMatchObject({ active_version: null, phase: null, baseline_empty: false });
     await rollbackHistory(cwd, anchors, oldHistory);
     const configuredAcceptance = originalAcceptance.get(cwd);
     if (configuredAcceptance !== null) expect(acceptanceCommand(cwd)).toBe(configuredAcceptance);
-    console.info(`[system-contracts] ${label}: CLI+Node mixed-receipt takeover regression completed; ${merged.length} historical versions preserved; ${feature.version} merged; artifact ${TARGET} executed; original historical anchors restored; this is not manual takeover or LLM-quality evidence`);
+    console.info(`[system-contracts] ${label}: CLI takeover with public API read parity completed; ${merged.length} historical versions preserved; ${feature.version} merged; artifact ${TARGET} executed; original historical anchors restored; this is not manual takeover or LLM-quality evidence`);
   } finally {
     expectSame(sourceBefore, managed(originalCwd));
     expectSame(sourceWrappers, snapshot(path.join(sourceDocs, ".ait")));
@@ -1295,7 +1731,7 @@ describe("Python-project takeover", () => {
     await ok(cwd, ["tdd", "confirm"], "wrapper");
     const pointer = await deliver(feature);
     generate(cwd, pointer);
-    await receipt(cwd, pointer);
+    await receipt(cwd, pointer, "wrapper");
     await acceptance(cwd, "wrapper", { executeCommand: false });
     expectAccepted(cwd, await ok(cwd, ["version", "confirm", feature.version], "wrapper"));
     expect(fs.readFileSync(path.join(cwd, "original-acceptance-ran"), "utf8")).toBe("passed");

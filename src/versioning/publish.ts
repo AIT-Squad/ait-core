@@ -1,10 +1,11 @@
-// [TDD]-publish v0.10
+// [TDD]-publish v0.13
 // 制品验收命令的配置与执行、双仓一体发布（先宿主仓后文档仓，文档仓附带 refs/tags/ait/* 锚点标签）。
 // 硬约束：只推当前分支与 refs/tags/ait/*（无强制推送、不接受任意引用）；
 // 不创建远端、不设置上游、不改写远端历史；推送失败不回滚已成功侧；幂等重跑收敛。
 
 import { spawnSync } from "node:child_process";
 import type { ProjectRoot } from "../foundation/root.js";
+import { reportProgress } from "../foundation/progress.js";
 import {
   loadAcceptanceCommand,
   writeLocalConfig,
@@ -44,13 +45,22 @@ export function runAcceptance(root: ProjectRoot): {
   if (command === null) {
     return { ran: false, passed: true, exitCode: null };
   }
-  const result = spawnSync(command, {
-    shell: true,
-    cwd: root.cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const exitCode = result.status;
-  return { ran: true, passed: !result.error && exitCode === 0, exitCode };
+  // 公共 API 在 worker 内调用；保留同步执行与结果，只报告实际发生的阶段。
+  reportProgress("acceptance", "started");
+  try {
+    const result = spawnSync(command, {
+      shell: true,
+      cwd: root.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exitCode = result.status;
+    const passed = !result.error && exitCode === 0;
+    reportProgress("acceptance", passed ? "completed" : "failed");
+    return { ran: true, passed, exitCode };
+  } catch (error) {
+    reportProgress("acceptance", "failed");
+    throw error;
+  }
 }
 
 // ---------- 内部辅助（不导出） ----------
@@ -62,12 +72,20 @@ interface GitOutcome {
 }
 
 function gitIn(dir: string, args: string[]): GitOutcome {
-  const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
-  return {
-    ok: !r.error && r.status === 0,
-    stdout: (r.stdout ?? "").trim(),
-    stderr: (r.stderr ?? "").trim(),
-  };
+  reportProgress("git", "started");
+  try {
+    const r = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    const outcome = {
+      ok: !r.error && r.status === 0,
+      stdout: (r.stdout ?? "").trim(),
+      stderr: (r.stderr ?? "").trim(),
+    };
+    reportProgress("git", outcome.ok ? "completed" : "failed");
+    return outcome;
+  } catch (error) {
+    reportProgress("git", "failed");
+    throw error;
+  }
 }
 
 function hasUpstream(dir: string): boolean {

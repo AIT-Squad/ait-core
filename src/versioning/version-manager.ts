@@ -39,6 +39,7 @@ import { ensureWithin, toPosixRel } from "../foundation/io.js";
 import { loadModel, saveModel } from "../foundation/yaml.js";
 import { loadAcceptanceCommand } from "../foundation/config.js";
 import { normalize } from "../foundation/hash.js";
+import { reportProgress, type ProgressStage } from "../foundation/progress.js";
 import { parseFile, parseText, type Chunk, type ParsedFile } from "../doc-model/chunk-parser.js";
 import {
   ChangeRecordSchema,
@@ -173,6 +174,19 @@ function isEnoent(err: unknown): boolean {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** 同步领域阶段由 API worker 执行；进度只观察结果，原异常保持原样。 */
+function runStage<T>(stage: ProgressStage, work: () => T): T {
+  reportProgress(stage, "started");
+  try {
+    const result = work();
+    reportProgress(stage, "completed");
+    return result;
+  } catch (error) {
+    reportProgress(stage, "failed");
+    throw error;
+  }
 }
 
 /** 读文件原始文本；不存在返回 null（缺失是合法态，不抛）。 */
@@ -743,33 +757,36 @@ export class VersionManager {
     created_at: string;
     based_on: string | null;
   } {
-    const active = this.activeVersion();
-    if (active !== null) {
-      throw new VersionManagerError(
-        "ACTIVE_VERSION_EXISTS",
-        `已存在开放版本 ${active}，拒绝再创建 ${id}（一次一个开放版本）`,
-      );
-    }
-    if (fs.existsSync(this.metaPath(id)) || fs.existsSync(this.workspaceDir(id))) {
-      throw new VersionManagerError(
-        "USAGE_ERROR",
-        `版本 ${id} 已存在（版本元数据或工作区已在磁盘上）`,
-      );
-    }
-
-    let basedOn: string | null = null;
-    for (const v of this.index.listVersions()) {
-      if (isMerged(this.loadMeta(v))) {
-        basedOn = v; // 数值序最后一个已合入版本
+    const { meta, basedOn } = runStage("validate", () => {
+      const active = this.activeVersion();
+      if (active !== null) {
+        throw new VersionManagerError(
+          "ACTIVE_VERSION_EXISTS",
+          `已存在开放版本 ${active}，拒绝再创建 ${id}（一次一个开放版本）`,
+        );
       }
-    }
+      if (fs.existsSync(this.metaPath(id)) || fs.existsSync(this.workspaceDir(id))) {
+        throw new VersionManagerError(
+          "USAGE_ERROR",
+          `版本 ${id} 已存在（版本元数据或工作区已在磁盘上）`,
+        );
+      }
 
-    const meta = parseWithDefaults(VersionMetaSchema, {
-      version: id,
-      created_at: new Date().toISOString(),
-      dependencies: { based_on: basedOn },
+      let basedOn: string | null = null;
+      for (const v of this.index.listVersions()) {
+        if (isMerged(this.loadMeta(v))) {
+          basedOn = v; // 数值序最后一个已合入版本
+        }
+      }
+
+      const meta = parseWithDefaults(VersionMetaSchema, {
+        version: id,
+        created_at: new Date().toISOString(),
+        dependencies: { based_on: basedOn },
+      });
+      return { meta, basedOn };
     });
-    fs.mkdirSync(this.workspaceDir(id), { recursive: true });
+    runStage("persist", () => fs.mkdirSync(this.workspaceDir(id), { recursive: true }));
     this.saveMeta(id, meta);
 
     const index = parseWithDefaults(VersionIndexSchema, {
@@ -792,18 +809,21 @@ export class VersionManager {
     committed: string[];
     changes: string[];
   } {
-    const meta = this.loadMeta(id); // 版本不存在 → VERSION_NOT_FOUND
-    const index = this.loadVersionIndex(id);
+    const { meta, index, targets } = runStage("validate", () => {
+      const meta = this.loadMeta(id); // 版本不存在 → VERSION_NOT_FOUND
+      const index = this.loadVersionIndex(id);
 
-    const targets = index.chunks.filter(
-      (c) => c.state === "working" || c.state === "staged",
-    );
-    if (targets.length === 0) {
-      throw new VersionManagerError(
-        "COMMIT_EMPTY",
-        `版本 ${id} 无 state∈{working,staged} 的条目可提交`,
+      const targets = index.chunks.filter(
+        (c) => c.state === "working" || c.state === "staged",
       );
-    }
+      if (targets.length === 0) {
+        throw new VersionManagerError(
+          "COMMIT_EMPTY",
+          `版本 ${id} 无 state∈{working,staged} 的条目可提交`,
+        );
+      }
+      return { meta, index, targets };
+    });
 
     const commitId = `c${index.commits.length + 1}`;
     const at = new Date().toISOString();
@@ -833,7 +853,7 @@ export class VersionManager {
     });
     this.saveVersionIndex(index);
     this.saveMeta(id, meta);
-    new SpecGraphStore(this.root).syncVersion(id);
+    runStage("persist", () => new SpecGraphStore(this.root).syncVersion(id));
 
     return { committed, changes };
   }
@@ -877,20 +897,23 @@ export class VersionManager {
    * → 保存版本元数据（唯一持久化；docs 零落盘）。
    */
   async versionConfirm(id: string): Promise<ConfirmResult> {
-    let meta = this.loadMeta(id);
-    if (isMerged(meta)) {
-      throw new VersionManagerError(
-        "USAGE_ERROR",
-        `版本 ${id} 已合入，confirm 只对未合入版本开放（已合入版本元数据只读）`,
-      );
-    }
+    let meta = runStage("validate", () => {
+      const current = this.loadMeta(id);
+      if (isMerged(current)) {
+        throw new VersionManagerError(
+          "USAGE_ERROR",
+          `版本 ${id} 已合入，confirm 只对未合入版本开放（已合入版本元数据只读）`,
+        );
+      }
 
-    // ① 真实文档、索引、原始图与 override 门禁（只读，违例零落盘）。
-    assertSpecIntegrity(this.root, id);
+      // ① 真实文档、索引、原始图与 override 门禁（只读，违例零落盘）。
+      assertSpecIntegrity(this.root, id);
 
-    // ② 验收前先检查治理与回执，block 时不执行验收命令。
-    checkGovernance(this.root, id);
-    checkGenerationReceipts(this.root, id);
+      // ② 验收前先检查治理与回执，block 时不执行验收命令。
+      checkGovernance(this.root, id);
+      checkGenerationReceipts(this.root, id);
+      return current;
+    });
 
     // ③ 制品验收（配置损坏由 foundation 抛 CONFIG_UNREADABLE，拒而不放）
     const acceptance = this.runAcceptance();
@@ -902,15 +925,18 @@ export class VersionManager {
     }
 
     // ④ 验收可能改写制品或规格；最终状态必须重新核验，不能保存验收前快照。
-    assertSpecIntegrity(this.root, id);
-    const warnings = checkGovernance(this.root, id);
-    const generationReceipts = checkGenerationReceipts(this.root, id);
-    meta = this.loadMeta(id);
-
-    // 最终 reconciliation plan 与判定输入指纹
     const conflictPolicy: ConflictPolicy = "use-version";
-    const { plan } = buildReconciliation(this.root, id, conflictPolicy);
-    const fingerprint = inputFingerprint(this.root, id, plan.operations, conflictPolicy);
+    const { warnings, generationReceipts, plan, fingerprint } = runStage("validate", () => {
+      assertSpecIntegrity(this.root, id);
+      const warnings = checkGovernance(this.root, id);
+      const generationReceipts = checkGenerationReceipts(this.root, id);
+      meta = this.loadMeta(id);
+
+      // 最终 reconciliation plan 与判定输入指纹
+      const { plan } = buildReconciliation(this.root, id, conflictPolicy);
+      const fingerprint = inputFingerprint(this.root, id, plan.operations, conflictPolicy);
+      return { warnings, generationReceipts, plan, fingerprint };
+    });
 
     // ⑤ 制品绑定（非 git 仓 null 不报错）
     meta.code_result = this.commitHostIfDirty(id);
@@ -947,13 +973,15 @@ export class VersionManager {
     id: string,
     opts: { confirm: boolean },
   ): Promise<RevertResult> {
-    if (opts.confirm !== true) {
-      throw new VersionManagerError(
-        "USAGE_ERROR",
-        `revert 需显式 confirm：versionRevert(${id}, { confirm: true })`,
-      );
-    }
-    const meta = this.loadMeta(id);
+    const meta = runStage("validate", () => {
+      if (opts.confirm !== true) {
+        throw new VersionManagerError(
+          "USAGE_ERROR",
+          `revert 需显式 confirm：versionRevert(${id}, { confirm: true })`,
+        );
+      }
+      return this.loadMeta(id);
+    });
 
     if (!isMerged(meta)) {
       this.purgeVersionArtifacts(id, { removeChangeRecords: true });
@@ -968,48 +996,52 @@ export class VersionManager {
     }
 
     // ── 只读预检（零写入）───────────────────────────────────────────────
-    const docsCwd = this.root.root;
-    const hostCwd = this.root.cwd;
-    if (!this.isGitRepo(docsCwd)) {
-      throw new VersionManagerError(
-        "REVERT_PRECHECK_FAILED",
-        `docs 仓不可访问（非 git 仓）：${docsCwd}，预检失败零写入`,
-      );
-    }
-    const hasHostBinding = [
-      meta.revert_anchor?.code_result, meta.code_result, meta.code_base,
-    ].some((ref) => typeof ref === "string" && ref.trim() !== "");
-    const hostRepo = hasHostBinding && this.isGitRepo(hostCwd);
+    const { docsCwd, hostCwd, docsAnchor, hostAnchor, docsCurrent, hostCurrent, laterVersions } =
+      runStage("validate", () => {
+        const docsCwd = this.root.root;
+        const hostCwd = this.root.cwd;
+        if (!this.isGitRepo(docsCwd)) {
+          throw new VersionManagerError(
+            "REVERT_PRECHECK_FAILED",
+            `docs 仓不可访问（非 git 仓）：${docsCwd}，预检失败零写入`,
+          );
+        }
+        const hasHostBinding = [
+          meta.revert_anchor?.code_result, meta.code_result, meta.code_base,
+        ].some((ref) => typeof ref === "string" && ref.trim() !== "");
+        const hostRepo = hasHostBinding && this.isGitRepo(hostCwd);
 
-    const docsAnchor = this.resolveAnchor(meta, { cwd: docsCwd, side: "docs", version: id });
-    const hostAnchor = hostRepo
-      ? this.resolveAnchor(meta, { cwd: hostCwd, side: "host", version: id })
-      : null;
-    if (docsAnchor === null) {
-      throw new VersionManagerError(
-        "REVERT_PRECHECK_FAILED",
-        `版本 ${id} 的 docs 锚点不可解析（revert_anchor.docs_ref → refs/tags/ait/${id} → docs_commit ` +
-          `依次 cat-file -e 均失败），预检失败零写入`,
-      );
-    }
-    if (hasHostBinding && !hostRepo) {
-      throw new VersionManagerError(
-        "REVERT_PRECHECK_FAILED",
-        `版本 ${id} 已绑定宿主锚点但宿主仓不可访问（非 git 仓）：${hostCwd}，预检失败零写入`,
-      );
-    }
-    if (hasHostBinding && hostAnchor === null) {
-      throw new VersionManagerError(
-        "REVERT_PRECHECK_FAILED",
-        `版本 ${id} 已绑定宿主锚点但不可解析（revert_anchor.code_result → code_result → code_base ` +
-          `依次 cat-file -e 均失败），预检失败零写入`,
-      );
-    }
+        const docsAnchor = this.resolveAnchor(meta, { cwd: docsCwd, side: "docs", version: id });
+        const hostAnchor = hostRepo
+          ? this.resolveAnchor(meta, { cwd: hostCwd, side: "host", version: id })
+          : null;
+        if (docsAnchor === null) {
+          throw new VersionManagerError(
+            "REVERT_PRECHECK_FAILED",
+            `版本 ${id} 的 docs 锚点不可解析（revert_anchor.docs_ref → refs/tags/ait/${id} → docs_commit ` +
+              `依次 cat-file -e 均失败），预检失败零写入`,
+          );
+        }
+        if (hasHostBinding && !hostRepo) {
+          throw new VersionManagerError(
+            "REVERT_PRECHECK_FAILED",
+            `版本 ${id} 已绑定宿主锚点但宿主仓不可访问（非 git 仓）：${hostCwd}，预检失败零写入`,
+          );
+        }
+        if (hasHostBinding && hostAnchor === null) {
+          throw new VersionManagerError(
+            "REVERT_PRECHECK_FAILED",
+            `版本 ${id} 已绑定宿主锚点但不可解析（revert_anchor.code_result → code_result → code_base ` +
+              `依次 cat-file -e 均失败），预检失败零写入`,
+          );
+        }
 
-    const docsCurrent = this.git(docsCwd, ["rev-parse", "HEAD"]);
-    const hostCurrent = hostRepo ? this.gitTry(hostCwd, ["rev-parse", "HEAD"]) : null;
-    const versions = this.index.listVersions();
-    const laterVersions = versions.slice(versions.indexOf(id) + 1);
+        const docsCurrent = this.git(docsCwd, ["rev-parse", "HEAD"]);
+        const hostCurrent = hostRepo ? this.gitTry(hostCwd, ["rev-parse", "HEAD"]) : null;
+        const versions = this.index.listVersions();
+        const laterVersions = versions.slice(versions.indexOf(id) + 1);
+        return { docsCwd, hostCwd, docsAnchor, hostAnchor, docsCurrent, hostCurrent, laterVersions };
+      });
 
     // ── 写补偿基准（recovery_journal，phase=prepared）────────────────────
     const journal: RecoveryJournal = {
@@ -1066,10 +1098,12 @@ export class VersionManager {
     }
 
     // ── 只校验实际参与 reset 的仓库；无历史绑定的宿主允许保持 dirty ────────
-    this.assertRepoState(docsCwd, docsAnchor, "docs");
-    if (hostAnchor !== null) {
-      this.assertRepoState(hostCwd, hostAnchor, "host");
-    }
+    runStage("validate", () => {
+      this.assertRepoState(docsCwd, docsAnchor, "docs");
+      if (hostAnchor !== null) {
+        this.assertRepoState(hostCwd, hostAnchor, "host");
+      }
+    });
 
     return {
       version: id,
@@ -1163,7 +1197,7 @@ export class VersionManager {
   }
 
   private saveMeta(version: string, meta: VersionMeta): void {
-    saveModel(this.metaPath(version), meta);
+    runStage("persist", () => saveModel(this.metaPath(version), meta));
   }
 
   /** 版本索引：文件不存在按空索引起步（save 时 stats 自动重算）。 */
@@ -1184,7 +1218,7 @@ export class VersionManager {
   }
 
   private saveVersionIndex(index: VersionIndex): void {
-    this.index.saveVersionIndex(index);
+    runStage("persist", () => this.index.saveVersionIndex(index));
   }
 
   /**
@@ -1274,8 +1308,10 @@ export class VersionManager {
   }
 
   private saveChangeRecord(changeId: string, record: ChangeRecord): void {
-    fs.mkdirSync(this.changesDir(), { recursive: true });
-    saveModel(this.changeRecordPath(changeId), record);
+    runStage("persist", () => {
+      fs.mkdirSync(this.changesDir(), { recursive: true });
+      saveModel(this.changeRecordPath(changeId), record);
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1291,21 +1327,28 @@ export class VersionManager {
     if (command === null) {
       return { ran: false, passed: true, exitCode: null };
     }
-    const res = spawnSync(command, {
-      cwd: this.root.cwd,
-      shell: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      encoding: "utf-8",
-    });
-    if (res.error !== undefined) {
-      throw new VersionManagerError(
-        "ACCEPTANCE_FAILED",
-        `制品验收命令无法执行：${errorMessage(res.error)}`,
-        { cause: res.error },
-      );
+    reportProgress("acceptance", "started");
+    try {
+      const res = spawnSync(command, {
+        cwd: this.root.cwd,
+        shell: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        encoding: "utf-8",
+      });
+      if (res.error !== undefined) {
+        throw new VersionManagerError(
+          "ACCEPTANCE_FAILED",
+          `制品验收命令无法执行：${errorMessage(res.error)}`,
+          { cause: res.error },
+        );
+      }
+      const exitCode = res.status ?? 1;
+      reportProgress("acceptance", exitCode === 0 ? "completed" : "failed");
+      return { ran: true, passed: exitCode === 0, exitCode };
+    } catch (error) {
+      reportProgress("acceptance", "failed");
+      throw error;
     }
-    const exitCode = res.status ?? 1;
-    return { ran: true, passed: exitCode === 0, exitCode };
   }
 
   /**
@@ -1408,17 +1451,19 @@ export class VersionManager {
       }
     }
 
-    fs.rmSync(this.workspaceDir(version), { recursive: true, force: true });
-    for (const p of [
-      this.versionIndexPath(version),
-      this.versionGraphPath(version),
-      this.metaPath(version),
-    ]) {
-      fs.rmSync(p, { force: true });
-    }
-    for (const changeId of changeIds) {
-      fs.rmSync(this.changeRecordPath(changeId), { force: true });
-    }
+    runStage("persist", () => {
+      fs.rmSync(this.workspaceDir(version), { recursive: true, force: true });
+      for (const p of [
+        this.versionIndexPath(version),
+        this.versionGraphPath(version),
+        this.metaPath(version),
+      ]) {
+        fs.rmSync(p, { force: true });
+      }
+      for (const changeId of changeIds) {
+        fs.rmSync(this.changeRecordPath(changeId), { force: true });
+      }
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1459,11 +1504,19 @@ export class VersionManager {
     cwd: string,
     args: string[],
   ): ReturnType<typeof spawnSync> {
-    return spawnSync("git", args, {
-      cwd,
-      encoding: "utf-8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    reportProgress("git", "started");
+    try {
+      const result = spawnSync("git", args, {
+        cwd,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      reportProgress("git", result.error === undefined && result.status === 0 ? "completed" : "failed");
+      return result;
+    } catch (error) {
+      reportProgress("git", "failed");
+      throw error;
+    }
   }
 
   private isGitRepo(cwd: string): boolean {

@@ -178,6 +178,7 @@ export type ModelManagerErrorCode =
   | "CONTEXT_TOKEN_STALE"
   | "USAGE_ERROR"
   | "NO_ACTIVE_VERSION"
+  | "ACTIVE_VERSION_CONFLICT"
   | "PRD_NOT_CONFIRMED"
   | "FSD_NOT_CONFIRMED"
   | "TDD_NOT_CONFIRMED"
@@ -915,17 +916,26 @@ export class NewModelManager {
     return this.index.queryBaseline(id) !== null ? "modify" : "add";
   }
 
-  /** 活动版本：.meta/versions 中相位非 merged 的数值序首个版本（唯一性由 versioning 域保证）。 */
+  /** 活动版本须同时未记录合入时间且相位非 merged；多个活动候选明确拒绝。 */
   private activeVersionMeta(): { version: string; meta: VersionMeta } {
+    const candidates: { version: string; meta: VersionMeta }[] = [];
     for (const version of this.index.listVersions()) {
       const meta = this.loadMeta(version);
-      if (meta.phase !== "merged") {
-        return { version, meta };
+      if (meta.merged_at === null && meta.phase !== "merged") {
+        candidates.push({ version, meta });
       }
     }
+    if (candidates.length > 1) {
+      throw new ModelManagerError(
+        "ACTIVE_VERSION_CONFLICT",
+        `存在多个活动版本：${candidates.map(({ version }) => version).join(", ")}`,
+      );
+    }
+    const active = candidates[0];
+    if (active !== undefined) return active;
     throw new ModelManagerError(
       "NO_ACTIVE_VERSION",
-      "无活动版本（.meta/versions 中不存在相位非 merged 的版本）",
+      "无活动版本（.meta/versions 中不存在 merged_at 为 null 且相位非 merged 的版本）",
     );
   }
 

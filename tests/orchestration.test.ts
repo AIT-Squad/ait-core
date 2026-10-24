@@ -1,26 +1,46 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-// Only external write failures and the temporary-directory boundary are injected.
-const boundary = vi.hoisted(() => ({ bundleWrite: false, renameTarget: "", temporaryRoot: "" }));
+// Inject only external IO failures and observe the bundle transport boundary.
+const boundary = vi.hoisted(() => ({
+  bundleWrite: false, bundleCorrupt: false, forbidBundleIO: false,
+  renameTarget: "", temporaryRoot: "", createdBundles: [] as string[],
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
+  const mkdtempSync = ((prefix: string): string => {
+    const isBundle = prefix.includes("ait-codegen-");
+    if (isBundle && boundary.forbidBundleIO) throw new Error("Memory delivery attempted to create a bundle directory");
+    const directory = actual.mkdtempSync(prefix);
+    if (isBundle) boundary.createdBundles.push(String(directory));
+    return directory;
+  }) as typeof actual.mkdtempSync;
   const writeFileSync: typeof actual.writeFileSync = (...args) => {
+    if (boundary.forbidBundleIO && String(args[0]).endsWith("bundle.md")) throw new Error("Memory delivery attempted to write a bundle");
     if (boundary.bundleWrite && String(args[0]).endsWith("bundle.md")) {
       throw Object.assign(new Error("injected bundle write failure"), { code: "EIO" });
     }
     actual.writeFileSync(...args);
+    if (boundary.bundleCorrupt && String(args[0]).endsWith("bundle.md")) actual.appendFileSync(args[0], "corrupt bytes");
   };
+  const readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
+    if (boundary.forbidBundleIO && String(args[0]).endsWith("bundle.md")) throw new Error("Memory delivery attempted to read a bundle");
+    return actual.readFileSync(...args);
+  }) as typeof actual.readFileSync;
   const renameSync: typeof actual.renameSync = (source, target) => {
     if (boundary.renameTarget && String(target) === boundary.renameTarget) {
       throw Object.assign(new Error("injected metadata replacement failure"), { code: "EIO" });
     }
     actual.renameSync(source, target);
   };
-  return { ...actual, writeFileSync, renameSync, default: { ...actual, writeFileSync, renameSync } };
+  return { ...actual, mkdtempSync, readFileSync, writeFileSync, renameSync,
+    default: { ...actual, mkdtempSync, readFileSync, writeFileSync, renameSync } };
 });
 vi.mock("node:os", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:os")>();
-  const tmpdir = () => boundary.temporaryRoot || actual.tmpdir();
+  const tmpdir = () => {
+    if (boundary.forbidBundleIO) throw new Error("Memory delivery attempted to access the temporary directory");
+    return boundary.temporaryRoot || actual.tmpdir();
+  };
   return { ...actual, tmpdir, default: { ...actual, tmpdir } };
 });
 
@@ -29,7 +49,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { CoreResultSchema, NextActionSchema, VersionMetaSchema, type GenerationDeliveryInput } from "../src/doc-model/schemas.js";
+import { CoreResultSchema, GenerationDeliveryInputSchema, VersionMetaSchema, type GenerationDeliveryInput } from "../src/doc-model/schemas.js";
+import { createCoreApi, type DocumentInput } from "../src/index.js";
 import { writeLocalConfig } from "../src/foundation/config.js";
 import type { ProjectRoot } from "../src/foundation/root.js";
 import { loadModel, saveModel } from "../src/foundation/yaml.js";
@@ -42,7 +63,6 @@ import { versionMerge } from "../src/versioning/merge-engine.js";
 import { dispatch, runCli } from "../src/cli/dispatcher.js";
 import { prepareDelivery, type DeliveryPointer } from "../src/orchestration/context-delivery.js";
 import { issueGenerationToken, registerGenerationReceipt, verifyGenerationReceipts } from "../src/orchestration/generation-receipts.js";
-import { buildNextAction, contractText } from "../src/orchestration/next-action.js";
 import { evaluateWriteGuard, type GuardInput } from "../src/orchestration/guard-decisions.js";
 import { getSessionContext } from "../src/orchestration/session-context.js";
 
@@ -68,16 +88,20 @@ function trackDirectory(directory: string): void {
 
 afterEach(() => {
   boundary.bundleWrite = false;
+  boundary.bundleCorrupt = false;
+  boundary.forbidBundleIO = false;
   boundary.renameTarget = "";
   boundary.temporaryRoot = "";
   vi.restoreAllMocks();
   process.chdir(originalCwd);
+  for (const directory of boundary.createdBundles) trackDirectory(directory);
   for (const directory of ownedDirectories) {
     const relative = path.relative(temporaryRoot, path.resolve(directory));
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Unsafe test cleanup target");
     fs.rmSync(directory, { recursive: true, force: true });
   }
   ownedDirectories.clear();
+  boundary.createdBundles.length = 0;
 });
 
 function makeRoot(): ProjectRoot {
@@ -120,6 +144,14 @@ function rejectWithoutWrites(root: ProjectRoot, operation: () => unknown, code: 
   const before = treeSnapshot(root);
   expectCode(operation, code);
   expect(treeSnapshot(root)).toEqual(before);
+}
+
+function expectNoOrchestration(value: unknown): void {
+  if (value === null || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    expect(["next_action", "next_call", "required_next_call", "NextAction"]).not.toContain(key);
+    expectNoOrchestration(child);
+  }
 }
 
 const prdText = [
@@ -179,7 +211,7 @@ function metadata(root: ProjectRoot, version = VERSION) {
 }
 
 function deliver(root: ProjectRoot, version?: string | null): DeliveryPointer {
-  const pointer = prepareDelivery(root, { tddRoot: TDD, ...(version === undefined ? {} : { version }) });
+  const pointer = prepareDelivery(root, { tddRoot: TDD, output: "file", ...(version === undefined ? {} : { version }) });
   trackDirectory(path.dirname(pointer.bundle_path));
   return pointer;
 }
@@ -209,6 +241,94 @@ async function mergeFixture(root: ProjectRoot): Promise<void> {
 }
 
 describe("context delivery", () => {
+  it("defaults to complete memory content without accessing a temporary bundle and still persists a verifiable delivery", async () => {
+    const body = Array.from({ length: 5000 }, (_, index) => `${index}: 内存完整正文 雪 🧪 é  `).join("\n")
+      + "\n规格原文：下一步由宿主决定，不能删除这句原文。";
+    const { root } = await fixture({ rich: true, body });
+    const beforeArtifact = artifact(root);
+    const expected = codegenPrepare(root, null, TDD);
+    const before = treeSnapshot(root);
+    boundary.forbidBundleIO = true;
+    const delivery = prepareDelivery(root, { tddRoot: TDD });
+    expect(delivery).toMatchObject({ version: VERSION, target_file: TARGET, tdd_root: TDD, target_state: "loaded" });
+    expect(delivery).not.toHaveProperty("bundle_path");
+    expectNoOrchestration(delivery);
+    expect(delivery.content).toContain(body);
+    expect(delivery.content).toContain(beforeArtifact.toString("utf8"));
+    expect(delivery.bytes).toBe(Buffer.byteLength(delivery.content, "utf8"));
+    expect(delivery.bytes).toBeGreaterThan(200_000);
+    expect(delivery.sha256).toBe(sha256(delivery.content));
+    for (const item of [...expected.upstream, ...expected.dependencies]) {
+      expect(delivery.content).toContain(item.content);
+      expect(delivery.content).toContain(`id: ${JSON.stringify(item.id)}`);
+      expect(delivery.content).toContain(`source_file: ${JSON.stringify(item.file)}`);
+      expect(delivery.content).toContain(`selection_reason: ${JSON.stringify(item.selectionReason)}`);
+    }
+    expect(boundary.createdBundles).toEqual([]);
+    const after = treeSnapshot(root);
+    expect(Object.keys(after).filter((name) => before[name] !== after[name])).toEqual([`project-docs/.meta/versions/${VERSION}.yaml`]);
+    const stored = metadata(root).generation?.deliveries[0];
+    expect(stored).toMatchObject({ bundle_sha256: delivery.sha256, token_digest: sha256(delivery.generation_token),
+      before_artifact: { state: "loaded", sha256: sha256(beforeArtifact) } });
+    expect(stored).not.toHaveProperty("content");
+    expect(stored).not.toHaveProperty("bundle_path");
+    expect(fs.readFileSync(path.join(root.meta, "versions", `${VERSION}.yaml`), "utf8")).not.toContain(delivery.generation_token);
+    const generated = artifact(root, "export const memoryGenerated = '雪';\n");
+    expect(registerGenerationReceipt(root, { generation_token: delivery.generation_token })).toMatchObject({
+      bundle_sha256: delivery.sha256, artifact_sha256: sha256(generated),
+    });
+    expect(verifyGenerationReceipts(root, VERSION).findings).toEqual([
+      expect.objectContaining({ tdd_root: "[TDD]-implementation", code: "GENERATION_RECEIPT_MISSING" }),
+    ]);
+  });
+
+  it.each(["absent", "unreadable"] as const)("returns structured memory target state %s without consulting the temporary directory", async (state) => {
+    const { root } = await fixture();
+    if (state === "unreadable") fs.mkdirSync(path.join(root.cwd, TARGET), { recursive: true });
+    boundary.forbidBundleIO = true;
+    const delivery = prepareDelivery(root, { tddRoot: TDD, output: "memory" });
+    expect(delivery.target_state).toBe(state);
+    expect(delivery.content).toContain(`target_state: ${state}`);
+    expect(delivery.content).not.toContain(`target_state: ${state === "absent" ? "unreadable" : "absent"}`);
+    expect(delivery).not.toHaveProperty("bundle_path");
+    expectNoOrchestration(delivery);
+    expect(metadata(root).generation?.deliveries[0]?.before_artifact).toEqual({ state, sha256: null });
+    expect(boundary.createdBundles).toEqual([]);
+  });
+
+  it.each(["memory", "file"] as const)("keeps both carriers byte equivalent and invalidates the previous %s delivery", async (firstOutput) => {
+    const { root } = await fixture();
+    artifact(root);
+    const first = prepareDelivery(root, { tddRoot: TDD, output: firstOutput });
+    const firstBytes = "content" in first ? Buffer.from(first.content, "utf8") : fs.readFileSync(first.bundle_path);
+    registerGenerationReceipt(root, { generation_token: first.generation_token });
+    const second = prepareDelivery(root, { tddRoot: TDD, output: firstOutput === "memory" ? "file" : "memory" });
+    const secondBytes = "content" in second ? Buffer.from(second.content, "utf8") : fs.readFileSync(second.bundle_path);
+    expect(secondBytes).toEqual(firstBytes);
+    for (const key of ["sha256", "bytes", "version", "target_file", "tdd_root", "source_file"] as const) expect(second[key]).toEqual(first[key]);
+    expect(second.generation_token).not.toBe(first.generation_token);
+    expect(metadata(root).generation?.deliveries).toHaveLength(1);
+    expect(metadata(root).generation?.deliveries[0]?.receipt).toBeNull();
+    rejectWithoutWrites(root, () => registerGenerationReceipt(root, { generation_token: first.generation_token }), "GENERATION_TOKEN_STALE");
+    expect(registerGenerationReceipt(root, { generation_token: second.generation_token }).bundle_sha256).toBe(second.sha256);
+    expect(verifyGenerationReceipts(root, VERSION)).toEqual({ enforcement: "report", passed: true, findings: [] });
+    expectNoOrchestration(first);
+    expectNoOrchestration(second);
+  });
+
+  it("preserves an earlier delivery and receipt when memory metadata persistence fails", async () => {
+    const { root } = await fixture();
+    artifact(root);
+    const first = prepareDelivery(root, { tddRoot: TDD });
+    const receipt = registerGenerationReceipt(root, { generation_token: first.generation_token });
+    boundary.forbidBundleIO = true;
+    boundary.renameTarget = path.join(root.meta, "versions", `${VERSION}.yaml`);
+    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD }), "EIO");
+    boundary.renameTarget = "";
+    expect(registerGenerationReceipt(root, { generation_token: first.generation_token })).toEqual(receipt);
+    expect(boundary.createdBundles).toEqual([]);
+  });
+
   it("delivers a large Unicode body, explicit ordered roles, exact bytes and a small CLI pointer", async () => {
     const body = Array.from({ length: 5000 }, (_, index) => `${index}: 完整正文 雪 🧪 é <tag> & \\ path  `).join("\n") + "\n正文结束。";
     const { root } = await fixture({ rich: true, body });
@@ -222,7 +342,9 @@ describe("context delivery", () => {
     try { exitCode = await inProject(root, () => runCli(["codegen", "prepare", TDD])); } finally { stdout.mockRestore(); }
     expect(exitCode).toBe(0);
     expect(output.trim().split("\n")).toHaveLength(1);
-    const result = CoreResultSchema.parse(JSON.parse(output));
+    const rawResult: unknown = JSON.parse(output);
+    expectNoOrchestration(rawResult);
+    const result = CoreResultSchema.parse(rawResult);
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.error);
     const pointer = result.data as unknown as DeliveryPointer;
@@ -251,12 +373,14 @@ describe("context delivery", () => {
       expect(text).toContain(`selection_reason: ${JSON.stringify(item.selectionReason)}`);
     }
     expect(fs.readFileSync(path.join(root.cwd, TARGET))).toEqual(beforeTarget);
-    expect(NextActionSchema.parse(pointer.next_action).type).toBe("continue");
-    expect(pointer.next_action).toMatchObject({ instruction: expect.stringContaining(pointer.sha256), next_call: expect.stringContaining(pointer.generation_token) });
+    expectNoOrchestration(pointer);
+    expect(pointer).not.toHaveProperty("content");
+    expect(pointer).not.toHaveProperty("target_state");
+    expect(text).not.toMatch(/core 不调用 LLM|下一步|registerGenerationReceipt|不得以空内容覆盖/);
     const persisted = fs.readFileSync(path.join(root.meta, "versions", `${VERSION}.yaml`), "utf8");
     expect(persisted).not.toContain(pointer.generation_token);
     expect(metadata(root).generation?.deliveries[0]).toMatchObject({ token_digest: sha256(pointer.generation_token), before_artifact: { state: "loaded", sha256: sha256(beforeTarget) } });
-  });
+  }, 30_000);
 
   it("preserves CRLF and trailing spaces from an existing confirmed source byte for byte", async () => {
     const { root } = await fixture();
@@ -278,21 +402,25 @@ describe("context delivery", () => {
     expect(metadata(root).generation?.deliveries[0]?.before_artifact).toEqual({ state, sha256: null });
     if (state === "unreadable") {
       expect(text).not.toContain("target_state: absent");
-      expect(pointer.next_action).toMatchObject({ instruction: expect.stringContaining("unreadable") });
-      expect(text).toContain("不得以空内容覆盖");
+      expect(text).toContain("目标文件存在但读取失败");
     }
+    expectNoOrchestration(pointer);
+    expect(text).not.toMatch(/不得以空内容覆盖|暂停覆盖|下一步/);
   });
 
   it("rejects unconfirmed active TDD through both APIs without issuing a token", async () => {
     const { root } = await fixture({ confirmed: false });
-    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD }), "TDD_NOT_CONFIRMED");
+    for (const output of ["memory", "file"] as const) {
+      rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD, output }), "TDD_NOT_CONFIRMED");
+    }
     const before = treeSnapshot(root);
     const result = await inProject(root, () => dispatch(["codegen", "prepare", TDD]));
     expect(result).toMatchObject({ ok: false, code: "TDD_NOT_CONFIRMED" });
     expect(result).not.toHaveProperty("data");
+    expectNoOrchestration(result);
     expect(treeSnapshot(root)).toEqual(before);
     expect(metadata(root).generation).toBeNull();
-  });
+  }, 30_000);
 
   it.each([
     ["missing file", "CODEGEN_SOURCE_MISSING"],
@@ -311,22 +439,29 @@ describe("context delivery", () => {
     else if (failure === "missing chunk") fs.writeFileSync(pointer.source_file, "<!-- @id:[TDD]-other -->\n## Other\n");
     else fs.writeFileSync(pointer.source_file, "<!-- @id:[TDD]-INVALID -->\n## Invalid\n");
     const generation = metadata(root, "v0.11").generation;
-    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD }), code!);
+    for (const output of ["memory", "file"] as const) {
+      rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD, output }), code!);
+    }
     expect(metadata(root, "v0.11").generation).toEqual(generation);
     expect(fs.readFileSync(path.join(root.docs, "tdd", `${TDD}.md`))).toEqual(baseline);
   });
 
-  it.each(["bundle", "metadata"] as const)("preserves the previous delivery and receipt when %s writing fails", async (failure) => {
+  it.each(["bundle", "readback", "metadata"] as const)("preserves the previous delivery and receipt when %s fails", async (failure) => {
     const { root } = await fixture();
     const pointer = deliver(root);
     artifact(root);
     const receipt = registerGenerationReceipt(root, { generation_token: pointer.generation_token });
     const oldBundle = fs.readFileSync(pointer.bundle_path);
+    const createdBefore = boundary.createdBundles.length;
     if (failure === "bundle") boundary.bundleWrite = true;
+    else if (failure === "readback") boundary.bundleCorrupt = true;
     else boundary.renameTarget = path.join(root.meta, "versions", `${VERSION}.yaml`);
-    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD }), "EIO");
+    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD, output: "file" }), failure === "readback" ? "DELIVERY_CONTENT_MISMATCH" : "EIO");
     boundary.bundleWrite = false;
+    boundary.bundleCorrupt = false;
     boundary.renameTarget = "";
+    expect(boundary.createdBundles.length).toBe(createdBefore + 1);
+    for (const directory of boundary.createdBundles.slice(createdBefore)) expect(fs.existsSync(directory)).toBe(false);
     expect(fs.readFileSync(pointer.bundle_path)).toEqual(oldBundle);
     expect(registerGenerationReceipt(root, { generation_token: pointer.generation_token })).toEqual(receipt);
   });
@@ -335,7 +470,7 @@ describe("context delivery", () => {
     const { root } = await fixture();
     const pointer = deliver(root);
     boundary.temporaryRoot = root.cwd;
-    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD }), "DELIVERY_PATH_INVALID");
+    rejectWithoutWrites(root, () => prepareDelivery(root, { tddRoot: TDD, output: "file" }), "DELIVERY_PATH_INVALID");
     expect(metadata(root).generation?.deliveries[0]?.token_digest).toBe(sha256(pointer.generation_token));
   });
 
@@ -513,6 +648,46 @@ describe("generation receipts", () => {
     rejectWithoutWrites(root, () => issueGenerationToken(root, input), field === "target" || field === "version" ? "GENERATION_SPEC_CHANGED" : "GENERATION_TOKEN_INVALID");
     expect(metadata(root).generation?.deliveries[0]?.token_digest).toBe(sha256(pointer.generation_token));
   });
+
+  it.each(["bytes", "hash", "target", "version", "body", "source"] as const)("validates actual memory %s before replacing a valid delivery", async (field) => {
+    const { root } = await fixture();
+    const delivery = prepareDelivery(root, { tddRoot: TDD });
+    const input = { version: delivery.version, tdd_root: delivery.tdd_root, target_file: delivery.target_file,
+      content: delivery.content, bundle_sha256: delivery.sha256, bytes: delivery.bytes };
+    if (field === "bytes") input.bytes += 1;
+    if (field === "hash") input.bundle_sha256 = "0".repeat(64);
+    if (field === "target") input.target_file = "src/other.ts";
+    if (field === "version") input.version = null;
+    if (field === "body" || field === "source") {
+      const source = codegenPrepare(root, null, TDD).upstream[0]!;
+      input.content = input.content.split(field === "body" ? source.content : JSON.stringify(source.file)).join("");
+      input.bytes = Buffer.byteLength(input.content, "utf8");
+      input.bundle_sha256 = sha256(input.content);
+    }
+    rejectWithoutWrites(root, () => issueGenerationToken(root, input), field === "bytes" || field === "hash" ? "GENERATION_TOKEN_INVALID" : "GENERATION_SPEC_CHANGED");
+    expect(metadata(root).generation?.deliveries[0]?.token_digest).toBe(sha256(delivery.generation_token));
+  });
+
+  it("rejects incomplete or malformed delivery identities for both carriers without writing", async () => {
+    const { root } = await fixture();
+    const pointer = deliver(root);
+    const fileInput = deliveryInput(pointer);
+    const { bundle_path: _bundlePath, ...identity } = fileInput;
+    const memoryInput = { ...identity, content: fs.readFileSync(pointer.bundle_path, "utf8") };
+    const before = treeSnapshot(root);
+    for (const input of [fileInput, memoryInput]) {
+      for (const field of Object.keys(input)) {
+        const incomplete: Record<string, unknown> = { ...input };
+        delete incomplete[field];
+        expect(GenerationDeliveryInputSchema.safeParse(incomplete).success).toBe(false);
+      }
+      for (const bytes of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(GenerationDeliveryInputSchema.safeParse({ ...input, bytes }).success).toBe(false);
+      }
+      expect(GenerationDeliveryInputSchema.safeParse({ ...input, bundle_sha256: "not-a-digest" }).success).toBe(false);
+    }
+    expect(treeSnapshot(root)).toEqual(before);
+  });
 });
 
 describe("read-only receipt verification", () => {
@@ -589,103 +764,107 @@ describe("read-only receipt verification", () => {
   });
 });
 
-describe("next actions and shared contract", () => {
-  it("round-trips real discussion arguments and token through a host following required_next_call", async () => {
+describe("facts for host orchestration", () => {
+  it("lets the host submit its original CLI intent with the returned discussion token", async () => {
     const root = makeRoot();
     new VersionManager(root).versionCreate(VERSION);
     const before = treeSnapshot(root);
-    const result = await inProject(root, () => dispatch(["prd", "create", PRD, "--action", "add", "--file", "中文 file.md"]));
+    const intent = ["prd", "create", PRD, "--action", "add", "--file", "中文 file.md"];
+    const result = await inProject(root, () => dispatch(intent));
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.error);
-    const action = NextActionSchema.parse(result.data.next_action);
-    expect(action.type).toBe("present_and_collect");
-    if (action.type !== "present_and_collect") throw new Error("Expected discussion action");
+    expect(result.data).toMatchObject({ mode: "discussion-context", layer: "prd", version: VERSION,
+      id: PRD, parent: null, background: expect.any(String), context_token: expect.stringMatching(/^ctx-v1\./) });
+    expectNoOrchestration(result);
     expect(treeSnapshot(root)).toEqual(before);
-    expect(action.instruction).toContain(contractText());
-    expect(action.required_next_call).toContain(JSON.stringify(VERSION));
-    const match = /await dispatch\((\[.*\])\)/.exec(action.required_next_call);
-    expect(match).not.toBeNull();
-    const argv = JSON.parse(match![1]!) as string[];
-    expect(argv).toEqual(["prd", "create", PRD, "--action", "add", "--file", "中文 file.md", "--context-token", result.data.context_token, "--content", "<讨论后确定的完整正文>"]);
-    argv[argv.length - 1] = prdText;
+    // The caller keeps the requested intent and supplies its own body; no call string is returned.
+    const argv = [...intent, "--context-token", String(result.data.context_token), "--content", prdText];
     const written = await inProject(root, () => dispatch(argv));
-    expect(written).toMatchObject({ ok: true, data: { mode: "written", next_action: null } });
+    expect(written).toMatchObject({ ok: true, data: { mode: "written", layer: "prd", id: PRD } });
+    expectNoOrchestration(written);
     expect(fs.readFileSync(path.join(root.root, "versions", VERSION, "prd", "中文 file.md"), "utf8")).toContain("完整交付与可核验生成。");
-  });
+  }, 30_000);
 
-  it("preserves explicit parent/action/file/override intent and safely escapes Unicode and quotes", async () => {
-    const { root, manager } = await fixture({ confirmed: false });
-    const discussion = await manager.createDocument("tdd", TDD, { parent: `${FSD}:generate`, action: "add" });
-    if (discussion.mode !== "discussion-context") throw new Error("Expected discussion");
+  it("preserves Unicode and quoted intent in host data and still enforces context token binding", async () => {
+    const { root } = await fixture({ confirmed: false });
+    const core = await inProject(root, async () => createCoreApi());
     const file = '中文 "file" \\ slash\u2028line.md';
-    const data = { ...discussion, target: { id: TDD }, anchor: { id: `${FSD}:generate` }, action: "modify", file, overrides: "[TDD]-previous" };
+    const intent: DocumentInput = { id: TDD, parent: `${FSD}:generate`, action: "modify", file, overrides: "[TDD]-previous" };
     const before = treeSnapshot(root);
-    const action = buildNextAction("tdd create", data);
-    expect(action?.type).toBe("present_and_collect");
-    if (action?.type !== "present_and_collect") throw new Error("Expected discussion action");
-    const argv = JSON.parse(/await dispatch\((\[.*\])\)/.exec(action.required_next_call)![1]!) as string[];
-    expect(argv).toEqual(["tdd", "create", TDD, "--parent", `${FSD}:generate`, "--action", "modify", "--file", file, "--overrides", "[TDD]-previous", "--context-token", discussion.context_token, "--content", "<讨论后确定的完整正文>"]);
-    expect(buildNextAction("tdd create", data)).toEqual(action);
+    const result = await core.tdd.create(intent);
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.data.mode !== "discussion-context") throw new Error("Expected discussion");
+    expect(result.data).toMatchObject({ layer: "tdd", version: VERSION, id: TDD, parent: intent.parent });
+    expectNoOrchestration(result);
+    expect(await core.tdd.create(JSON.parse(JSON.stringify(intent)) as DocumentInput)).toEqual(result);
     expect(treeSnapshot(root)).toEqual(before);
-    for (const missing of ["layer", "version", "target", "context_token", "anchor"]) {
-      const incomplete: Record<string, unknown> = { ...data };
-      delete incomplete[missing];
-      if (missing === "target") delete incomplete.id;
-      if (missing === "anchor") delete incomplete.parent;
-      expect(buildNextAction("tdd create", incomplete)).toBeNull();
+    const token = result.data.context_token;
+    const changes: Partial<DocumentInput>[] = [
+      { id: "[TDD]-another" }, { parent: `${FSD}:TEST` }, { action: "add" },
+      { file: "another.md" }, { overrides: "[TDD]-different" },
+    ];
+    for (const change of changes) {
+      const rejected = await core.tdd.create({ ...intent, ...change, content: tddText(), contextToken: token });
+      expect(rejected).toMatchObject({ ok: false, code: "CONTEXT_TOKEN_STALE" });
+      expectNoOrchestration(rejected);
+      expect(treeSnapshot(root)).toEqual(before);
     }
-  });
+    for (const contextToken of [undefined, "fabricated-token"]) {
+      const rejected = await core.tdd.create({ ...intent, content: tddText(), ...(contextToken === undefined ? {} : { contextToken }) });
+      expect(rejected).toMatchObject({ ok: false, code: "CONTEXT_TOKEN_INVALID" });
+      expectNoOrchestration(rejected);
+      expect(treeSnapshot(root)).toEqual(before);
+    }
+  }, 30_000);
 
-  it("uses the actual generation token and public receipt signature for the continue action", async () => {
+  it("lets the host pass complete memory content and later register through the public receipt method", async () => {
     const { root } = await fixture();
-    const pointer = deliver(root);
-    const action = NextActionSchema.parse(pointer.next_action);
-    expect(action.type).toBe("continue");
-    if (action.type !== "continue") throw new Error("Expected generation action");
-    expect(action.instruction).toContain(contractText());
-    expect(action.instruction).toContain(String(pointer.bytes));
-    expect(action.instruction).toContain(JSON.stringify(pointer.bundle_path));
-    expect(action.instruction).toContain(JSON.stringify(TARGET));
-    const tokenMatch = /^registerGenerationReceipt\(root, \{ generation_token: (".*") \}\)$/.exec(action.next_call);
-    expect(tokenMatch).not.toBeNull();
-    const token = JSON.parse(tokenMatch![1]!) as string;
-    expect(token).toBe(pointer.generation_token);
-    artifact(root);
-    expect(registerGenerationReceipt(root, { generation_token: token }).bundle_sha256).toBe(pointer.sha256);
+    const core = await inProject(root, async () => createCoreApi());
+    const prepared = await core.delivery.prepare({ tddRootId: TDD });
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) throw new Error(prepared.error);
+    expectNoOrchestration(prepared);
+    expect(prepared.data).not.toHaveProperty("bundle_path");
+    const task = { target: prepared.data.target_file, prompt: prepared.data.content };
+    expect(task.prompt).toContain(tddText());
+    expect(Buffer.byteLength(task.prompt)).toBe(prepared.data.bytes);
+    expect(sha256(task.prompt)).toBe(prepared.data.sha256);
+    const generated = artifact(root, "export const hostGenerated = '雪';\n", task.target);
+    const registered = await core.generation.registerReceipt({ generationToken: prepared.data.generation_token });
+    expect(registered).toMatchObject({ ok: true, data: { target_file: TARGET,
+      bundle_sha256: prepared.data.sha256, artifact_sha256: sha256(generated) } });
+    expectNoOrchestration(registered);
     const before = treeSnapshot(root);
-    const data: Record<string, unknown> = { ...pointer };
-    for (const field of ["bundle_path", "sha256", "bytes", "version", "target_file", "tdd_root", "source_file", "generation_token"]) {
-      const incomplete = { ...data };
-      delete incomplete[field];
-      expect(buildNextAction("codegen prepare", incomplete)).toBeNull();
-    }
-    for (const bytes of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) expect(buildNextAction("codegen prepare", { ...data, bytes })).toBeNull();
-    expect(buildNextAction("codegen prepare", { ...data, sha256: "not-a-digest" })).toBeNull();
-    expect(buildNextAction("codegen prepare", { ...data, target_state: "unreadable" })).toMatchObject({ instruction: expect.stringContaining("暂停覆盖") });
+    const verified = await core.generation.verifyReceipts({ version: VERSION });
+    expect(verified).toEqual({ ok: true, data: { enforcement: "report", passed: true, findings: [] } });
+    expectNoOrchestration(verified);
     expect(treeSnapshot(root)).toEqual(before);
-  });
+  }, 30_000);
 
-  it("validates report and null forms without inventing progress or executing suggested calls", async () => {
+  it("returns confirmation facts and errors without suggested calls or invented host progress", async () => {
     const { root, manager } = await fixture();
     manager.revertLayer("tdd");
-    const confirmed = manager.confirmLayer("tdd");
+    const core = await inProject(root, async () => createCoreApi());
+    const confirmed = await core.tdd.confirm();
+    expect(confirmed).toMatchObject({ ok: true, data: { version: VERSION, phase: "tdd-confirm", confirmed: [TDD] } });
+    expectNoOrchestration(confirmed);
     const before = treeSnapshot(root);
-    const action = buildNextAction("tdd confirm", { ...confirmed });
-    expect(NextActionSchema.parse(action)).toMatchObject({ type: "report", message: expect.stringContaining(VERSION) });
-    expect(NextActionSchema.nullable().parse(buildNextAction("unknown operation", {}))).toBeNull();
-    expect(buildNextAction("version create", {})).toBeNull();
-    expect(buildNextAction("version confirm", { version: VERSION })).toBeNull();
-    expect(buildNextAction("tdd confirm", { version: VERSION, phase: "tdd-creating", confirmed: [] })).toBeNull();
-    expect(buildNextAction("version confirm", { version: VERSION, passed: false })).toMatchObject({ type: "report", message: expect.stringContaining("未通过") });
-    expect(buildNextAction("version confirm", { version: VERSION, passed: true, ok: false })).toBeNull();
-    const contract = contractText();
-    expect(contractText()).toBe(contract);
-    expect(contract).toContain("core 不调用 LLM");
-    expect(contract).toContain("回执不证明语义正确");
-    const session = getSessionContext(root);
-    expect(session.text.split(contract)).toHaveLength(2);
+    const unknown = await inProject(root, () => dispatch(["unknown-operation"]));
+    expect(unknown).toMatchObject({ ok: false, code: "USAGE_ERROR" });
+    expectNoOrchestration(unknown);
+    const session = await core.session.get();
+    expect(session).toMatchObject({ ok: true, data: { active_version: VERSION, phase: "tdd-confirm" } });
+    expectNoOrchestration(session);
+    if (!session.ok) throw new Error(session.error);
+    expect(session.data.text).not.toMatch(/core 不调用 LLM|回执不证明语义正确|下一步|await dispatch|subagent|正在运行|等待用户/);
     expect(treeSnapshot(root)).toEqual(before);
-  });
+    writeLocalConfig(root.meta, { generation_receipts: { enforcement: "block" } });
+    const beforeFailure = treeSnapshot(root);
+    const refused = await core.version.confirm({ version: VERSION });
+    expect(refused).toMatchObject({ ok: false, code: "GENERATION_RECEIPTS_FAILED" });
+    expectNoOrchestration(refused);
+    expect(treeSnapshot(root)).toEqual(beforeFailure);
+  }, 30_000);
 });
 
 type GuardCase = { name: string; request: GuardInput; decision: "allow" | "block" };
@@ -778,7 +957,18 @@ function readSessionWithoutWrites(root: ProjectRoot) {
   const first = getSessionContext(root);
   expect(getSessionContext(root)).toEqual(first);
   expect(first.project_root).toBe(root.cwd);
-  expect(first.text).toContain(contractText());
+  expectNoOrchestration(first);
+  expect(first.text).toBe([
+    `项目：${first.project_root}`,
+    `活动版本：${first.active_version ?? "无"}`,
+    `阶段：${first.phase ?? "无"}`,
+    ...(["prd", "fsd", "tdd"] as const).map((layer) => {
+      const counts = first.layers[layer];
+      return `${layer.toUpperCase()}：working=${counts.working}, staged=${counts.staged}, committed=${counts.committed}`;
+    }),
+    `基线：${first.baseline_empty ? "空" : "非空"}`,
+  ].join("\n"));
+  expect(first.text).not.toMatch(/core 不调用 LLM|回执不证明语义正确|下一步|await dispatch|subagent|正在运行|等待用户/);
   expect(treeSnapshot(root)).toEqual(before);
   expect(Object.keys(before).some((name) => name.endsWith("/state.md"))).toBe(false);
   return first;
@@ -791,7 +981,7 @@ describe("session context", () => {
     const before = treeSnapshot(root);
     expect(await inProject(root, () => dispatch(["state"]))).toMatchObject({ ok: false, code: "NO_VERSION" });
     expect(treeSnapshot(root)).toEqual(before);
-  });
+  }, 30_000);
 
   it("counts real records at every current PRD/FSD/TDD phase deterministically", async () => {
     const root = makeRoot();

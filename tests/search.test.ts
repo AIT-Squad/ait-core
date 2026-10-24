@@ -1,5 +1,5 @@
 // [TDD]-search_tests — search 域两个制品（keyword_search / baseline_summary）的集成验收。
-// 覆盖 [FSD]-ait-core-search:TEST 第 1~4 条全部断言点。
+// 覆盖 [FSD]-ait-core-search:TEST 的全文检索、摘要投影与独立统计契约。
 // 约束：每个用例在 os.tmpdir() 下自建临时 project-docs 工作区（含 docs 与 versions/<v>/），
 // afterEach 清理；用例间零共享状态；路径断言统一为 posix 相对路径。
 
@@ -14,7 +14,8 @@ import {
 	SearchError,
 	type SearchHit,
 } from "../src/search/keyword-search.js";
-import { baselineSummary } from "../src/search/baseline-summary.js";
+import { IndexError } from "../src/indexing/index-manager.js";
+import { baselineStats, baselineSummary } from "../src/search/baseline-summary.js";
 
 let tmpDirs: string[] = [];
 
@@ -59,6 +60,40 @@ function makeProject(setup: (projDocs: string) => void): ProjectRoot {
 		docs: path.join(projDocs, "docs"),
 		meta: path.join(projDocs, ".meta"),
 	};
+}
+
+/** 按给定顺序写入真实索引；省略 summary 用于覆盖历史索引的缺省值。 */
+function writeBaselineIndex(
+	projDocs: string,
+	chunks: Array<{ id: string; file: string; heading: string; summary?: string | null }>,
+): void {
+	writeFile(
+		path.join(projDocs, ".meta", "chunks-index.yaml"),
+		JSON.stringify({
+			version: 1,
+			scope: "global",
+			updated: "2026-10-24T00:00:00Z",
+			chunks: chunks.map((entry) => ({ level: 2, metadata: {}, ...entry })),
+		}),
+	);
+}
+
+/** 同时记录目录、文件字节与修改时间，防止摘要读取隐式重建或改写。 */
+function snapshotTree(root: string): Record<string, { content: string | null; mtimeMs: number }> {
+	const entries: Record<string, { content: string | null; mtimeMs: number }> = {};
+	function visit(dir: string): void {
+		for (const name of fs.readdirSync(dir).sort()) {
+			const abs = path.join(dir, name);
+			const stat = fs.statSync(abs);
+			entries[path.relative(root, abs).replace(/\\/g, "/")] = {
+				content: stat.isDirectory() ? null : fs.readFileSync(abs).toString("base64"),
+				mtimeMs: stat.mtimeMs,
+			};
+			if (stat.isDirectory()) visit(abs);
+		}
+	}
+	visit(root);
+	return entries;
 }
 
 describe("keyword_search 命中", () => {
@@ -348,12 +383,213 @@ describe("keyword_search regexp", () => {
 });
 
 describe("baseline_summary", () => {
+	const withSummaryIndex = (projDocs: string): void => {
+		writeBaselineIndex(projDocs, [
+			{
+				id: "[FSD]-zeta",
+				file: ".\\PRD\\nested\\..\\overview",
+				heading: "以文件层级归入 PRD",
+				summary: "  索引中的摘要\n保留换行与空格  ",
+			},
+			{
+				id: "[PRD]-portal:entry",
+				file: "archive/portal",
+				heading: "入口需求",
+				summary: null,
+			},
+			{
+				id: "[PRD]-portal",
+				file: "archive/portal",
+				heading: "门户需求根",
+			},
+			{
+				id: "legacy-prd",
+				file: "prd/legacy",
+				heading: "旧 ID 的 PRD",
+				summary: "保留旧条目",
+			},
+			{
+				id: "[PRD]-moved",
+				file: "fsd/./moved",
+				heading: "以文件层级归入 FSD",
+				summary: "文件层级优先于 ID",
+			},
+			{
+				id: "[FSD]-fallback",
+				file: "archive/feature",
+				heading: "FSD 前缀回退",
+				summary: "功能摘要",
+			},
+			{
+				id: "[TDD]-fallback",
+				file: "archive/design",
+				heading: "TDD 前缀回退",
+				summary: "",
+			},
+			{
+				id: "[FSD]-moved",
+				file: "tdd\\moved",
+				heading: "以文件层级归入 TDD",
+				summary: "技术摘要",
+			},
+			{
+				id: "prd-legacy_unknown",
+				file: "archive/legacy",
+				heading: "无法归层的历史条目",
+				summary: "全量保留",
+			},
+		]);
+	};
+
+	it("缺省和空参数返回全量 scope/items，保留索引顺序、真实摘要及空值", () => {
+		const root = makeProject(withSummaryIndex);
+		const before = snapshotTree(root.root);
+		const expected = {
+			scope: "all",
+			items: [
+				{ id: "[FSD]-zeta", heading: "以文件层级归入 PRD", summary: "  索引中的摘要\n保留换行与空格  " },
+				{ id: "[PRD]-portal:entry", heading: "入口需求", summary: null },
+				{ id: "[PRD]-portal", heading: "门户需求根", summary: null },
+				{ id: "legacy-prd", heading: "旧 ID 的 PRD", summary: "保留旧条目" },
+				{ id: "[PRD]-moved", heading: "以文件层级归入 FSD", summary: "文件层级优先于 ID" },
+				{ id: "[FSD]-fallback", heading: "FSD 前缀回退", summary: "功能摘要" },
+				{ id: "[TDD]-fallback", heading: "TDD 前缀回退", summary: "" },
+				{ id: "[FSD]-moved", heading: "以文件层级归入 TDD", summary: "技术摘要" },
+				{ id: "prd-legacy_unknown", heading: "无法归层的历史条目", summary: "全量保留" },
+			],
+		};
+
+		expect(baselineSummary(root)).toEqual(expected);
+		expect(baselineSummary(root, {})).toEqual(expected);
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+
+	it.each([
+		["prd", ["[FSD]-zeta", "[PRD]-portal:entry", "[PRD]-portal", "legacy-prd"]],
+		["fsd", ["[PRD]-moved", "[FSD]-fallback"]],
+		["tdd", ["[TDD]-fallback", "[FSD]-moved"]],
+	] as const)("scope=%s 按规范化文件层级优先、ID 前缀回退筛选并保留顺序", (scope, ids) => {
+		const root = makeProject(withSummaryIndex);
+		const before = snapshotTree(root.root);
+		const result = baselineSummary(root, { scope });
+
+		expect(result.scope).toBe(scope);
+		expect(result.items.map((item) => item.id)).toEqual(ids);
+		if (scope === "prd") {
+			expect(result.items.slice(1, 3)).toEqual([
+				{ id: "[PRD]-portal:entry", heading: "入口需求", summary: null },
+				{ id: "[PRD]-portal", heading: "门户需求根", summary: null },
+			]);
+		}
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+
+	it.each(["missing", "empty"] as const)("%s 基线索引返回空摘要，读取不创建或重建索引", (state) => {
+		const root = makeProject((projDocs) => {
+			// 磁盘存在文档也不能取代空/缺失索引的事实。
+			writeFile(path.join(projDocs, "docs", "prd", "unindexed.md"),
+				"<!-- @id:[PRD]-unindexed -->\n## 尚未建索引\n正文不是摘要。\n");
+			if (state === "empty") writeBaselineIndex(projDocs, []);
+		});
+		const before = snapshotTree(root.root);
+
+		expect(baselineSummary(root)).toEqual({ scope: "all", items: [] });
+		for (const scope of ["prd", "fsd", "tdd"] as const) {
+			expect(baselineSummary(root, { scope })).toEqual({ scope, items: [] });
+		}
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+
+	it("指定层无条目返回空数组，不影响其他层的摘要", () => {
+		const root = makeProject((projDocs) => {
+			writeBaselineIndex(projDocs, [
+				{ id: "[FSD]-only", file: "fsd/only", heading: "仅功能设计", summary: null },
+			]);
+		});
+
+		expect(baselineSummary(root, { scope: "prd" })).toEqual({ scope: "prd", items: [] });
+		expect(baselineSummary(root, { scope: "tdd" })).toEqual({ scope: "tdd", items: [] });
+		expect(baselineSummary(root)).toEqual({
+			scope: "all",
+			items: [{ id: "[FSD]-only", heading: "仅功能设计", summary: null }],
+		});
+	});
+
+	it("只投影基线索引，不扫描正文、不混入活动版本或改写任何文件", () => {
+		const root = makeProject((projDocs) => {
+			writeBaselineIndex(projDocs, [
+				{ id: "[PRD]-portal", file: "prd/portal", heading: "索引标题", summary: "基线摘要" },
+			]);
+			writeFile(path.join(projDocs, "docs", "prd", "portal.md"), [
+				"<!-- @id:[PRD]-portal -->", "## 磁盘标题", "<!-- @summary:正文摘要 -->",
+				"<!-- @id:[PRD]-unindexed -->", "## 不在索引中", "不得自动重建。",
+			].join("\n"));
+			writeFile(path.join(projDocs, "versions", "v9.9", "prd", "portal.md"), [
+				"<!-- @id:[PRD]-portal -->", "## 版本标题", "<!-- @summary:版本摘要 -->",
+				"<!-- @id:[PRD]-version_only -->", "## 版本新增", "仅存在版本中。",
+			].join("\n"));
+			writeFile(path.join(projDocs, ".meta", "versions", "v9.9.yaml"),
+				"version: v9.9\ncreated_at: '2026-10-24T00:00:00Z'\nphase: prd-creating\n");
+			writeFile(path.join(projDocs, ".meta", "chunks-index-v9.9.yaml"), JSON.stringify({
+				version: 1,
+				version_name: "v9.9",
+				chunks: [
+					{ id: "[PRD]-portal", file: "prd/portal", heading: "版本标题", level: 2, summary: "版本摘要", action: "modify", state: "working" },
+					{ id: "[PRD]-version_only", file: "prd/portal", heading: "版本新增", level: 2, summary: "仅版本摘要", action: "add", state: "working" },
+				],
+			}));
+		});
+		const before = snapshotTree(root.root);
+		const items = [{ id: "[PRD]-portal", heading: "索引标题", summary: "基线摘要" }];
+
+		expect(baselineSummary(root)).toEqual({ scope: "all", items });
+		expect(baselineSummary(root, { scope: "prd" })).toEqual({ scope: "prd", items });
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+
+	it.each([
+		["非法 YAML", "chunks: [unclosed\n"],
+		["字段类型损坏", JSON.stringify({ chunks: [
+			{ id: "[PRD]-valid", file: "prd/valid", heading: "可读条目", level: 2, summary: "不可返回部分结果" },
+			{ id: "[FSD]-broken", file: "fsd/broken", heading: 123, level: 2 },
+		] })],
+	])("%s 透传 INDEX_UNREADABLE，scope 过滤不能隐藏损坏", (_label, content) => {
+		const root = makeProject((projDocs) => {
+			writeFile(path.join(projDocs, ".meta", "chunks-index.yaml"), content);
+		});
+		const before = snapshotTree(root.root);
+		for (const scope of [undefined, "prd", "fsd", "tdd"] as const) {
+			let err: unknown;
+			try {
+				baselineSummary(root, scope === undefined ? undefined : { scope });
+			} catch (caught) {
+				err = caught;
+			}
+			expect(err).toBeInstanceOf(IndexError);
+			expect(err).toMatchObject({ code: "INDEX_UNREADABLE" });
+			expect((err as Error).message).toContain(path.join(root.meta, "chunks-index.yaml"));
+		}
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+
+	it.each(["all", "baseline", "PRD", "", null, 123])("非法 scope=%s 返回 USAGE_ERROR，零写入", (scope) => {
+		const root = makeProject(withSummaryIndex);
+		const before = snapshotTree(root.root);
+		// 模拟 JavaScript 调用者绕过静态类型，检查领域运行时输入约束。
+		expect(() => Reflect.apply(baselineSummary, undefined, [root, { scope }])).toThrowError(
+			expect.objectContaining({ code: "USAGE_ERROR" }),
+		);
+		expect(snapshotTree(root.root)).toEqual(before);
+	});
+});
+
+describe("baseline_stats", () => {
 	it("空基线返回全零结构（合法，不报错）", () => {
 		const root = makeProject(() => {
 			// docs/ 各层目录与 .meta/versions 均缺失。
 		});
 
-		expect(baselineSummary(root)).toEqual({
+		expect(baselineStats(root)).toEqual({
 			docs: { prd: 0, fsd: 0, tdd: 0 },
 			chunks: 0,
 			edges: { derives: 0, decomposes: 0, details: 0, depends_on: 0 },
@@ -448,7 +684,7 @@ describe("baseline_summary", () => {
 			}
 		});
 
-		expect(baselineSummary(root)).toEqual({
+		expect(baselineStats(root)).toEqual({
 			docs: { prd: 1, fsd: 2, tdd: 1 },
 			chunks: 5,
 			edges: { derives: 1, decomposes: 1, details: 1, depends_on: 1 },

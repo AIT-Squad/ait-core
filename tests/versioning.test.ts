@@ -1,4 +1,4 @@
-// [TDD]-versioning_tests v0.12 — versioning 域三个制品（version-manager / merge-engine /
+// [TDD]-versioning_tests v0.13 — versioning 域三个制品（version-manager / merge-engine /
 // publish）的集成验收，覆盖 [FSD]-ait-core-versioning:TEST 第 1~8 条全部断言点。
 //
 // 持久化形态按 Python 当前形态断言（v0.5 对齐，doc-model schemas 为权威）：
@@ -2338,7 +2338,7 @@ async function buildGenerationVersion(root: ProjectRoot): Promise<VersionManager
 }
 
 function deliverGeneration(root: ProjectRoot): DeliveryPointer {
-  const pointer = prepareDelivery(root, { tddRoot: "[TDD]-demo", version: V });
+  const pointer = prepareDelivery(root, { tddRoot: "[TDD]-demo", version: V, output: "file" });
   tmpDirs.push(path.dirname(pointer.bundle_path));
   const bytes = fs.readFileSync(pointer.bundle_path);
   expect(bytes.length).toBe(pointer.bytes);

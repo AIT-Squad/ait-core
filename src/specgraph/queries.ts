@@ -1,12 +1,38 @@
-import type { CombinedView, Edge } from "./graph-model.js";
+import type { Direction } from "../api/types.js";
+import type { CombinedView, Edge, EdgeRel } from "./graph-model.js";
 
 const TREE_RELS: ReadonlySet<string> = new Set(["derives", "decomposes", "details"]);
 const DEPENDS_ON = "depends_on";
+const QUERY_RELS: ReadonlySet<string> = new Set([...TREE_RELS, DEPENDS_ON]);
+
+class QueryUsageError extends Error {
+  readonly code = "USAGE_ERROR";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "QueryUsageError";
+  }
+}
+
+function validateDepsArguments(direction: unknown, rels: unknown): void {
+  if (direction !== "in" && direction !== "out" && direction !== "both") {
+    throw new QueryUsageError("direction 必须为 in、out 或 both");
+  }
+  if (rels === undefined) return;
+  if (!Array.isArray(rels)) {
+    throw new QueryUsageError("rels 必须为关系数组");
+  }
+  for (const rel of rels) {
+    if (typeof rel !== "string" || !QUERY_RELS.has(rel)) {
+      throw new QueryUsageError("rels 仅支持 derives、decomposes、details、depends_on");
+    }
+  }
+}
 
 export interface DepsResult {
   found: boolean;
   target: string;
-  direction: "from" | "to" | "both";
+  direction: Direction;
   edges: Edge[];
 }
 
@@ -74,15 +100,19 @@ function kahnResidual(edges: ReadonlyArray<readonly [string, string]>): string[]
 export function queryDeps(
   view: CombinedView,
   target: string,
-  direction: "from" | "to" | "both" = "both",
+  direction: Direction = "both",
+  rels?: EdgeRel[],
 ): DepsResult {
+  validateDepsArguments(direction, rels);
   if (!view.nodes.has(target)) {
     return { found: false, target, direction, edges: [] };
   }
+  const selectedRels = rels === undefined ? undefined : new Set<string>(rels);
   const seen = new Set<string>();
   const edges: Edge[] = [];
   const collect = (list: Iterable<Edge>): void => {
     for (const e of list) {
+      if (selectedRels !== undefined && !selectedRels.has(e.rel)) continue;
       const key = `${e.src}${e.rel}${e.dst}`;
       if (!seen.has(key)) {
         seen.add(key);
@@ -90,10 +120,10 @@ export function queryDeps(
       }
     }
   };
-  if (direction === "from" || direction === "both") {
+  if (direction === "out" || direction === "both") {
     collect(view.edgesFrom(target));
   }
-  if (direction === "to" || direction === "both") {
+  if (direction === "in" || direction === "both") {
     collect(view.edgesTo(target));
   }
   return { found: true, target, direction, edges };

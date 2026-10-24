@@ -135,6 +135,25 @@ function loadPolicy(root: ProjectRoot): GovernancePolicy {
   };
 }
 
+/** Read-only policy projection for the internal API read models. */
+export function getEffectiveGovernancePolicy(root: ProjectRoot): GovernancePolicy & {
+  generation_receipts: { enforcement: "report" | "block" };
+} {
+  const policy = loadPolicy(root);
+  const receipts = loadConfig(root.meta).generation_receipts;
+  // Match generation-receipts validation: only omitted values default to report.
+  if (receipts === undefined) {
+    return { ...policy, generation_receipts: { enforcement: "report" } };
+  }
+  if (receipts !== null && typeof receipts === "object" && !Array.isArray(receipts)) {
+    const enforcement = (receipts as Record<string, unknown>).enforcement;
+    if (enforcement === undefined || enforcement === "report" || enforcement === "block") {
+      return { ...policy, generation_receipts: { enforcement: enforcement ?? "report" } };
+    }
+  }
+  throw new ConfigUnreadableError(root.meta, "generation_receipts.enforcement 必须是 report 或 block");
+}
+
 export function governancePolicyFingerprint(root: ProjectRoot): string {
   return createHash("sha256").update(JSON.stringify(loadPolicy(root))).digest("hex");
 }

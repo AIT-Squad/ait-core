@@ -4,7 +4,6 @@ import { ensureWithin } from "../foundation/io.js";
 import type { ProjectRoot } from "../foundation/root.js";
 import { loadModel } from "../foundation/yaml.js";
 import { IndexManager } from "../indexing/index-manager.js";
-import { contractText } from "./next-action.js";
 
 export interface LayerCounts {
   working: number;
@@ -72,7 +71,6 @@ export function getSessionContext(root: ProjectRoot): SessionContext {
       return `${layer.toUpperCase()}：working=${counts.working}, staged=${counts.staged}, committed=${counts.committed}`;
     }),
     `基线：${baselineEmpty ? "空" : "非空"}`,
-    contractText(),
   ].join("\n");
   return {
     project_root: root.cwd,
