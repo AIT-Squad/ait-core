@@ -1,6 +1,6 @@
 {
   "name": "ait-core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "AIT — chunk-level spec version control and AI implementation orchestration (TypeScript)",
   "type": "module",
   "main": "./dist/src/index.js",

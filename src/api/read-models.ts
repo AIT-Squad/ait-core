@@ -1,11 +1,8 @@
 /** Read-only projections of version, confirmation, generation, and policy facts. */
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   VersionMetaSchema,
-  type GenerationArtifactState,
   type VersionIndex,
   type VersionMeta,
 } from "../doc-model/schemas.js";
@@ -13,11 +10,12 @@ import { ensureWithin } from "../foundation/io.js";
 import type { ProjectRoot } from "../foundation/root.js";
 import { loadModel } from "../foundation/yaml.js";
 import { IndexManager } from "../indexing/index-manager.js";
-import { CodegenError, codegenPrepare } from "../new-model/codegen.js";
+import { CodegenError } from "../new-model/codegen.js";
 import { getEffectiveGovernancePolicy } from "../new-model/governance.js";
-import { normalizeTargetFile } from "../new-model/validator.js";
-import { verifyGenerationReceipts } from "../orchestration/generation-receipts.js";
-import { specType } from "../specgraph/graph-model.js";
+import {
+  generationVerificationCandidates,
+  verifyGenerationReceipts,
+} from "../orchestration/generation-receipts.js";
 import {
   VersionManagerError,
   buildReconciliation,
@@ -35,19 +33,9 @@ interface VersionContext {
   index: VersionIndex;
 }
 
-interface GenerationCandidate {
-  tdd_root: string;
-  target_file: string;
-  artifact: GenerationArtifactState;
-}
-
 function errorCode(error: unknown): unknown {
   return error !== null && typeof error === "object" && "code" in error
     ? error.code : undefined;
-}
-
-function compare(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 function isMerged(meta: VersionMeta): boolean {
@@ -193,56 +181,21 @@ export function inspectVersion(root: ProjectRoot, version: string): VersionInspe
   };
 }
 
-function readArtifact(root: ProjectRoot, target: string): GenerationArtifactState {
-  const file = ensureWithin(root.cwd, normalizeTargetFile(target));
-  try {
-    return { state: "loaded", sha256: createHash("sha256").update(fs.readFileSync(file)).digest("hex") };
-  } catch (error) {
-    return { state: errorCode(error) === "ENOENT" ? "absent" : "unreadable", sha256: null };
-  }
-}
-
 /** Project the receipt verifier's candidate set without manufacturing absent targets. */
-function generationCandidates(root: ProjectRoot, context: VersionContext, tddRootId?: string): GenerationCandidate[] {
-  const indexes = new IndexManager(root);
-  const deliveries = context.meta.generation?.deliveries ?? [];
-  const candidates = new Map<string, GenerationCandidate>();
-  const add = (candidate: GenerationCandidate): void => {
-    candidates.set(`${candidate.tdd_root}\0${candidate.target_file}`, candidate);
-  };
-  const ids = [...new Set(context.index.chunks.map((entry) => entry.id))].sort(compare);
-  for (const id of ids) {
-    if (tddRootId !== undefined && id !== tddRootId) continue;
-    const latest = indexes.queryVersion(context.meta.version, id);
-    if (latest === null || latest.action === "delete" || id.includes(":") ||
-        specType(id, latest.file ?? undefined) !== "tdd") continue;
-    let target: string;
-    try {
-      target = codegenPrepare(root, context.meta.version, id).targetFile;
-    } catch (error) {
-      if (!(error instanceof CodegenError) && errorCode(error) !== "CHUNK_PARSE_ERROR" &&
-          errorCode(error) !== "INVALID_TARGET_FILE") throw error;
-      const historicalTarget = deliveries.find((record) => record.tdd_root === id)?.target_file;
-      // Preserve the original code and source location when no target is known.
-      if (historicalTarget === undefined || historicalTarget.trim() === "") throw error;
-      target = historicalTarget;
-    }
-    add({ tdd_root: id, target_file: target, artifact: readArtifact(root, target) });
-  }
-  for (const record of deliveries) {
-    if (tddRootId !== undefined && record.tdd_root !== tddRootId) continue;
-    const artifact = readArtifact(root, record.target_file);
-    if (artifact.state !== record.before_artifact.state || artifact.sha256 !== record.before_artifact.sha256) {
-      const key = `${record.tdd_root}\0${record.target_file}`;
-      if (!candidates.has(key)) add({ tdd_root: record.tdd_root, target_file: record.target_file, artifact });
-    }
-  }
-  return [...candidates.values()].sort((a, b) => compare(a.tdd_root, b.tdd_root) || compare(a.target_file, b.target_file));
+function generationCandidates(root: ProjectRoot, version: string, tddRootId?: string) {
+  return generationVerificationCandidates(root, version)
+    .filter((candidate) => tddRootId === undefined || candidate.tdd_root === tddRootId)
+    .map((candidate) => {
+      if (candidate.target_file === "" && candidate.spec_error !== undefined) {
+        throw Object.assign(new Error(candidate.spec_error), { code: candidate.spec_error_code ?? "SPEC_CONTENT_MISMATCH" });
+      }
+      return candidate;
+    });
 }
 
 export function generationStatus(root: ProjectRoot, input: { version: string; tddRootId?: string }): GenerationStatus {
   const context = loadVersion(root, input.version);
-  const candidates = generationCandidates(root, context, input.tddRootId);
+  const candidates = generationCandidates(root, input.version, input.tddRootId);
   if (input.tddRootId !== undefined && candidates.length === 0) {
     throw new CodegenError("TDD_NOT_FOUND", `版本 ${input.version} 的生成候选中不存在 TDD：${input.tddRootId}`);
   }

@@ -240,6 +240,18 @@ async function mergeFixture(root: ProjectRoot): Promise<void> {
   expect((await versionMerge(root, VERSION)).version).toBe(VERSION);
 }
 
+async function mergedReceiptFixture(policy: "report" | "block" = "report", withReceipt = true): Promise<{
+  root: ProjectRoot; pointer: DeliveryPointer; artifactBytes: Buffer;
+}> {
+  const { root } = await fixture();
+  if (policy === "block") writeLocalConfig(root.meta, { generation_receipts: { enforcement: policy } });
+  const pointer = deliver(root);
+  const artifactBytes = artifact(root, "export const mergedHistory = '保留原字节';\r\n");
+  if (withReceipt) registerGenerationReceipt(root, { generation_token: pointer.generation_token });
+  await mergeFixture(root);
+  return { root, pointer, artifactBytes };
+}
+
 describe("context delivery", () => {
   it("defaults to complete memory content without accessing a temporary bundle and still persists a verifiable delivery", async () => {
     const body = Array.from({ length: 5000 }, (_, index) => `${index}: 内存完整正文 雪 🧪 é  `).join("\n")
@@ -691,6 +703,113 @@ describe("generation receipts", () => {
 });
 
 describe("read-only receipt verification", () => {
+  it.each(["report", "block"] as const)("keeps a clean merged receipt verifiable under %s policy through internal, public, dispatch, and bin entry points", async (policy) => {
+    const { root, pointer, artifactBytes } = await mergedReceiptFixture(policy);
+    const before = treeSnapshot(root);
+    const expected = { enforcement: policy, passed: true, findings: [] };
+    expect(verifyGenerationReceipts(root, VERSION)).toEqual(expected);
+    expect(treeSnapshot(root)).toEqual(before);
+
+    const core = await inProject(root, async () => createCoreApi());
+    expect(await core.generation.verifyReceipts({ version: VERSION })).toEqual({ ok: true, data: expected });
+    expect(await core.generation.status({ version: VERSION, tddRootId: TDD })).toEqual({ ok: true, data: {
+      version: VERSION, enforcement: policy, items: [{
+        tdd_root: TDD, target_file: TARGET, delivery_present: true, receipt_present: true,
+        artifact_state: "loaded", artifact_sha256: sha256(artifactBytes),
+        receipt_artifact_sha256: sha256(artifactBytes), findings: [],
+      }],
+    } });
+    expect(await inProject(root, () => dispatch(["codegen", "verify", "--version", VERSION])))
+      .toEqual({ ok: true, data: expected });
+
+    const { spawnSync } = await import("node:child_process");
+    const bin = spawnSync(process.execPath, [path.join(originalCwd, "dist/src/bin.js"), "codegen", "verify", "--version", VERSION], {
+      cwd: root.cwd, encoding: "utf8", windowsHide: true,
+    });
+    expect(bin.status, bin.stderr).toBe(0);
+    const lines = bin.stdout.trim().split(/\r?\n/);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toEqual({ ok: true, data: expected });
+    expect(treeSnapshot(root)).toEqual(before);
+    rejectWithoutWrites(root, () => registerGenerationReceipt(root, { generation_token: pointer.generation_token }), "GENERATION_TOKEN_STALE");
+  }, 30_000);
+
+  it.each([
+    ["changed", "loaded", "GENERATION_ARTIFACT_CHANGED"],
+    ["missing", "absent", "GENERATION_ARTIFACT_MISSING"],
+    ["unreadable", "unreadable", "GENERATION_ARTIFACT_UNREADABLE"],
+  ] as const)("reports a merged artifact becoming %s without mutating history", async (state, artifactState, code) => {
+    const { root } = await mergedReceiptFixture();
+    const target = path.join(root.cwd, TARGET);
+    if (state === "changed") artifact(root, "// changed after merge\n");
+    else {
+      fs.unlinkSync(target);
+      if (state === "unreadable") fs.mkdirSync(target);
+    }
+    const before = treeSnapshot(root);
+    expect(verifyGenerationReceipts(root, VERSION)).toEqual({ enforcement: "report", passed: true, findings: [
+      expect.objectContaining({ code, tdd_root: TDD, target_file: TARGET }),
+    ] });
+    const core = await inProject(root, async () => createCoreApi());
+    expect(await core.generation.status({ version: VERSION, tddRootId: TDD })).toMatchObject({ ok: true, data: { items: [{
+      tdd_root: TDD, target_file: TARGET, delivery_present: true, receipt_present: true,
+      artifact_state: artifactState, artifact_sha256: state === "changed" ? expect.any(String) : null,
+      findings: [{ code }],
+    }] } });
+    expect(treeSnapshot(root)).toEqual(before);
+  }, 30_000);
+
+  it("keeps a merged version bound to its historical target after a later real version changes the baseline target", async () => {
+    const { root, artifactBytes } = await mergedReceiptFixture();
+    const oldVersionSnapshot = treeSnapshot(root);
+    const nextVersion = "v0.11";
+    new VersionManager(root).versionCreate(nextVersion);
+    await writeTree(root, { action: "modify", target: "src/replacement-target.ts" });
+    artifact(root, "export const replacement = true;\n", "src/replacement-target.ts");
+    expect((await new VersionManager(root).versionConfirm(nextVersion)).passed).toBe(true);
+    expect((await versionMerge(root, nextVersion)).version).toBe(nextVersion);
+    const afterLaterMerge = treeSnapshot(root);
+
+    expect(verifyGenerationReceipts(root, VERSION)).toEqual({ enforcement: "report", passed: true, findings: [] });
+    const core = await inProject(root, async () => createCoreApi());
+    expect(await core.generation.status({ version: VERSION, tddRootId: TDD })).toMatchObject({ ok: true, data: { items: [{
+      target_file: TARGET, artifact_state: "loaded", artifact_sha256: sha256(artifactBytes), findings: [],
+    }] } });
+    expect(treeSnapshot(root)).toEqual(afterLaterMerge);
+    expect(oldVersionSnapshot[`project-docs/versions/${VERSION}/tdd/${TDD}.md`])
+      .toEqual(afterLaterMerge[`project-docs/versions/${VERSION}/tdd/${TDD}.md`]);
+  }, 30_000);
+
+  it("retains a missing-receipt finding after a report-policy version is really merged", async () => {
+    const { root } = await mergedReceiptFixture("report", false);
+    const before = treeSnapshot(root);
+    expect(verifyGenerationReceipts(root, VERSION)).toEqual({ enforcement: "report", passed: true, findings: [
+      expect.objectContaining({ code: "GENERATION_RECEIPT_MISSING", tdd_root: TDD, target_file: TARGET }),
+    ] });
+    const core = await inProject(root, async () => createCoreApi());
+    expect(await core.generation.status({ version: VERSION, tddRootId: TDD })).toMatchObject({ ok: true, data: { items: [{
+      delivery_present: true, receipt_present: false,
+      findings: [{ code: "GENERATION_RECEIPT_MISSING" }],
+    }] } });
+    expect(treeSnapshot(root)).toEqual(before);
+  }, 30_000);
+
+  it.each(["missing source", "damaged source", "damaged metadata identity"] as const)("fails closed for merged history with %s and preserves every byte", async (failure) => {
+    const { root, pointer } = await mergedReceiptFixture();
+    if (failure === "missing source") fs.unlinkSync(pointer.source_file);
+    if (failure === "damaged source") fs.writeFileSync(pointer.source_file, "<!-- @id:[TDD]-broken -->\n## broken\n");
+    if (failure === "damaged metadata identity") {
+      const meta = metadata(root);
+      saveModel(path.join(root.meta, "versions", `${VERSION}.yaml`), { ...meta, created_at: "2000-01-01T00:00:00.000Z" });
+    }
+    const before = treeSnapshot(root);
+    const expectedCode = failure === "damaged metadata identity" ? "GENERATION_TOKEN_STALE" : "GENERATION_SPEC_CHANGED";
+    expect(verifyGenerationReceipts(root, VERSION).findings).toEqual([
+      expect.objectContaining({ code: expectedCode, tdd_root: TDD, target_file: TARGET }),
+    ]);
+    expect(treeSnapshot(root)).toEqual(before);
+  }, 30_000);
+
   it.each(["report", "block"] as const)("includes a declared TDD never prepared under %s policy", async (policy) => {
     const { root } = await fixture();
     artifact(root);
@@ -1061,3 +1180,4 @@ describe("session context", () => {
     rejectWithoutWrites(root, () => getSessionContext(root), "ACTIVE_VERSION_CONFLICT");
   });
 });
+

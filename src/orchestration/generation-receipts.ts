@@ -2,6 +2,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { parse as parseYaml } from "yaml";
 import {
   GenerationDeliveryInputSchema,
   GenerationStateSchema,
@@ -15,6 +16,7 @@ import {
   type VersionIndex,
   type VersionMeta,
 } from "../doc-model/schemas.js";
+import { ChunkParseError, parseText } from "../doc-model/chunk-parser.js";
 import { ConfigUnreadableError, loadConfig } from "../foundation/config.js";
 import { ensureWithin } from "../foundation/io.js";
 import type { ProjectRoot } from "../foundation/root.js";
@@ -54,13 +56,16 @@ interface GenerationStore {
   version: VersionContext | null;
 }
 
-interface Candidate {
+export interface GenerationVerificationCandidate {
   tdd_root: string;
   target_file: string;
   artifact: GenerationArtifactState;
   bundle?: CodegenBundle;
   spec_error?: string;
+  spec_error_code?: string;
 }
+
+type Candidate = GenerationVerificationCandidate;
 
 const TOKEN_PATTERN = /^gen-v1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([0-9a-f]{64})$/;
 
@@ -298,6 +303,52 @@ function currentBundle(root: ProjectRoot, record: GenerationDeliveryRecord): Cod
   }
 }
 
+const YAML_FENCE_PATTERN = /```yaml[ \t]*\r?\n([\s\S]*?)```/g;
+
+function historicalTarget(content: string, file: string): string {
+  for (const fence of content.matchAll(YAML_FENCE_PATTERN)) {
+    let value: unknown;
+    try {
+      value = parseYaml(fence[1] as string);
+    } catch (error) {
+      const line = content.slice(0, fence.index).split("\n").length + 1;
+      throw new ChunkParseError(file, line, `target_file YAML 解析失败（${file}:${line}）：${String(error)}`);
+    }
+    if (value !== null && typeof value === "object" && "target_file" in value) {
+      const target = (value as { target_file?: unknown }).target_file;
+      if (typeof target !== "string" || target.trim() === "") {
+        throw new CodegenError("TARGET_FILE_MISSING", `TDD 的 target_file 不是非空字符串：${file}`);
+      }
+      return normalizeTargetFile(target);
+    }
+  }
+  throw new CodegenError("TARGET_FILE_MISSING", `TDD 缺少字符串 target_file 声明：${file}`);
+}
+
+/** Resolve a merged version from its retained TDD bytes, never from the later baseline. */
+function mergedTarget(root: ProjectRoot, context: VersionContext, id: string): string {
+  const latest = new IndexManager(root).queryVersion(context.meta.version, id);
+  if (latest === null || latest.action === "delete" || latest.file === null) {
+    throw new CodegenError("TDD_NOT_FOUND", `已合入版本 ${context.meta.version} 不保留 TDD：${id}`);
+  }
+  const relative = latest.file.replace(/\\/g, "/");
+  const file = ensureWithin(
+    ensureWithin(root.root, path.join("versions", context.meta.version)),
+    relative.endsWith(".md") ? relative : `${relative}.md`,
+  );
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    throw new CodegenError("SPEC_CONTENT_MISMATCH", `已合入版本 TDD 来源缺失或不可读：${id}（${file}）：${String(error)}`);
+  }
+  const chunk = parseText(text, file).chunks.find((entry) => entry.id === id);
+  if (chunk === undefined) {
+    throw new CodegenError("SPEC_CONTENT_MISMATCH", `已合入版本 TDD 正文缺少索引声明的 chunk：${id}（${file}）`);
+  }
+  return historicalTarget(chunk.content, file);
+}
+
 export function registerGenerationReceipt(root: ProjectRoot, input: { generation_token: string }): GenerationReceipt {
   const token = input?.generation_token;
   const match = typeof token === "string" ? TOKEN_PATTERN.exec(token) : null;
@@ -353,7 +404,8 @@ export function registerGenerationReceipt(root: ProjectRoot, input: { generation
   return publicReceipt(receipt);
 }
 
-function candidates(root: ProjectRoot, context: VersionContext): Candidate[] {
+export function generationVerificationCandidates(root: ProjectRoot, version: string): GenerationVerificationCandidate[] {
+  const context = loadVersion(root, version);
   const index = new IndexManager(root);
   const result = new Map<string, Candidate>();
   const add = (candidate: Candidate) => result.set(`${candidate.tdd_root}\0${candidate.target_file}`, candidate);
@@ -363,8 +415,13 @@ function candidates(root: ProjectRoot, context: VersionContext): Candidate[] {
     if (latest === null || latest.action === "delete" || id.includes(":") ||
         specType(id, latest.file ?? undefined) !== "tdd") continue;
     try {
-      const bundle = codegenPrepare(root, context.meta.version, id);
-      add({ tdd_root: id, target_file: bundle.targetFile, artifact: readArtifact(root, bundle.targetFile), bundle });
+      if (context.merged) {
+        const target = mergedTarget(root, context, id);
+        add({ tdd_root: id, target_file: target, artifact: readArtifact(root, target) });
+      } else {
+        const bundle = codegenPrepare(root, context.meta.version, id);
+        add({ tdd_root: id, target_file: bundle.targetFile, artifact: readArtifact(root, bundle.targetFile), bundle });
+      }
     } catch (error) {
       if (!(error instanceof CodegenError) && errorCode(error) !== "CHUNK_PARSE_ERROR" && errorCode(error) !== "INVALID_TARGET_FILE") throw error;
       const target = context.meta.generation?.deliveries.find((record) => record.tdd_root === id)?.target_file ?? "";
@@ -373,6 +430,7 @@ function candidates(root: ProjectRoot, context: VersionContext): Candidate[] {
         target_file: target,
         artifact: target === "" ? { state: "absent", sha256: null } : readArtifact(root, target),
         spec_error: error instanceof Error ? error.message : String(error),
+        spec_error_code: typeof errorCode(error) === "string" ? errorCode(error) as string : "SPEC_CONTENT_MISMATCH",
       });
     }
   }
@@ -392,14 +450,23 @@ function candidateFinding(root: ProjectRoot, store: GenerationStore, candidate: 
     return { code: "GENERATION_RECEIPT_MISSING", message: "缺少与最新交付绑定的生成回执" };
   }
   try {
-    assertCurrentRecord(store, record, store.state!.epoch);
+    if (store.version?.merged) {
+      if (record.version !== store.version.meta.version ||
+          record.version_created_at !== store.version.meta.created_at) {
+        throw new GenerationError("GENERATION_TOKEN_STALE", "历史交付的版本身份与保存元数据不一致");
+      }
+    } else {
+      assertCurrentRecord(store, record, store.state!.epoch);
+    }
     if (record.target_file !== candidate.target_file) {
       throw new GenerationError("GENERATION_SPEC_CHANGED", "最新交付的目标与版本声明的制品不一致");
     }
     if (candidate.spec_error !== undefined) throw new GenerationError("GENERATION_SPEC_CHANGED", candidate.spec_error);
-    const bundle = candidate.bundle ?? currentBundle(root, record);
-    if (specFingerprint(root, store, bundle, store.state!.epoch) !== record.spec_fingerprint) {
-      throw new GenerationError("GENERATION_SPEC_CHANGED", "交付之后规格正文、来源或关系已经变化");
+    if (!store.version?.merged) {
+      const bundle = candidate.bundle ?? currentBundle(root, record);
+      if (specFingerprint(root, store, bundle, store.state!.epoch) !== record.spec_fingerprint) {
+        throw new GenerationError("GENERATION_SPEC_CHANGED", "交付之后规格正文、来源或关系已经变化");
+      }
     }
     if (candidate.artifact.state === "absent") throw new GenerationError("GENERATION_ARTIFACT_MISSING", "已登记制品不存在");
     if (candidate.artifact.state === "unreadable") throw new GenerationError("GENERATION_ARTIFACT_UNREADABLE", "已登记制品不可读");
@@ -418,7 +485,7 @@ export function verifyGenerationReceipts(root: ProjectRoot, version: string): Ge
   const context = loadVersion(root, version);
   const store = { state: context.meta.generation, version: context };
   const findings: GenerationVerification["findings"] = [];
-  for (const candidate of candidates(root, context)) {
+  for (const candidate of generationVerificationCandidates(root, version)) {
     const finding = candidateFinding(root, store, candidate);
     if (finding !== null) findings.push({ ...finding, tdd_root: candidate.tdd_root, target_file: candidate.target_file });
   }
@@ -437,7 +504,7 @@ export function generationFingerprint(root: ProjectRoot, version: string): strin
     created_at: context.meta.created_at,
     phase: context.meta.phase,
     generation: context.meta.generation,
-    candidates: candidates(root, context).map((candidate) => ({
+    candidates: generationVerificationCandidates(root, version).map((candidate) => ({
       tdd_root: candidate.tdd_root,
       target_file: candidate.target_file,
       artifact: candidate.artifact,

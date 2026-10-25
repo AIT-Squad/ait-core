@@ -1,6 +1,6 @@
 # Node API 参考
 
-`ait-core` 为 Node.js 22 及以上环境提供 ESM API。集成代码从包根导入 `createCoreApi`，通过 `CoreApi` 的 44 个分组方法读写项目；类型也从包根导入。本文适用于 0.2.0 公共接口。
+`ait-core` 为 Node.js 22 及以上环境提供 ESM API。集成代码从包根导入 `createCoreApi`，通过 `CoreApi` 的 44 个分组方法读写项目；类型也从包根导入。本文适用于 0.2.1，公共 API shape 与 0.2.0 保持一致。
 
 ```ts
 import { createCoreApi } from "ait-core";
@@ -233,6 +233,8 @@ type DecomposeInput = Omit<DocumentInput, "id" | "parent"> & {
 内存交付不创建 bundle 中间文件，但会读取规格和目标制品、登记交付元数据。两种模式的正文与字节算法相同；文件模式先完成写入和校验，再登记新交付，失败清理本次文件并保留原有效交付。再次为同一 TDD prepare 会替换最新交付，使旧令牌/回执失效。元数据保存令牌摘要而非可恢复原 token、完整正文或 bundle 路径；宿主需保留当前交付，丢失后重新 prepare。
 
 回执为 `{ version: string | null, tdd_root: string, target_file: string, bundle_sha256: string, artifact_sha256: string, generated_at: string }`。`bundle_sha256` 在内存模式下同样表示上下文内容 hash。相同有效令牌与相同制品的重复登记幂等；生成前后 hash 相同不必然失败。令牌与回执只关联规格、交付和制品，不证明 agent 身份、测试执行、模型阅读行为或业务正确性。
+
+对于已经合入的版本，相关回执按历史记录只读比较：合入后 write token 过期不等于历史回执失效。读模型会把历史合入证据与当前目标文件的实时指纹分开；当前字节不同应报告 current drift，而不是改写历史结论。调用方不得用旧 prepare/token 为当前制品补登记；处理漂移需要新版本、新交付和新的收口证据。
 
 `GenerationVerification` 为 `{ enforcement: "report" | "block", passed: boolean, findings: { code, message, tdd_root, target_file }[] }`。`report` 下有发现仍可 `passed: true`；`block` 下发现会阻断。宿主应同时展示策略与发现。
 
