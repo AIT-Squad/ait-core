@@ -2,8 +2,8 @@
  * [TDD]-init_manager — 项目初始化：骨架、空基线引导、docs 独立 git 仓、
  * 首个 PRD/FSD 根文档与 derives 边、幂等重跑。
  *
- * 白板入口（唯一不要求先有项目根的命令，故自建 ProjectRoot 而非
- * resolveProjectRoot）；全程幂等：已存在内容字节不动、记入 skipped。
+ * 白板入口之一（不要求先有项目根；clone 为另一入口，故自建 ProjectRoot
+ * 而非 resolveProjectRoot）；全程幂等：已存在内容字节不动、记入 skipped。
  * 原子写委托 foundation，基线索引重建委托 indexing，PRD 根→FSD 根
  * derives 边以显式边建立（`metadata.source: new-model-cli`），不依赖
  * 文档结构推断。持久化形态为 Python 当前形态：空基线索引无 stats、

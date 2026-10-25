@@ -1,23 +1,23 @@
 # CLI 命令参考
 
-本文适用于 `ait-core` 0.2.0，运行环境为 Node.js 22 及以上。CLI 通过同一套公共业务接口执行规格、版本、图查询、交付与回执操作。Node 集成入口见 [Node API 参考](node-api.md)。
+本文适用于 `ait-core` 0.3.0，运行环境为 Node.js 22 及以上。CLI 通过同一套公共业务接口执行规格、版本、图查询、交付与回执操作。Node 集成入口见 [Node API 参考](node-api.md)。
 
 ## 安装与运行目录
 
 本次开发交付使用已构建、打包的本地 tarball，安装后同时提供 `ait` 命令：
 
 ```sh
-npm install --global /absolute/path/ait-core-0.2.0.tgz
+npm install --global /absolute/path/ait-core-0.3.0.tgz
 ait init --name demo
 ```
 
-本页不表示 0.2.0 已发布到公开 registry。只有目标版本已经发布到所配置的 registry 时，才可按包名安装：
+本页不表示 0.3.0 已发布到公开 registry。只有目标版本已经发布到所配置的 registry 时，才可按包名安装：
 
 ```sh
 npm install --global ait-core
 ```
 
-在宿主项目根目录执行命令，该目录应包含 `project-docs/`。首次初始化前可直接运行 `ait init`；初始化后优先使用项目本地 wrapper：
+除 `ait clone` 外，在宿主项目根目录执行命令，该目录应包含 `project-docs/`。首次初始化前可直接运行 `ait init`；从已有双仓恢复时，在空的最终项目根运行 `ait clone`。初始化或克隆后优先使用项目本地 wrapper：
 
 | 环境 | 项目入口 |
 | --- | --- |
@@ -75,6 +75,80 @@ npm install --global ait-core
 ### `ait --version`
 
 无其他参数。返回文档版本记录中数值序最大的版本号，例如 `data: {"version":"v0.13"}`；无版本记录或不在项目根时为 `"unversioned"`。它不是 npm 包版本，也不用于判断项目结构是否完整。包安装版本可由 `npm list --global ait-core --depth=0` 查询；项目检查使用 `init --check`。
+
+### `ait clone <docs-url> [--host-url <url>] [--branch <host-branch>] [--docs-branch <docs-branch>]`
+
+在当前空目录原地恢复文档仓和宿主代码仓；当前目录就是最终项目根，不接受目标目录等额外位置参数。执行顺序固定为：
+
+1. 在当前目录创建 `project-docs/`，先把 `<docs-url>` 克隆到该目录。
+2. 从已克隆文档仓读取 `project-docs/.meta/repositories.yaml`。
+3. 在当前父目录原地执行宿主仓的 `git init`、添加 `origin`、获取并安全检出分支。
+
+不会先把代码克隆到临时目录再搬迁，也不会对非空父目录执行 `git clone ... .`。每个 Git 子进程使用明确的工作目录；命令不改变调用进程的当前目录。
+
+| 参数 | 默认值、优先级与含义 |
+| --- | --- |
+| `<docs-url>` | 必需，是本次文档仓来源的权威地址；可与共享配置中的 `docs.url` 不同，用于从 fork 恢复 |
+| `--docs-branch <docs-branch>` | 缺省使用文档远端声明的默认分支；分支在读取共享元数据之前选定。共享配置中的 `docs.branch` 若与实际选择不同，只在 `warnings` 中提示，不切换分支、不使克隆失败 |
+| `--host-url <url>` | 缺省读取共享配置的 `host.url`；显式值只覆盖本次克隆，不改写共享配置 |
+| `--branch <host-branch>` | 宿主分支优先级为：显式 `--branch` > 共享配置 `host.branch` > 宿主远端默认分支；不硬编码 `main` 或 `master` |
+
+仓库地址支持 `https`、`ssh`、scp 样式、`file:` URL 和绝对本地路径。相对路径、以 `-` 开头、含控制字符、内嵌凭据、查询参数或片段的 URL，以及 `ext::` 等 external remote helper 地址会被拒绝；SSH 的普通用户名可用。分支名也必须是安全 Git ref，不能是选项或 `@{-1}` 一类历史表达式。CLI 不转换地址拼写；本地路径和 file URL 只在身份比较时规范化。
+
+首次执行要求目录为空，并拒绝卷根、用户根、符号链接/重解析路径、已有祖先 Git 工作树中的意外嵌套，以及宿主树中会与 `project-docs` 冲突的路径。获取完整分支和 tags，不提供 shallow、force、submodule 递归或固定 AIT `--version` 选项。成功后保留两仓各自的历史、分支、upstream 和 origin，生成当前平台 wrapper，并验证项目结构、基线索引和规格图；不会运行验收命令，也不声称文档分支与代码分支属于同一 AIT 发布。
+
+成功 stdout 的 `data` 为：
+
+```text
+{
+  directory:string,
+  resumed:boolean,
+  host:{path:string,url:string,branch:string,commit:string},
+  docs:{path:string,url:string,branch:string,commit:string},
+  wrapper:string,
+  warnings:string[]
+}
+```
+
+`directory`、两仓 `path` 和 `wrapper` 均为绝对路径；URL、分支和 commit 来自完成后的真实仓库。`resumed` 表示本次调用使用了已有恢复记录，不表示跳过了身份与工作区核对。
+
+命令在 `project-docs/.git/ait-clone-state.json` 保存本机恢复状态。该文件不进入版本库；它是“哪些原地步骤由本次流程创建并可安全续跑”的本地标记，不是密码、签名或加密身份认证。只有恢复记录、调用参数、两仓 origin/分支/commit、Git 根和干净状态全部匹配时才能继续。共享 `repositories.yaml` 不能授权删除或覆盖文件；无记录或身份不一致的残留、脏工作区和未知 `.git` 都会拒绝，命令不会用 reset、clean、force 或覆盖来猜测恢复。
+
+文档仓成功而宿主初始化、fetch、checkout 或项目验证失败时，已成功的 `project-docs/` 和可能已创建的父 `.git` 会保留，错误文字包含失败阶段及位置；修正外部原因后，以完全相同的 clone 参数重跑即可从已记录阶段继续。已完成后重复调用只核对并返回当前两仓 HEAD，不拉取新提交、不覆盖后来编辑；若真实状态已变化，可以拒绝而不是改写。
+
+```powershell
+New-Item -ItemType Directory -Path 'restored-project' | Out-Null
+Set-Location 'restored-project'
+ait clone 'https://example.invalid/team/project-docs.git' `
+    --host-url 'git@example.invalid:team/project.git' `
+    --branch 'release' --docs-branch 'docs-release'
+```
+
+### `ait repos show`
+
+无参数，只读返回当前项目的共享双仓配置。成功 `data` 为：
+
+```text
+{path:string,repositories:{schema_version:1,host:{url,branch?},docs:{url,branch?,path:"project-docs"}}}
+```
+
+`path` 是 `project-docs/.meta/repositories.yaml` 的绝对路径。文件缺失报 `REPOSITORIES_NOT_FOUND`；未知键、坏 YAML、错误 schema、非法地址/分支、`docs.path` 不是 `project-docs`，或 `.meta`/配置文件是符号链接或越界路径时，报 `REPOSITORIES_INVALID`。既有项目没有该文件不影响其它旧命令。
+
+### `ait repos set --host-url <url> --docs-url <url> [--host-branch <branch>] [--docs-branch <branch>]`
+
+`--host-url` 和 `--docs-url` 都必需。命令完整验证后原子替换共享配置；它不合并旧的可选分支，因此省略 `--host-branch` 或 `--docs-branch` 会从新配置中删除对应旧值。成功返回与 `repos show` 相同的 `{path,repositories}`。
+
+此命令只修改 `project-docs/.meta/repositories.yaml`，不修改两仓 Git remote，不 checkout 分支，不自动 commit 或 push。地址和分支采用与 `clone` 相同的安全规则；配置不得保存密码、私钥或带 token 的查询 URL。
+
+```powershell
+# 维护者从项目根登记双仓关系；文件保存到文档仓，随后审阅并提交。
+ait repos set `
+    --host-url 'git@example.invalid:team/project.git' `
+    --docs-url 'git@example.invalid:team/project-docs.git' `
+    --host-branch 'release' `
+    --docs-branch 'docs-release'
+ait repos show
+```
 
 ### `ait init [--name <name>] [--check] [--refresh-wrapper] [--new-model]`
 
@@ -540,6 +614,12 @@ $neighbors = Invoke-Ait -CliArgs @('specgraph', 'query', '[FSD]-hello_cli:greeti
 | 错误码 | 含义与处理 |
 | --- | --- |
 | `USAGE_ERROR` | 修正未知参数、互斥参数、非法枚举或缺失值后重试；不通过改元数据绕过 |
+| `REPOSITORIES_NOT_FOUND`、`REPOSITORIES_INVALID` | clone 读取或 repos show/set 使用的共享仓库配置缺失、不安全或内容非法；修复文档仓中的受管配置，不把它当作覆盖本地文件的授权 |
+| `CLONE_DIRECTORY_NOT_EMPTY` | 首次 clone 的最终项目根非空，或残留不满足受管恢复布局；选择真正空目录，或只在匹配的恢复记录上以相同参数续跑 |
+| `CLONE_REPOSITORY_MISMATCH`、`CLONE_STATE_INVALID` | 恢复记录、参数、origin、分支、commit、Git 根或工作区事实不一致；保留现场核对，不 reset/clean/force 后冒充同一次恢复 |
+| `CLONE_PATH_CONFLICT` | 目标位于危险根、链接路径、祖先 Git 工作树中，或宿主树与 `project-docs` 冲突；更换安全空目录或修复远端树布局 |
+| `CLONE_BRANCH_NOT_FOUND` | 显式分支、配置分支或远端默认分支不存在/未指向提交；修正来源或分支后按错误现场决定首次重试或匹配续跑 |
+| `CLONE_GIT_FAILED`、`CLONE_PROJECT_INVALID` | Git 阶段失败，或恢复后的 AIT 项目结构、索引、规格图、wrapper 检查未通过；错误文字含阶段和保留位置，修复原因后用相同参数安全续跑 |
 | `NOT_AT_PROJECT_ROOT`、`CWD_INSIDE_PROJECT_DOCS`、`PROJECT_DOCS_MALFORMED` | 切到正确宿主根，检查项目布局；不要从 `project-docs` 内运行 |
 | `CONFIG_UNREADABLE`、`INDEX_UNREADABLE`、`GRAPH_UNREADABLE`、`CHUNK_PARSE_ERROR` | 存储不可读或结构损坏；保留错误定位，恢复合法来源，不能将错误视为无数据 |
 | `SPEC_CONTENT_MISMATCH`、`MERGE_SOURCE_MISSING`、`MERGE_TARGET_MISSING`、`GOVERNANCE_SOURCE_MISSING` | 索引、关系、版本身份与真实规格不一致，或所需来源缺失；核对原始状态 |

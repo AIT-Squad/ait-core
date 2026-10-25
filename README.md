@@ -8,7 +8,7 @@ PRD → FSD（可递归分解）→ TDD（一文件一映射）→ 上下文交�
 
 core 提供库与 `ait` CLI；CLI 直接适配同一公共 Node API。ait-pi、ait-skill 是独立的宿主胶水，负责模型调用、工具接入和实际拦截；core 不调用 LLM、不创建 agent、不生成内容。
 
-本文适用于 **0.2.1** 公共接口；公共 Node API shape 与 0.2.0 保持一致。完整参数、默认值、返回值、错误和流程示例见：
+本文适用于 **0.3.0** 公共接口。0.3.0 在 0.2.0 一次性迁移后的对象 API 上增加了双仓克隆与共享仓库配置能力；完整参数、默认值、返回值、错误和流程示例见：
 
 - [Node API 参考](docs/node-api.md)：`createCoreApi` 分组接口、内存交付和宿主接入。
 - [CLI 参考](docs/cli.md)：命令行参数、文件交付和纯 CLI 回执闭环。
@@ -27,10 +27,10 @@ npm pack
 
 完整测试依赖构建产物，`npm test` 的 `pretest` 会先构建；`npm pack` 的 `prepack` 也会构建。构建失败时不能用陈旧产物作为验收依据。以 `npm pack` 输出的实际 `.tgz` 文件名为准，下面路径需替换成该文件的绝对路径。
 
-在使用者的项目根安装：
+对已有项目或准备执行 `init` 的项目，可在项目根本地安装：
 
 ```sh
-npm install "/absolute/path/to/ait-core-0.2.1.tgz"
+npm install "/absolute/path/to/ait-core-0.3.0.tgz"
 npm ls ait-core --depth=0
 npm exec -- ait --version
 ```
@@ -44,14 +44,36 @@ npm ls ait-core --depth=0
 
 安装验收须使用真实 tarball，并分别验证 Node API 与纯 CLI 各自完成规格写入、交付、实际制品生成、回执、验收、确认和合入；混合入口流程不能替代这两项检查。上述命令是检查方法，不表示已执行本次全量验收、真实 Python 项目接管或 LLM 生成验证，也不表示已发布到 registry。
 
-在尚未纳管的项目中初始化：
+从已有 AIT 文档仓恢复项目时，先在项目根之外安装 AIT（例如全局安装本地 tarball），然后创建并进入一个**空的最终项目根**，直接在当前目录执行：
+
+```sh
+npm install --global "/absolute/path/to/ait-core-0.3.0.tgz"
+mkdir restored-project
+cd restored-project
+ait clone <docs-url> [--host-url <url>] [--branch <host-branch>] [--docs-branch <docs-branch>]
+```
+
+`clone` 不接受额外的目标目录参数。它先把文档仓检出到当前目录的 `project-docs/`，再读取 `project-docs/.meta/repositories.yaml`，在当前目录就地恢复宿主代码仓。`--host-url`、`--branch` 只覆盖本次恢复；`--docs-branch` 选择本次文档分支。未指定分支时使用对应远端的默认分支，不假定 `main` 或 `master`。
+
+克隆不安装项目依赖、不运行验收命令或仓库脚本。中途失败可能保留已成功的 `project-docs/`、宿主 `.git` 或本地恢复记录；这不是整个双仓操作的原子回滚。保留现场并在同一目录以完全相同的参数重试，core 会核对恢复记录与两个仓库的实际状态后续跑；未记录、参数或现场不一致时会拒绝覆盖。这些记录是本地进度事实，不是身份或凭据认证。
+
+新项目没有可克隆的文档仓时，在尚未纳管的项目根初始化：
 
 ```sh
 npm exec -- ait init --name demo
 npm exec -- ait init --check
 ```
 
-之后从包含 `project-docs/` 的项目根运行命令，不要进入 `project-docs/` 运行。也可使用初始化生成的项目本地 wrapper：POSIX 为 `./project-docs/.ait/ait-cli`，Windows 为 `.\project-docs\.ait\ait-cli.cmd`。已有项目无需重复初始化；需要更新 wrapper 时使用 `npm exec -- ait init --refresh-wrapper`。初始化不会自动创建活动版本；无活动版本时不带版本参数的 `state` 返回 `NO_VERSION`。
+之后从包含 `project-docs/` 的项目根运行命令，不要进入 `project-docs/` 运行。也可使用初始化或克隆生成的项目本地 wrapper：POSIX 为 `./project-docs/.ait/ait-cli`，Windows 为 `.\project-docs\.ait\ait-cli.cmd`。已有项目无需重复初始化；需要更新 wrapper 时使用 `npm exec -- ait init --refresh-wrapper`。初始化不会自动创建活动版本；无活动版本时不带版本参数的 `state` 返回 `NO_VERSION`。
+
+维护者应在发布可克隆的文档仓前，先在现有项目根写入共享仓库关联：
+
+```sh
+ait repos set --host-url <host-url> --docs-url <docs-url> [--host-branch <branch>] [--docs-branch <branch>]
+ait repos show
+```
+
+`repos set` 是完整替换，省略的可选分支不会从旧配置合并回来。它只原子写入 `project-docs/.meta/repositories.yaml`，不修改 Git remote，也不自动 commit 或 push。因此要让新机器的 `clone` 读到配置，必须由维护者事先将该文件提交并推送到文档仓。共享配置不得包含 token、密码或私钥。
 
 ## 公共 Node 接口
 
@@ -59,12 +81,12 @@ npm exec -- ait init --check
 
 | 接口 | 用途 |
 | --- | --- |
-| `createCoreApi(options?)` | 创建分组 client，提供项目、版本、规格、图、检索、状态、交付、回执、验收和治理能力。 |
+| `createCoreApi(options?)` | 创建分组 client，提供项目初始化/克隆/仓库配置、版本、规格、图、检索、状态、交付、回执、验收和治理能力。 |
 | `dispatch(argv, options?)` | 命令行适配入口，返回 `Promise<CliDispatchResult>`；Node 集成直接调用 client 方法。 |
 
 公开类型包括 `CoreApi`、`CoreApiOptions`、`ApiResult<T>`、`CoreProgressEvent`、`MemoryDelivery`、`DeliveryPointer`、`GenerationReceipt` 及各方法的输入和读模型。内部模块不属于公开接口。
 
-`createCoreApi()` 绑定**创建时的 `process.cwd()`**，后续不随 `process.chdir()` 改变目标。请在宿主项目根创建 client，无需拼装内部项目路径；不接受 `cwd` 或 `root` 选项。导入和创建 client 不执行文件读写，项目解析延迟到实际调用，因此空目录可调用 `core.project.init()`。`dispatch` 每次调用使用当时的当前目录。
+`createCoreApi()` 绑定**创建时的 `process.cwd()`**，后续不随 `process.chdir()` 改变目标。请在宿主项目根创建 client，无需拼装内部项目路径；不接受 `cwd` 或 `root` 选项。导入和创建 client 不执行文件读写，项目解析延迟到实际调用，因此空目录可调用 `core.project.init()` 或 `core.project.clone({docsUrl})`。`dispatch` 每次调用使用当时的当前目录。
 
 业务输入使用单个对象和 camelCase 字段，无参数方法可直接调用。除同步纯函数 `core.guard.evaluate(...)` 外，方法均返回 `Promise<ApiResult<T>>`。成功为 `{ok:true,data}`，失败为 `{ok:false,code,error}`；先检查 `ok` 再取数据。工厂的非法选项同步抛出 `USAGE_ERROR`，方法的非法输入返回错误信封。
 
@@ -184,7 +206,7 @@ generation_receipts:
 
 回执关联最新交付、当前规格与制品 SHA-256；重新交付、规格变化或登记后再次修改制品，都可能使回执失效。它证明字节关联，不认证 agent 身份，也不保证业务语义正确；业务正确性仍需制品验收。
 
-已合入版本的回执属于历史只读证据：读取历史版本时以合入时保存的规格与制品绑定判断其历史记录，不会因为当时的 write token 已过期而把历史回执改判为无效。与此同时，当前工作树的实际制品仍会单独计算实时指纹；若它与历史合入记录不同，结果应报告 current drift。历史回执只能说明当时合入的字节关联，不能为当前漂移背书，也不能复用旧 prepare/token 登记来洗白当前变化；修复当前漂移应创建新版本并形成新的交付、回执、验收与合入记录。
+已合入版本的回执属于历史只读证据：核验使用该版本保留的 TDD/交付定位和历史记录身份，不套用后来 baseline 的 `target_file`，也不会因为当时的 write token 已过期就把字节仍一致的历史回执改判为无效。它仍会报告历史制品缺失、不可读、字节改变或记录身份不一致；历史源损坏也不会被伪装成“当前文件不存在”。这种比对不会重新认证旧上下文的完整指纹或业务语义，也不写文件、重新 prepare 或为过期令牌新建记录。旧 token 不得用于 `registerReceipt`；当前变化应创建新版本并形成新的交付、回执、验收与合入记录。
 
 `core.guard.evaluate(...)` 是同步纯判定函数。宿主须在每次真实工具执行前调用它，并实际执行 `block` 决定；示例只展示一次目标写入检查。受保护路径包括 `project-docs/docs/`、`project-docs/versions/`、`project-docs/.meta/`，应经 AIT 正式接口修改。守卫不会限制普通源码只能由指定生成器写入，宿主仍须单独限制生成任务的目标范围。
 
@@ -192,7 +214,7 @@ generation_receipts:
 
 ## 兼容方向与版本号
 
-0.2.0 是开发期的一次性公共接口迁移；0.2.1 不改变该公共 API shape，也不恢复以下五个旧函数的包根兼容导出：
+0.2.0 是开发期的一次性公共接口迁移。0.3.0 保留该迁移结果，并在 `core.project` 上增加 `clone`、`getRepositories` 和 `setRepositories`；它不恢复以下五个旧函数的包根兼容导出：
 
 | 已移除出口 | 替代方式 |
 | --- | --- |

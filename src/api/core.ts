@@ -92,6 +92,7 @@ function localInput(args: unknown[], allowed: readonly string[], optional = fals
 }
 
 const writeOperations = new Set<Operation>([
+  "project.clone", "project.setRepositories",
   "version.create", "version.commit", "version.confirm", "version.merge", "version.revert", "version.backfillTags",
   "prd.confirm", "prd.revert", "fsd.confirm", "fsd.revert", "tdd.confirm", "tdd.revert",
   "delivery.prepare", "graph.sync", "state.save", "index.rebuild",
@@ -272,7 +273,10 @@ export function createCoreApi(options?: CoreApiOptions): CoreApi {
     ((...args: unknown[]) => invoke(operation, args)) as unknown as Method;
 
   return {
-    project: { documentVersion: method("project.documentVersion"), init: method("project.init") },
+    project: {
+      documentVersion: method("project.documentVersion"), init: method("project.init"), clone: method("project.clone"),
+      getRepositories: method("project.getRepositories"), setRepositories: method("project.setRepositories"),
+    },
     version: {
       create: method("version.create"), commit: method("version.commit"), status: method("version.status"),
       confirm: method("version.confirm"), merge: method("version.merge"), revert: method("version.revert"),

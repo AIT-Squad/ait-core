@@ -1,6 +1,6 @@
 # Node API 参考
 
-`ait-core` 为 Node.js 22 及以上环境提供 ESM API。集成代码从包根导入 `createCoreApi`，通过 `CoreApi` 的 44 个分组方法读写项目；类型也从包根导入。本文适用于 0.2.1，公共 API shape 与 0.2.0 保持一致。
+`ait-core` 为 Node.js 22 及以上环境提供 ESM API。集成代码从包根导入 `createCoreApi`，通过 `CoreApi` 的 47 个分组方法读写项目；类型也从包根导入。本文适用于 0.3.0。
 
 ```ts
 import { createCoreApi } from "ait-core";
@@ -84,6 +84,8 @@ API 不提供 `signal`、`AbortSignal`、`cancel`、取消状态或取消错误�
 | 类型 | 字段与默认值 |
 | --- | --- |
 | `InitInput` | `name?: string`，缺省从当前目录名归一生成项目名称；`check?: boolean = false`；`refreshWrapper?: boolean = false`。`check` 优先于刷新和初始化 |
+| `CloneInput` | `docsUrl: string`；`hostUrl?: string`；`branch?: string`，代码仓分支；`docsBranch?: string`，文档仓分支。地址支持 HTTPS、SSH、SCP、file URL 或绝对本地路径；不接受相对路径或内嵌凭据 |
+| `SetRepositoriesInput` | `hostUrl: string`；`docsUrl: string`；`hostBranch?: string`；`docsBranch?: string`。完整替换共享仓库配置，不做部分更新 |
 | `VersionInput` | `version: string`，无默认版本 |
 | `OptionalVersionInput` | `version?: string`，具体默认读视图见各方法 |
 | `VersionRevertInput` | `version: string`；`confirm?: boolean = false`，实际回滚必须显式为 `true` |
@@ -139,12 +141,15 @@ type DecomposeInput = Omit<DocumentInput, "id" | "parent"> & {
 
 每个方法均适用前述参数校验与公共项目/存储错误。表中的错误是用于分支处理的常见错误，并非穷举底层 I/O 故障。副作用为“只读”的方法不会自动重建索引、同步图或修复状态。
 
-### 项目与版本：11 个方法
+### 项目与版本：14 个方法
 
 | 方法签名 | 默认行为与结果 | 副作用与常见错误 |
 | --- | --- | --- |
 | `core.project.documentVersion(): R<DocumentVersionResult>` | 返回 `{ version: string }`，取最大数值文档版本号；无记录或无法按项目根读取时回退 `"unversioned"`。这不是 npm 包版本 | 只读；回退语义不能用于判断项目健康 |
 | `core.project.init(input?: InitInput): R<InitResponse>` | 普通初始化返回 `InitResult`；`check: true` 返回 `{ ok, missing }`；`refreshWrapper: true` 刷新本平台 wrapper | 初始化项目骨架、基线、文档 Git 仓和 wrapper，宿主为 Git 仓时维护忽略项；检查分支只读。常见 `WRAPPER_PATH_UNRESOLVED`；文件/Git 故障保留错误 |
+| `core.project.clone(input: CloneInput): R<CloneResult>` | 在 client 绑定的空目录中先克隆文档仓，再按共享配置恢复代码仓；返回目录、是否续跑、两仓实际 URL/分支/提交、wrapper 路径及警告 | 写两套 Git 工作区、恢复记录、忽略项和 wrapper，并执行项目检查。常见 `CLONE_DIRECTORY_NOT_EMPTY`、`CLONE_REPOSITORY_MISMATCH`、`CLONE_PATH_CONFLICT`、`CLONE_GIT_FAILED`、`CLONE_BRANCH_NOT_FOUND`、`CLONE_STATE_INVALID`、`CLONE_PROJECT_INVALID` |
+| `core.project.getRepositories(): R<RepositoriesResult>` | 读取 `project-docs/.meta/repositories.yaml`，返回 `{ path, repositories }`；配置包含 `schema_version: 1`、`host` 与固定 `path: "project-docs"` 的 `docs` | 只读；不存在报 `REPOSITORIES_NOT_FOUND`，损坏、路径链接或非法地址/分支报 `REPOSITORIES_INVALID` |
+| `core.project.setRepositories(input: SetRepositoriesInput): R<RepositoriesResult>` | 校验后原子写入完整共享仓库配置并返回同形结果；分支字段省略即不记录 | 写 `project-docs/.meta/repositories.yaml`；不验证远端存在或切换当前分支。路径或内容非法报 `REPOSITORIES_INVALID` |
 | `core.version.create(input: VersionInput): R<VersionCreateResult>` | 返回 `{ version, created_at, based_on }`；`based_on` 为最后一个已合入版本或 `null` | 创建工作区、版本元数据和空索引。已有活动版本报 `ACTIVE_VERSION_EXISTS`，多活动版本报 `ACTIVE_VERSION_CONFLICT`，重复版本报 `USAGE_ERROR` |
 | `core.version.commit(input: VersionInput): R<VersionCommitResult>` | 返回 `{ committed: string[], changes: string[] }`；提交 working/staged chunk，无 `message` 输入 | 写变更记录、版本索引/图和元数据；不等同宿主 Git 提交。无可提交项报 `COMMIT_EMPTY`，版本不存在报 `VERSION_NOT_FOUND` |
 | `core.version.status(input: VersionInput): R<VersionStatus>` | 返回版本、相位、working/staged/committed ID 与 `by_action` 计数 | 只读；`VERSION_NOT_FOUND`、索引/元数据损坏 |
@@ -156,6 +161,24 @@ type DecomposeInput = Omit<DocumentInput, "id" | "parent"> & {
 | `core.version.inspect(input: VersionInput): R<VersionInspection>` | 返回确认计划、Git 绑定及恢复记录的当前读模型，详见下节 | 只读，包含 Git 锚点解析；`VERSION_NOT_FOUND`、`SPEC_CONTENT_MISMATCH`、`GIT_FAILED` 或计划计算错误；不运行恢复 |
 
 `InitResult` 为 `{ createdFiles: string[], chunks: number, specs: number, status: "fresh" | "existing", files: Record<string,string>, skipped: string[] }`；`files` 是本次结果中的文件内容映射。重复初始化遵循既有幂等行为，不用它代替只读检查。
+
+#### 克隆与共享仓库配置
+
+`project.clone` 是 docs-first 的就地恢复操作。调用方或 CLI 必须先直接提供 `docsUrl`，可用 `docsBranch` 指定文档分支；未指定时由 Git 按文档远端 `HEAD` 选择默认分支。文档仓成功检出后，core 才读取其中的 `project-docs/.meta/repositories.yaml`。`hostUrl` 与 `branch` 是本次代码仓恢复的显式覆盖；省略时使用共享配置的 `host.url` 与可选 `host.branch`，代码分支仍未确定时再读取代码远端 `HEAD`。
+
+共享配置中的 `repositories.docs.branch` 只提供信息，不支配本次文档仓检出；它与 `docsBranch` 或远端 `HEAD` 得到的实际分支不同时，结果在 `warnings` 中报告且不会切换分支。
+
+| 类型 | 完整字段 |
+| --- | --- |
+| `RepositoryReference` | `url: string`、`branch?: string` |
+| `RepositoriesConfig` | `schema_version: 1`、`host: RepositoryReference`、`docs: RepositoryReference & { path: "project-docs" }` |
+| `RepositoriesResult` | `path: string`（配置文件绝对路径）、`repositories: RepositoriesConfig` |
+| `ClonedRepository` | `path: string`（仓库绝对路径）、`url: string`（实际 origin）、`branch: string`、`commit: string`（实际 HEAD） |
+| `CloneResult` | `directory: string`、`resumed: boolean`、`host: ClonedRepository`、`docs: ClonedRepository`、`wrapper: string`（本机入口绝对路径）、`warnings: string[]` |
+
+克隆被中断后，可在同一目录用完全相同的输入再次调用。续跑依据文档仓 `.git` 内的本地恢复记录，并逐项核对真实 Git 仓库、origin、分支、提交、upstream、工作区清洁状态与已完成阶段；`resumed: true` 只表示采用了这条恢复路径。恢复记录是需与实际 Git 状态共同验证的本地进度记录，不是签名、凭据或密码学认证。若记录未成功保存、参数或现场状态不一致，core 拒绝覆盖，不保证任意时刻强制中断均可自动恢复。
+
+该流程不会递归子模块，不运行仓库 hooks，也不承诺整个双仓恢复具备原子回滚。失败时可能已经留下可安全续跑的文档仓、代码仓 `.git`、远端配置或恢复记录；调用方应保留现场并根据错误信封决定重试，不应假设目标目录恢复为空。
 
 | 版本结果类型 | 业务字段 |
 | --- | --- |

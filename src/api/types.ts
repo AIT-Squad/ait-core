@@ -7,6 +7,11 @@ import type {
   VersionPhase,
 } from "../doc-model/schemas.js";
 import type { InitResult } from "../init/init-manager.js";
+import type { CloneInput, CloneResult } from "../init/clone-manager.js";
+import type {
+  RepositoriesResult,
+  SetRepositoriesInput,
+} from "../init/repository-config.js";
 import type { GovernanceFinding } from "../new-model/governance.js";
 import type {
   ConfirmResult as LayerConfirmResult,
@@ -40,6 +45,13 @@ export type {
   VersionPhase,
 } from "../doc-model/schemas.js";
 export type { InitResult } from "../init/init-manager.js";
+export type { CloneInput, ClonedRepository, CloneResult } from "../init/clone-manager.js";
+export type {
+  RepositoriesConfig,
+  RepositoriesResult,
+  RepositoryReference,
+  SetRepositoriesInput,
+} from "../init/repository-config.js";
 export type { GovernanceFinding } from "../new-model/governance.js";
 export type {
   ConfirmResult as LayerConfirmResult,
@@ -404,6 +416,9 @@ export interface EffectiveGovernancePolicy {
 export interface ProjectApi {
   documentVersion(): R<DocumentVersionResult>;
   init(input?: InitInput): R<InitResponse>;
+  clone(input: CloneInput): R<CloneResult>;
+  getRepositories(): R<RepositoriesResult>;
+  setRepositories(input: SetRepositoriesInput): R<RepositoriesResult>;
 }
 
 export interface VersionApi {

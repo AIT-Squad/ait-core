@@ -293,6 +293,41 @@ const COMMANDS: Record<string, CommandSpec> = {
       ...(flags["refresh-wrapper"] === true ? { refreshWrapper: true } : {}),
     }),
   },
+  clone: {
+    positionals: ["docs-url"],
+    flags: {
+      "host-url": "value",
+      branch: "value",
+      "docs-branch": "value",
+    },
+    run: ({ core, args, flags }) => core.project.clone({
+      docsUrl: args[0]!,
+      ...(typeof flags["host-url"] === "string" ? { hostUrl: flags["host-url"] } : {}),
+      ...(typeof flags.branch === "string" ? { branch: flags.branch } : {}),
+      ...(typeof flags["docs-branch"] === "string" ? { docsBranch: flags["docs-branch"] } : {}),
+    }),
+  },
+  "repos show": {
+    positionals: [],
+    flags: {},
+    run: ({ core }) => core.project.getRepositories(),
+  },
+  "repos set": {
+    positionals: [],
+    flags: {
+      "host-url": "value",
+      "docs-url": "value",
+      "host-branch": "value",
+      "docs-branch": "value",
+    },
+    requiredFlags: ["host-url", "docs-url"],
+    run: ({ core, flags }) => core.project.setRepositories({
+      hostUrl: flags["host-url"] as string,
+      docsUrl: flags["docs-url"] as string,
+      ...(typeof flags["host-branch"] === "string" ? { hostBranch: flags["host-branch"] } : {}),
+      ...(typeof flags["docs-branch"] === "string" ? { docsBranch: flags["docs-branch"] } : {}),
+    }),
+  },
 
   // versioning 域：version_manager / merge_engine / publish 三 split
   "version create": {
@@ -524,7 +559,7 @@ export async function dispatch(
   try {
     if (argv.length === 0) {
       throw new UsageError(
-        "缺命令：init / version <sub> / prd|fsd|tdd <sub> / fsd decompose / codegen prepare|receipt|verify / deps / impact / state / search / specgraph <sub> / reindex / baseline-summary / acceptance <sub> / push / --version",
+        "缺命令：init / clone / repos show|set / version <sub> / prd|fsd|tdd <sub> / fsd decompose / codegen prepare|receipt|verify / deps / impact / state / search / specgraph <sub> / reindex / baseline-summary / acceptance <sub> / push / --version",
       );
     }
     if (argv[0] === "--version") {

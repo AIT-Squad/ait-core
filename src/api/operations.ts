@@ -32,6 +32,18 @@ const initInput = z.object({
   check: z.boolean().optional(),
   refreshWrapper: z.boolean().optional(),
 }).strict();
+const cloneInput = z.object({
+  docsUrl: nonemptyString,
+  hostUrl: nonemptyString.optional(),
+  branch: nonemptyString.optional(),
+  docsBranch: nonemptyString.optional(),
+}).strict();
+const setRepositoriesInput = z.object({
+  hostUrl: nonemptyString,
+  docsUrl: nonemptyString,
+  hostBranch: nonemptyString.optional(),
+  docsBranch: nonemptyString.optional(),
+}).strict();
 const revertInput = versionInput.extend({ confirm: z.boolean().optional() });
 const documentFields = {
   content: z.string().optional(),
@@ -219,6 +231,31 @@ async function runOperation(cwd: string, operation: string, input: unknown): Pro
       if (value.check === true) return checkProject(cwd);
       if (value.refreshWrapper === true) return refreshWrapper(cwd);
       return initProject(cwd, { name: value.name ?? "" });
+    }
+    case "project.clone": {
+      const value = parseInput(cloneInput, input);
+      const { cloneProject } = await import("../init/clone-manager.js");
+      return cloneProject(cwd, {
+        docsUrl: value.docsUrl,
+        ...(value.hostUrl === undefined ? {} : { hostUrl: value.hostUrl }),
+        ...(value.branch === undefined ? {} : { branch: value.branch }),
+        ...(value.docsBranch === undefined ? {} : { docsBranch: value.docsBranch }),
+      });
+    }
+    case "project.getRepositories": {
+      parseInput(noInput, input, true);
+      const { readRepositories } = await import("../init/repository-config.js");
+      return readRepositories(cwd);
+    }
+    case "project.setRepositories": {
+      const value = parseInput(setRepositoriesInput, input);
+      const { writeRepositories } = await import("../init/repository-config.js");
+      return writeRepositories(cwd, {
+        hostUrl: value.hostUrl,
+        docsUrl: value.docsUrl,
+        ...(value.hostBranch === undefined ? {} : { hostBranch: value.hostBranch }),
+        ...(value.docsBranch === undefined ? {} : { docsBranch: value.docsBranch }),
+      });
     }
     case "version.create":
     case "version.commit":
