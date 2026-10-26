@@ -1,16 +1,32 @@
 // [TDD]-clone_tests - real local Git integration tests for the v0.15
 // docs-first, current-directory clone and shared repository configuration.
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createCoreApi } from "../src/index.js";
 import type { ApiResult, CoreApi } from "../src/index.js";
+import { cloneProject } from "../src/init/clone-manager.js";
+import { validateRepositoryUrl } from "../src/init/repository-config.js";
+
+const diagnosticStub = vi.hoisted(() => ({ stderr: null as string | null, calls: [] as string[][] }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawnSync: (...args: unknown[]) => {
+    if (diagnosticStub.stderr !== null && args[0] === "git") {
+      const argv = args[1] as string[];
+      diagnosticStub.calls.push([...argv]);
+      const stderr = argv.includes("clone") ? diagnosticStub.stderr : "fatal: not a git repository";
+      return { pid: 0, status: 128, signal: null, stdout: "", stderr, output: [null, "", stderr] };
+    }
+    return Reflect.apply(original.spawnSync, undefined, args);
+  } };
+});
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(HERE, "../dist/src/bin.js");
@@ -36,6 +52,8 @@ function directory(label = "fixture"): string {
 }
 
 afterEach(() => {
+  diagnosticStub.stderr = null;
+  diagnosticStub.calls = [];
   process.chdir(originalCwd);
   for (const root of owned) {
     const relative = path.relative(TEMP, root);
@@ -100,13 +118,13 @@ function treeHash(root: string): string {
   return hash.digest("hex");
 }
 
-function runBin(cwd: string, args: string[]): Promise<{ status: number | null; stdout: string; stderr: string }> {
+function runBin(cwd: string, args: string[], extraEnv: Record<string, string | undefined> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BIN, ...args], {
       cwd,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extraEnv },
     });
     let stdout = "";
     let stderr = "";
@@ -534,5 +552,113 @@ describe("docs-first clone", { timeout: 120_000 }, () => {
       expect(JSON.parse(run.stdout)).toMatchObject({ ok: false, code: "CLONE_PATH_CONFLICT" });
       expect(treeHash(outside)).toBe(before);
     }
+  });
+
+  it("passes original docs and metadata host URLs to real Git while insteadOf selects offline transports", async () => {
+    const fixture = await makeFixture({ rootLabel: "v017-url-rewrite" });
+    const cwd = directory("v017-url-rewrite-destination");
+    const config = path.join(fixture.root, "isolated-git-config");
+    const trace = path.join(fixture.root, "git-trace.jsonl");
+    const docsAlias = "https://offline.invalid/docs.git", hostAlias = "https://offline.invalid/host.git";
+    const docsParent = path.join(fixture.root, "docs work");
+    const docsWork = path.join(docsParent, "project-docs");
+    unwrap(await api(docsParent).project.setRepositories({ hostUrl: hostAlias, docsUrl: docsAlias, hostBranch: fixture.hostBranch, docsBranch: fixture.docsBranch }));
+    git(docsWork, "add", ".meta/repositories.yaml"); git(docsWork, "commit", "-m", "public URLs for offline mapping");
+    git(docsWork, "push", fixture.docsRemote, `HEAD:refs/heads/${fixture.docsBranch}`);
+    const metadata = fs.readFileSync(path.join(docsWork, ".meta/repositories.yaml"));
+    git(fixture.root, "config", "--file", config, `url.${pathToFileURL(fixture.docsRemote).href}.insteadOf`, docsAlias);
+    git(fixture.root, "config", "--file", config, `url.${pathToFileURL(fixture.hostRemote).href}.insteadOf`, hostAlias);
+    const childEnv = { GIT_CONFIG_GLOBAL: config, GIT_CONFIG_NOSYSTEM: "1", GIT_ALLOW_PROTOCOL: "file", GIT_TRACE2_EVENT: trace };
+    const run = await runBin(cwd, ["clone", docsAlias], childEnv);
+    expect(run.status, run.stderr).toBe(0);
+    const envelope = JSON.parse(run.stdout.trim()) as { ok: boolean; data?: { host: { url: string }; docs: { url: string } } };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.data?.host.url).toBe(hostAlias);
+    expect(envelope.data?.docs.url).toBe(docsAlias);
+    expect(git(cwd, "config", "--local", "--get", "remote.origin.url")).toBe(hostAlias);
+    const docsClone = path.join(cwd, "project-docs");
+    expect(git(docsClone, "config", "--local", "--get", "remote.origin.url")).toBe(docsAlias);
+    expect(fs.readFileSync(path.join(docsClone, ".meta/repositories.yaml"))).toEqual(metadata);
+    expect(git(cwd, "rev-parse", "HEAD")).toBe(fixture.hostHead);
+    expect(git(docsClone, "rev-parse", "HEAD")).toBe(git(docsWork, "rev-parse", "HEAD"));
+    expect(git(cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe(`origin/${fixture.hostBranch}`);
+    const events = fs.readFileSync(trace, "utf8").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as { event?: string; argv?: string[] });
+    const starts = events.filter((event) => event.event === "start" && Array.isArray(event.argv)).map((event) => event.argv!);
+    expect(starts.some((argv) => argv.includes("clone") && argv.includes(docsAlias))).toBe(true);
+    expect(starts.some((argv) => argv.includes("remote") && argv.includes("add") && argv.includes(hostAlias))).toBe(true);
+    expect(starts.flat().some((arg) => arg.includes("<repository-url>"))).toBe(false);
+    const before = treeHash(cwd);
+    const repeated = await runBin(cwd, ["clone", docsAlias], childEnv);
+    expect(repeated.status, repeated.stderr).toBe(0);
+    expect(JSON.parse(repeated.stdout).data.resumed).toBe(true);
+    expect(treeHash(cwd)).toBe(before);
+    git(cwd, "remote", "set-url", "origin", "https://offline.invalid/different.git");
+    const changed = treeHash(cwd);
+    const mismatched = await runBin(cwd, ["clone", docsAlias], childEnv);
+    expect(JSON.parse(mismatched.stdout)).toMatchObject({ ok: false, code: "CLONE_REPOSITORY_MISMATCH" });
+    expect(treeHash(cwd)).toBe(changed);
+  });
+
+  it("rejects malformed URLs before any write and reports a missing source readably", async () => {
+    const cwd = directory("v017-preflight");
+    const before = treeHash(cwd);
+    for (const docsUrl of ["https:example.invalid/repo.git", "https:/example.invalid/repo.git", "https:\\example.invalid\\repo.git", "https://example.invalid/repo name.git", "[repo](https://example.invalid/repo.git)", "<https://example.invalid/repo.git>", "https://user:secret@example.invalid/docs.git?token=x"]) {
+      rejection(await api(cwd).project.clone({ docsUrl }), "REPOSITORIES_INVALID");
+      const cliResult = await runBin(cwd, ["clone", docsUrl]);
+      expect(JSON.parse(cliResult.stdout)).toMatchObject({ ok: false, code: "REPOSITORIES_INVALID" });
+      expect(treeHash(cwd)).toBe(before);
+    }
+
+    const missing = path.join(cwd, "missing-source.git");
+    const failed = await api(cwd).project.clone({ docsUrl: missing });
+    expect(failed.ok).toBe(false);
+    if (!failed.ok) {
+      expect(failed.error).toContain(missing);
+      expect(failed.error).toContain("文档仓克隆失败");
+      expect(failed.error).toContain("工作目录");
+      expect(failed.error).not.toContain("<repository-url>");
+      expect(failed.error).not.toContain("clone clone");
+    }
+    expect(treeHash(cwd)).toBe(before);
+  });
+
+  it("keeps origin identity and HEAD stable across a completed repeat", async () => {
+    const fixture = await makeFixture({ rootLabel: "v017-repeat" });
+    const cwd = directory("v017-repeat-destination");
+    const first = unwrap(await api(cwd).project.clone({ docsUrl: fixture.docsRemote }));
+    const hostHead = git(cwd, "rev-parse", "HEAD");
+    const docsHead = git(path.join(cwd, "project-docs"), "rev-parse", "HEAD");
+    const repeated = unwrap(await api(cwd).project.clone({ docsUrl: fixture.docsRemote }));
+    expect(repeated.resumed).toBe(true);
+    expect(first.host.url).toBe(git(cwd, "remote", "get-url", "origin"));
+    expect(first.docs.url).toBe(git(path.join(cwd, "project-docs"), "remote", "get-url", "origin"));
+    expect(git(cwd, "rev-parse", "HEAD")).toBe(hostHead);
+    expect(git(path.join(cwd, "project-docs"), "rev-parse", "HEAD")).toBe(docsHead);
+  });
+
+  it("validates supported URL spellings without changing the value later passed to Git", () => {
+    const local = path.join(TEMP, "space 中文", "repo.git");
+    for (const url of ["https://github.com/AIT-Squad/ait-core.git", "https://[::1]/repo.git", "ssh://git@example.invalid/team/repo.git", "git@example.invalid:team/repo.git", pathToFileURL(local).href, local]) {
+      expect(validateRepositoryUrl(url)).toBe(url);
+    }
+  });
+
+  it("keeps raw Git argv separate from display-only credential redaction", () => {
+    const cwd = directory("diagnostic-argv");
+    const docsUrl = "https://github.com/AIT-Squad/ait-core-project-docs.git";
+    diagnosticStub.stderr = `fatal: unable to access '${docsUrl}/': failure\nredirected to https://TOKEN_ONLY@example.invalid/team/repo.git?token=QUERY_SECRET#FRAGMENT_SECRET\nother https://alice:PASSWORD_SECRET@example.invalid/path.git`;
+    let caught: unknown;
+    try { cloneProject(cwd, { docsUrl }); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ code: "CLONE_GIT_FAILED" });
+    const message = (caught as Error).message;
+    expect(message).toContain(docsUrl);
+    expect(message).toContain("example.invalid/team/repo.git");
+    expect(message).toContain("文档仓克隆失败");
+    expect(message).not.toContain("<repository-url>");
+    for (const secret of ["TOKEN_ONLY", "QUERY_SECRET", "FRAGMENT_SECRET", "PASSWORD_SECRET"]) expect(message).not.toContain(secret);
+    const argv = diagnosticStub.calls.find((call) => call.includes("clone"))!;
+    expect(argv.slice(-3)).toEqual(["--", docsUrl, "."]);
+    expect(argv.some((arg) => /<repository-url>|<credentials>|<redacted>/.test(arg))).toBe(false);
+    expect(fs.readdirSync(cwd)).toEqual([]);
   });
 });

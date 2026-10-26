@@ -106,7 +106,17 @@ const PHASES: readonly ClonePhase[] = [
 ];
 
 function cloneError(code: CloneErrorCode, phase: string, detail: string, cause?: unknown): CloneError {
-  return new CloneError(code, `clone ${phase} 失败：${detail}`, cause === undefined ? undefined : { cause });
+  const labels: Readonly<Record<string, string>> = {
+    "resolve docs branch": "文档仓分支查询",
+    "clone docs": "文档仓克隆",
+    "resolve default branch": "代码仓默认分支查询",
+    "fetch host": "代码仓拉取",
+    "checkout host": "代码仓检出",
+    "add host origin": "代码仓 origin 配置",
+    "init host": "代码仓初始化",
+  };
+  const label = labels[phase];
+  return new CloneError(code, `${label === undefined ? `${phase} ` : label}失败：${detail}`, cause === undefined ? undefined : { cause });
 }
 
 function sanitizedEnvironment(): NodeJS.ProcessEnv {
@@ -131,15 +141,34 @@ function sanitizedEnvironment(): NodeJS.ProcessEnv {
   return env;
 }
 
-function redactGitText(value: string, repositoryUrls: readonly string[]): string {
-  let text = value;
-  for (const url of repositoryUrls) {
-    if (url.length > 0) text = text.split(url).join("<repository-url>");
-  }
-  return text
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1<credentials>@")
-    .replace(/(https?:\/\/[^\s?#]+)\?[^\s#]*/gi, "$1?<redacted>")
+function redactGitText(value: string): string {
+  return value
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^\s/?#]+)([^\s]*)/gi, (_match, scheme: string, authority: string, rest: string) => {
+      const protocol = scheme.slice(0, -3).toLowerCase();
+      const at = authority.lastIndexOf("@");
+      let safeAuthority = authority;
+      if (at >= 0) {
+        const userinfo = authority.slice(0, at);
+        const host = authority.slice(at + 1);
+        if (protocol === "http" || protocol === "https" || userinfo.includes(":")) {
+          safeAuthority = `<credentials>@${host}`;
+        }
+      }
+      const query = rest.search(/[?#]/);
+      if (query < 0) return `${scheme}${safeAuthority}${rest}`;
+      const pathPart = rest.slice(0, query);
+      const suffix = rest.slice(query);
+      const hasQuery = suffix.startsWith("?");
+      const hasFragment = suffix.includes("#");
+      return `${scheme}${safeAuthority}${pathPart}${hasQuery ? "?<redacted>" : ""}${hasFragment ? "#<redacted>" : ""}`;
+    })
     .trim();
+}
+
+function operationRepository(cwd: string, args: readonly string[], repositoryUrls: readonly string[]): string | undefined {
+  const explicit = repositoryUrls.find((url) => args.includes(url));
+  if (explicit !== undefined) return explicit;
+  return path.basename(cwd).toLowerCase() === "project-docs" ? repositoryUrls[0] : repositoryUrls.at(-1);
 }
 
 function git(
@@ -165,12 +194,16 @@ function git(
   const stderr = result.stderr ?? "";
   if (result.error !== undefined && !options.allowFailure) {
     reportProgress("git", "failed");
-    throw cloneError("CLONE_GIT_FAILED", phase, redactGitText(result.error.message, repositoryUrls), result.error);
+    const target = operationRepository(cwd, args, repositoryUrls);
+    const context = `工作目录：${cwd}${target === undefined ? "" : `；仓库：${redactGitText(target)}`}`;
+    throw cloneError("CLONE_GIT_FAILED", phase, `${redactGitText(result.error.message)}；${context}`, result.error);
   }
   if (status !== 0 && !options.allowFailure) {
     reportProgress("git", "failed");
-    const detail = redactGitText(stderr || stdout || `git 退出码 ${status}`, repositoryUrls);
-    throw cloneError("CLONE_GIT_FAILED", phase, detail);
+    const target = operationRepository(cwd, args, repositoryUrls);
+    const detail = redactGitText(stderr || stdout || `git 退出码 ${status}`);
+    const context = `工作目录：${cwd}${target === undefined ? "" : `；仓库：${redactGitText(target)}`}`;
+    throw cloneError("CLONE_GIT_FAILED", phase, `${detail}；${context}`);
   }
   return { stdout, stderr, status };
 }
@@ -367,11 +400,19 @@ function commitOf(cwd: string, ref: string, urls: readonly string[]): string {
 }
 
 function originOf(cwd: string, urls: readonly string[]): string {
-  const result = git(cwd, ["remote", "get-url", "origin"], "inspect origin", urls, { allowFailure: true });
-  if (result.status !== 0 || result.stdout.trim() === "") {
+  const result = git(cwd, ["config", "--local", "--get-all", "remote.origin.url"], "inspect origin", urls, { allowFailure: true });
+  const values = result.stdout.split(/\r?\n/).filter((value) => value.length > 0);
+  if (result.status !== 0 || values.length === 0) {
     throw cloneError("CLONE_REPOSITORY_MISMATCH", "inspect", `仓库缺少 origin：${cwd}`);
   }
-  return result.stdout.trim();
+  if (values.length !== 1) {
+    throw cloneError("CLONE_REPOSITORY_MISMATCH", "inspect", `仓库 origin 必须恰有一个本地配置值：${cwd}`);
+  }
+  try {
+    return validateRepositoryUrl(values[0]!);
+  } catch (error) {
+    throw cloneError("CLONE_REPOSITORY_MISMATCH", "inspect", `仓库 origin 本地配置值非法：${cwd}`, error);
+  }
 }
 
 function assertRepositoryRoot(cwd: string, urls: readonly string[]): void {
@@ -445,7 +486,12 @@ function checkoutHostBranch(cwd: string, branch: string, urls: readonly string[]
     }
     const checkout = git(cwd, ["checkout", "--no-overwrite-ignore", branch], "checkout host", urls, { allowFailure: true });
     if (checkout.status !== 0) {
-      throw cloneError("CLONE_GIT_FAILED", "checkout host", redactGitText(checkout.stderr || checkout.stdout, urls));
+      const target = operationRepository(cwd, [], urls);
+      throw cloneError(
+        "CLONE_GIT_FAILED",
+        "checkout host",
+        `${redactGitText(checkout.stderr || checkout.stdout)}；工作目录：${cwd}${target === undefined ? "" : `；仓库：${redactGitText(target)}`}`,
+      );
     }
   } else {
     git(cwd, ["checkout", "--no-overwrite-ignore", "--track", "-b", branch, `origin/${branch}`], "checkout host", urls);
@@ -550,7 +596,7 @@ export function cloneProject(cwd: string, input: CloneInput): CloneResult {
         throw cloneError(
           "CLONE_GIT_FAILED",
           "resolve docs branch",
-          redactGitText(branchProbe.stderr || branchProbe.stdout || `git 退出码 ${branchProbe.status}`, knownUrls),
+          `${redactGitText(branchProbe.stderr || branchProbe.stdout || `git 退出码 ${branchProbe.status}`)}；工作目录：${directory}；仓库：${redactGitText(docsUrl)}`,
         );
       }
     }
@@ -676,9 +722,9 @@ export function cloneProject(cwd: string, input: CloneInput): CloneResult {
     }
     assertRepositoryRoot(directory, knownUrls);
     try {
-      const existingOrigin = git(directory, ["remote", "get-url", "origin"], "inspect host origin", knownUrls, { allowFailure: true });
+      const existingOrigin = git(directory, ["config", "--local", "--get-all", "remote.origin.url"], "inspect host origin", knownUrls, { allowFailure: true });
       if (existingOrigin.status === 0) {
-        if (canonicalRepositoryUrl(existingOrigin.stdout.trim()) !== canonicalHost) {
+        if (canonicalRepositoryUrl(originOf(directory, knownUrls)) !== canonicalHost) {
           throw cloneError("CLONE_REPOSITORY_MISMATCH", "init host", "既有 origin 与恢复记录不一致");
         }
       } else {

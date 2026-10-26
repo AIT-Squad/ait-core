@@ -8,7 +8,7 @@ PRD → FSD（可递归分解）→ TDD（一文件一映射）→ 上下文交�
 
 core 提供库与 `ait` CLI；CLI 直接适配同一公共 Node API。ait-pi、ait-skill 是独立的宿主胶水，负责模型调用、工具接入和实际拦截；core 不调用 LLM、不创建 agent、不生成内容。
 
-本文适用于 **0.3.0** 公共接口。0.3.0 在 0.2.0 一次性迁移后的对象 API 上增加了双仓克隆与共享仓库配置能力；完整参数、默认值、返回值、错误和流程示例见：
+本文适用于 **0.3.1** 公共接口。0.3.0 在 0.2.0 一次性迁移后的对象 API 上增加了双仓克隆与共享仓库配置能力，0.3.1 修正了仓库 URL 校验、原始 origin 识别和 Git 错误展示；完整参数、默认值、返回值、错误和流程示例见：
 
 - [Node API 参考](docs/node-api.md)：`createCoreApi` 分组接口、内存交付和宿主接入。
 - [CLI 参考](docs/cli.md)：命令行参数、文件交付和纯 CLI 回执闭环。
@@ -27,14 +27,14 @@ npm pack
 
 源码交付还必须在不复用 `node_modules` 的干净源码副本中，以仓库提交的 `package-lock.json` 执行 `npm ci`，并继续完成 typecheck 与 build。已有依赖目录中的回归通过或已打出的 tarball 可证明相应环境/制品可用，但不能替代 fresh-source 锁文件验收；若 `npm ci` 报告锁文件缺项或与 `package.json` 不一致，应修复并提交锁文件后重新执行 `npm ci`，不要删除锁文件或使用 `--force` 掩盖问题。
 
-首次干净安装需要能从锁文件记录的来源取得依赖：可使用已包含所需包的可信 npm 缓存，否则需要网络访问 registry。离线或权限受限时，即使部分可选依赖未落地或安装过程表面成功，也不能据此断言依赖闭包完整；应结合锁文件闭包检查与干净 `npm ci` 结果确认。本项只修复源码锁与验证路径，npm 包版本仍为 **0.3.0**，运行时 API 和依赖范围不变。
+首次干净安装需要能从锁文件记录的来源取得依赖：可使用已包含所需包的可信 npm 缓存，否则需要网络访问 registry。离线或权限受限时，即使部分可选依赖未落地或安装过程表面成功，也不能据此断言依赖闭包完整；应结合锁文件闭包检查与干净 `npm ci` 结果确认。v0.16 曾修复源码锁缺项并补强该验证路径；当时 npm 包版本保持 **0.3.0**，运行时 API 和依赖范围未变。当前 npm 包版本为 **0.3.1**。
 
 完整测试依赖构建产物，`npm test` 的 `pretest` 会先构建；`npm pack` 的 `prepack` 也会构建。构建失败时不能用陈旧产物作为验收依据。以 `npm pack` 输出的实际 `.tgz` 文件名为准，下面路径需替换成该文件的绝对路径。
 
 对已有项目或准备执行 `init` 的项目，可在项目根本地安装：
 
 ```sh
-npm install "/absolute/path/to/ait-core-0.3.0.tgz"
+npm install "/absolute/path/to/ait-core-0.3.1.tgz"
 npm ls ait-core --depth=0
 npm exec -- ait --version
 ```
@@ -51,13 +51,15 @@ npm ls ait-core --depth=0
 从已有 AIT 文档仓恢复项目时，先在项目根之外安装 AIT（例如全局安装本地 tarball），然后创建并进入一个**空的最终项目根**，直接在当前目录执行：
 
 ```sh
-npm install --global "/absolute/path/to/ait-core-0.3.0.tgz"
+npm install --global "/absolute/path/to/ait-core-0.3.1.tgz"
 mkdir restored-project
 cd restored-project
 ait clone <docs-url> [--host-url <url>] [--branch <host-branch>] [--docs-branch <docs-branch>]
 ```
 
 `clone` 不接受额外的目标目录参数。它先把文档仓检出到当前目录的 `project-docs/`，再读取 `project-docs/.meta/repositories.yaml`，在当前目录就地恢复宿主代码仓。`--host-url`、`--branch` 只覆盖本次恢复；`--docs-branch` 选择本次文档分支。未指定分支时使用对应远端的默认分支，不假定 `main` 或 `master`。
+
+仓库身份核对和成功结果使用 Git 本地配置中记录的原始 `remote.origin.url`。Git 仍可按用户已有的 `url.*.insteadOf` 规则把该地址重写为实际传输端点，但重写后的地址不替代原始 origin，也不会造成恢复身份的误判。Git 失败信息会保留经过安全处理的正常地址主机与路径以便定位，并遮蔽 userinfo、查询参数、片段等可能含凭据的部分；显示内容不是传给 Git 的占位符，也不能据此断言网络或 TLS 故障的根因。
 
 克隆不安装项目依赖、不运行验收命令或仓库脚本。中途失败可能保留已成功的 `project-docs/`、宿主 `.git` 或本地恢复记录；这不是整个双仓操作的原子回滚。保留现场并在同一目录以完全相同的参数重试，core 会核对恢复记录与两个仓库的实际状态后续跑；未记录、参数或现场不一致时会拒绝覆盖。这些记录是本地进度事实，不是身份或凭据认证。
 
@@ -218,7 +220,7 @@ generation_receipts:
 
 ## 兼容方向与版本号
 
-0.2.0 是开发期的一次性公共接口迁移。0.3.0 保留该迁移结果，并在 `core.project` 上增加 `clone`、`getRepositories` 和 `setRepositories`；它不恢复以下五个旧函数的包根兼容导出：
+0.2.0 是开发期的一次性公共接口迁移。0.3.0 保留该迁移结果，并在 `core.project` 上增加 `clone`、`getRepositories` 和 `setRepositories`；0.3.1 继续保留这些接口并修正仓库 URL 处理。它不恢复以下五个旧函数的包根兼容导出：
 
 | 已移除出口 | 替代方式 |
 | --- | --- |

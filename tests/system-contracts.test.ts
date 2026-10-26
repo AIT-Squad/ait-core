@@ -999,7 +999,7 @@ beforeAll(async () => {
   expect(fs.lstatSync(packageRoot).isSymbolicLink()).toBe(false);
   const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as Data;
   expect(manifest.name).toBe("ait-core");
-  expect(manifest.version).toBe("0.3.0");
+  expect(manifest.version).toBe("0.3.1");
   expect(manifest.version).toBe(packs[0]!.version);
   for (const file of ["README.md", "docs/node-api.md", "docs/cli.md", "dist/src/api/worker.js", "dist/src/index.d.ts"]) {
     expect(fs.statSync(path.join(packageRoot, file)).isFile(), `Missing installed contract: ${file}`).toBe(true);

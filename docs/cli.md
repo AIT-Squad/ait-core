@@ -1,17 +1,17 @@
 # CLI 命令参考
 
-本文适用于 `ait-core` 0.3.0，运行环境为 Node.js 22 及以上。CLI 通过同一套公共业务接口执行规格、版本、图查询、交付与回执操作。Node 集成入口见 [Node API 参考](node-api.md)。
+本文适用于 `ait-core` 0.3.1，运行环境为 Node.js 22 及以上。CLI 通过同一套公共业务接口执行规格、版本、图查询、交付与回执操作。Node 集成入口见 [Node API 参考](node-api.md)。
 
 ## 安装与运行目录
 
 本次开发交付使用已构建、打包的本地 tarball，安装后同时提供 `ait` 命令：
 
 ```sh
-npm install --global /absolute/path/ait-core-0.3.0.tgz
+npm install --global /absolute/path/ait-core-0.3.1.tgz
 ait init --name demo
 ```
 
-本页不表示 0.3.0 已发布到公开 registry。只有目标版本已经发布到所配置的 registry 时，才可按包名安装：
+本页不表示 0.3.1 已发布到公开 registry。只有目标版本已经发布到所配置的 registry 时，才可按包名安装：
 
 ```sh
 npm install --global ait-core
@@ -93,7 +93,9 @@ npm install --global ait-core
 | `--host-url <url>` | 缺省读取共享配置的 `host.url`；显式值只覆盖本次克隆，不改写共享配置 |
 | `--branch <host-branch>` | 宿主分支优先级为：显式 `--branch` > 共享配置 `host.branch` > 宿主远端默认分支；不硬编码 `main` 或 `master` |
 
-仓库地址支持 `https`、`ssh`、scp 样式、`file:` URL 和绝对本地路径。相对路径、以 `-` 开头、含控制字符、内嵌凭据、查询参数或片段的 URL，以及 `ext::` 等 external remote helper 地址会被拒绝；SSH 的普通用户名可用。分支名也必须是安全 Git ref，不能是选项或 `@{-1}` 一类历史表达式。CLI 不转换地址拼写；本地路径和 file URL 只在身份比较时规范化。
+仓库地址支持完整的 `https://authority/path`、`ssh://authority/path`、scp 样式、完整 `file://` URL 和绝对本地路径。`https`/`ssh` 地址必须明确包含 `://`、authority 和路径；单斜杠或无斜杠形式（例如 `https:/host/x`、`https:host/x`）、反斜杠、未编码空白和 Markdown 链接包装都会被拒绝，不能依赖 URL 解析器自动纠正后再把畸形原文交给 Git。相对路径、以 `-` 开头、含控制字符、内嵌凭据、查询参数或片段的 URL，以及 `ext::` 等 external remote helper 地址也会被拒绝；SSH 的普通用户名可用。Windows 绝对本地路径中的空格、中文和反斜杠按本地路径处理，不套用远端 URL 规则。分支名必须是安全 Git ref，不能是选项或 `@{-1}` 一类历史表达式。
+
+CLI 将通过校验的地址原样交给 Git；规范化只用于身份比较，不改写传输参数。恢复核对及成功结果中的 `host.url` / `docs.url` 读取各仓本地配置里唯一的 `remote.origin.url` 原始值。Git 可按用户已有的 `url.*.insteadOf` 配置选择实际传输端点，但这种传输重写不会改变声明的 origin，也不会造成恢复身份误判；AIT 不禁用、修改或保存该映射。若原始 `remote.origin.url` 被真实改动、缺失、重复或变得非法，身份核对仍会拒绝。
 
 首次执行要求目录为空，并拒绝卷根、用户根、符号链接/重解析路径、已有祖先 Git 工作树中的意外嵌套，以及宿主树中会与 `project-docs` 冲突的路径。获取完整分支和 tags，不提供 shallow、force、submodule 递归或固定 AIT `--version` 选项。成功后保留两仓各自的历史、分支、upstream 和 origin，生成当前平台 wrapper，并验证项目结构、基线索引和规格图；不会运行验收命令，也不声称文档分支与代码分支属于同一 AIT 发布。
 
@@ -110,7 +112,7 @@ npm install --global ait-core
 }
 ```
 
-`directory`、两仓 `path` 和 `wrapper` 均为绝对路径；URL、分支和 commit 来自完成后的真实仓库。`resumed` 表示本次调用使用了已有恢复记录，不表示跳过了身份与工作区核对。
+`directory`、两仓 `path` 和 `wrapper` 均为绝对路径；URL 是完成后仓库本地配置中记录的原始 `remote.origin.url`，不是 `insteadOf` 展开后的传输端点；分支和 commit 来自完成后的真实仓库。`resumed` 表示本次调用使用了已有恢复记录，不表示跳过了身份与工作区核对。
 
 命令在 `project-docs/.git/ait-clone-state.json` 保存本机恢复状态。该文件不进入版本库；它是“哪些原地步骤由本次流程创建并可安全续跑”的本地标记，不是密码、签名或加密身份认证。只有恢复记录、调用参数、两仓 origin/分支/commit、Git 根和干净状态全部匹配时才能继续。共享 `repositories.yaml` 不能授权删除或覆盖文件；无记录或身份不一致的残留、脏工作区和未知 `.git` 都会拒绝，命令不会用 reset、clean、force 或覆盖来猜测恢复。
 
@@ -139,6 +141,8 @@ ait clone 'https://example.invalid/team/project-docs.git' `
 `--host-url` 和 `--docs-url` 都必需。命令完整验证后原子替换共享配置；它不合并旧的可选分支，因此省略 `--host-branch` 或 `--docs-branch` 会从新配置中删除对应旧值。成功返回与 `repos show` 相同的 `{path,repositories}`。
 
 此命令只修改 `project-docs/.meta/repositories.yaml`，不修改两仓 Git remote，不 checkout 分支，不自动 commit 或 push。地址和分支采用与 `clone` 相同的安全规则；配置不得保存密码、私钥或带 token 的查询 URL。
+
+`repos show` 显示共享配置声明的地址，`clone` 结果显示实际仓库记录的原始 origin；两者都不是 Git 经 `insteadOf` 展开的传输地址。配置读取与 Git 的传输重写彼此独立，AIT 不据此修改用户 Git 配置。
 
 ```powershell
 # 维护者从项目根登记双仓关系；文件保存到文档仓，随后审阅并提交。
@@ -619,7 +623,7 @@ $neighbors = Invoke-Ait -CliArgs @('specgraph', 'query', '[FSD]-hello_cli:greeti
 | `CLONE_REPOSITORY_MISMATCH`、`CLONE_STATE_INVALID` | 恢复记录、参数、origin、分支、commit、Git 根或工作区事实不一致；保留现场核对，不 reset/clean/force 后冒充同一次恢复 |
 | `CLONE_PATH_CONFLICT` | 目标位于危险根、链接路径、祖先 Git 工作树中，或宿主树与 `project-docs` 冲突；更换安全空目录或修复远端树布局 |
 | `CLONE_BRANCH_NOT_FOUND` | 显式分支、配置分支或远端默认分支不存在/未指向提交；修正来源或分支后按错误现场决定首次重试或匹配续跑 |
-| `CLONE_GIT_FAILED`、`CLONE_PROJECT_INVALID` | Git 阶段失败，或恢复后的 AIT 项目结构、索引、规格图、wrapper 检查未通过；错误文字含阶段和保留位置，修复原因后用相同参数安全续跑 |
+| `CLONE_GIT_FAILED`、`CLONE_PROJECT_INVALID` | Git 阶段失败，或恢复后的 AIT 项目结构、索引、规格图、wrapper 检查未通过；Git 错误会说明具体角色和阶段（如“文档仓克隆失败”“代码仓拉取失败”“代码仓默认分支查询失败”）、实际工作目录及安全仓库地址，修复原因后用相同参数安全续跑 |
 | `NOT_AT_PROJECT_ROOT`、`CWD_INSIDE_PROJECT_DOCS`、`PROJECT_DOCS_MALFORMED` | 切到正确宿主根，检查项目布局；不要从 `project-docs` 内运行 |
 | `CONFIG_UNREADABLE`、`INDEX_UNREADABLE`、`GRAPH_UNREADABLE`、`CHUNK_PARSE_ERROR` | 存储不可读或结构损坏；保留错误定位，恢复合法来源，不能将错误视为无数据 |
 | `SPEC_CONTENT_MISMATCH`、`MERGE_SOURCE_MISSING`、`MERGE_TARGET_MISSING`、`GOVERNANCE_SOURCE_MISSING` | 索引、关系、版本身份与真实规格不一致，或所需来源缺失；核对原始状态 |
@@ -634,3 +638,5 @@ $neighbors = Invoke-Ait -CliArgs @('specgraph', 'query', '[FSD]-hello_cli:greeti
 | `INTERNAL_ERROR` | 未预期异常，保留消息及现场，检查实际状态后处理 |
 
 读取失败、写前校验拒绝、事务恢复和外部验收/Git 副作用的边界不同，不能把所有失败理解成“所有文件均未改变”。失败后用 `version status`、`state`、`specgraph query`、`specgraph validate-new-model` 或 `codegen verify` 等只读命令核对事实。`confirm`、`sync` 和 `reindex` 不属于只读刷新；发布、确认、合入和回滚不应自动重试。
+
+clone 的 Git 诊断保留正常 URL 的 host/path 和正常本地路径，不再把整个地址统一替换成 `<repository-url>`。错误展示会遮蔽 URL userinfo（包括 HTTPS token-only username）、query/fragment 中的敏感值，以及 Git 输出中可能出现的凭据；该处理也覆盖 `insteadOf` 生成、未出现在命令输入中的传输端点。展示脱敏只作用于返回文本，不会改动传给 Git 的 argv 或仓库配置。`CLONE_GIT_FAILED` 只表示所列 Git 阶段失败，不能仅凭该错误码推断地址缺失、网络故障或其他特定根因。

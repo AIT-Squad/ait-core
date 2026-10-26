@@ -68,6 +68,8 @@ function localAbsolutePath(value: string): string | undefined {
 }
 
 function fileUrlPath(value: string): string {
+  if (!/^file:\/\//i.test(value)) throw invalid("file URL 必须使用完整 file:// 形式");
+  if (/[\\\s]/.test(value)) throw invalid("file URL 包含反斜杠或未编码空白");
   let parsed: URL;
   try {
     parsed = new URL(value);
@@ -85,6 +87,28 @@ function fileUrlPath(value: string): string {
   }
 }
 
+function isMarkdownWrapped(value: string): boolean {
+  return (
+    (value.startsWith("<") && value.endsWith(">")) ||
+    (value.startsWith("`") && value.endsWith("`")) ||
+    /^\[[^\]]+\]\([^)]+\)$/.test(value)
+  );
+}
+
+function parseRemoteUrl(value: string): URL {
+  // WHATWG URL parsing deliberately repairs inputs such as `https:/host/x`,
+  // `https:host/x`, and backslash-separated URLs. Reject those spellings before
+  // parsing because Git must receive the exact string that was validated.
+  if (!/^(?:https|ssh):\/\/[^/?#\\\s]+\/[^?#\\\s]+$/i.test(value)) {
+    throw invalid("仓库 URL 必须使用完整 scheme://authority/path，且不得包含反斜杠、未编码空白或 Markdown 包装");
+  }
+  try {
+    return new URL(value);
+  } catch (error) {
+    throw invalid("仓库 URL 无法解析", error);
+  }
+}
+
 /** Validate a clone-safe repository reference while preserving its spelling. */
 export function validateRepositoryUrl(value: string): string {
   if (typeof value !== "string" || value.length === 0) throw invalid("仓库地址必须是非空字符串");
@@ -94,6 +118,7 @@ export function validateRepositoryUrl(value: string): string {
   if (/^[A-Za-z][A-Za-z0-9+.-]*::/.test(value)) throw invalid("不支持 Git external remote helper 地址");
 
   if (localAbsolutePath(value) !== undefined) return value;
+  if (isMarkdownWrapped(value)) throw invalid("仓库地址不得包含 Markdown 包装");
   if (/^[A-Za-z]:[^\\/]/.test(value)) throw invalid("不允许 Windows 盘符相对路径");
   if (/^file:/i.test(value)) {
     fileUrlPath(value);
@@ -101,12 +126,7 @@ export function validateRepositoryUrl(value: string): string {
   }
 
   if (/^https:/i.test(value) || /^ssh:/i.test(value)) {
-    let parsed: URL;
-    try {
-      parsed = new URL(value);
-    } catch (error) {
-      throw invalid("仓库 URL 无法解析", error);
-    }
+    const parsed = parseRemoteUrl(value);
     const protocol = parsed.protocol.toLowerCase();
     if (protocol !== "https:" && protocol !== "ssh:") throw invalid("仅支持 https、ssh、scp、file 或绝对本地路径");
     if (!parsed.hostname || !parsed.pathname || parsed.pathname === "/") throw invalid("仓库 URL 缺少主机或仓库路径");
